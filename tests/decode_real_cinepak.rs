@@ -129,8 +129,8 @@ fn parse_box_header(data: &[u8], off: usize) -> Option<(u32, [u8; 4], usize, usi
     }
 }
 
-fn find_box<'a>(
-    data: &'a [u8],
+fn find_box(
+    data: &[u8],
     parent_start: usize,
     parent_end: usize,
     target: &[u8; 4],

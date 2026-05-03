@@ -15,7 +15,3 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
-` table here stops cargo from climbing up into the
-# umbrella manifest — the standalone build then resolves
-# `oxideav-core` from crates.io as usual.
-[workspace]

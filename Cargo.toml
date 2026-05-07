@@ -14,4 +14,22 @@ keywords = ["multimedia", "video", "cinepak", "cvid", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-cinepak` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes a free-standing
+# `CinepakDecoder` plus crate-local `CinepakFrame` / `CinepakPlane` /
+# `CinepakPixelFormat` / `CinepakError` types and never references
+# `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the framework `Decoder` trait implementation, the
+# `register_codecs` / `register` entry points, and the
+# `From<CinepakError> for oxideav_core::Error` /
+# `From<CinepakFrame> for oxideav_core::VideoFrame` conversions
+# against `oxideav-core`. Default-on; turn off for image-library
+# use-cases that just want the standalone `CinepakDecoder` API.
+registry = ["dep:oxideav-core"]

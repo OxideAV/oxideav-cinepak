@@ -1,0 +1,550 @@
+//! Cinepak frame-level decoder.
+//!
+//! Ties together the frame & strip header parser ([`crate::header`]),
+//! codebook chunks ([`crate::codebook`]), vector chunks
+//! ([`crate::vector`]), the YUV→RGB matrix ([`crate::yuv`]), and the
+//! 4×4 macroblock expansion rules from
+//! `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` §4 / §5
+//! (V1 / V4 expansion) and §4 of `04-yuv-rgb-matrix.md` (grayscale
+//! identity).
+
+use crate::codebook::{
+    apply_codebook_chunk, Codebook, CodebookChunkKind, PixelMode, UpdateStyle, WhichCodebook,
+    CHUNK_HEADER_SIZE,
+};
+use crate::error::{CinepakError, Result};
+use crate::header::{
+    FrameHeader, RawStripHeader, StripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE,
+};
+use crate::image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
+use crate::vector::{decode_vector_chunk, Mb};
+use crate::yuv::yuv_to_rgb;
+
+/// Stateful Cinepak decoder. Holds the V4 / V1 codebook pair from the
+/// previous strip (for inheritance across strips and frames) and the
+/// previous frame's reconstructed pixel buffer (for `0x3100` skip
+/// macroblocks).
+#[derive(Default)]
+pub struct CinepakDecoder {
+    /// V4 codebook from the previous strip (any frame).
+    prev_v4: Option<Codebook>,
+    /// V1 codebook from the previous strip (any frame).
+    prev_v1: Option<Codebook>,
+    /// Previous frame's reconstructed pixel buffer + dimensions + mode.
+    /// Required for `0x3100` skip macroblocks.
+    prev_frame: Option<CinepakFrame>,
+}
+
+impl CinepakDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset all carry-over state. The decoder behaves as if it had
+    /// never seen a frame.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Decode a single Cinepak frame from `bytes`. The frame's
+    /// `frame_length` field must equal `bytes.len()` (or be smaller —
+    /// the slice may carry container padding past the frame).
+    pub fn decode_frame(&mut self, bytes: &[u8], pts: Option<i64>) -> Result<CinepakFrame> {
+        let header = FrameHeader::parse(bytes)?;
+        let frame_len = header.frame_length as usize;
+        if frame_len > bytes.len() {
+            return Err(CinepakError::invalid(format!(
+                "frame_length {} exceeds buffer size {}",
+                frame_len,
+                bytes.len()
+            )));
+        }
+        let frame_bytes = &bytes[..frame_len];
+
+        // Walk strips.
+        let mut cursor = FRAME_HEADER_SIZE;
+        let mut prev_y_bottom = 0u32;
+        // Detected pixel mode (set by the first codebook chunk we see).
+        let mut frame_mode: Option<PixelMode> = None;
+
+        // Allocate output canvas now that we know the frame dims.
+        let width = u32::from(header.width);
+        let height = u32::from(header.height);
+
+        // Use placeholder Rgb24 mode initially; we patch the format
+        // after seeing the first chunk.
+        let mut out_pixels: Vec<u8> = vec![0; (width * height) as usize * 3];
+        let mut out_stride = (width as usize) * 3;
+        // We start by *assuming* RGB; if frame turns out grayscale we
+        // shrink the buffer below. We can't allocate the right size up
+        // front without sniffing the first chunk, so allocate the
+        // larger RGB buffer and convert to gray at the end if needed.
+
+        // If the previous frame is the wrong size for this frame, drop
+        // it — skip macroblocks must reference the *same* frame layout.
+        if let Some(p) = &self.prev_frame {
+            if p.width != width || p.height != height {
+                self.prev_frame = None;
+            }
+        }
+
+        for strip_index in 0..header.strip_count {
+            if cursor + STRIP_HEADER_SIZE > frame_bytes.len() {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} header truncated"
+                )));
+            }
+            let raw = RawStripHeader::parse(&frame_bytes[cursor..cursor + STRIP_HEADER_SIZE])?;
+            let strip_size = raw.strip_size as usize;
+            if cursor + strip_size > frame_bytes.len() {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} declared size {strip_size} overruns frame"
+                )));
+            }
+            let is_first = strip_index == 0;
+            let strip_hdr = StripHeader::resolve(raw, is_first, prev_y_bottom);
+
+            // Strip bounds.
+            let sx0 = u32::from(raw.x_top);
+            let sx1 = u32::from(raw.x_bottom);
+            if sx1 > width || strip_hdr.actual_y_bottom > height {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} bounds ({sx0}..{sx1}, {}..{}) exceed frame ({width}x{height})",
+                    strip_hdr.actual_y_top, strip_hdr.actual_y_bottom
+                )));
+            }
+            if (sx1 - sx0) % 4 != 0 || strip_hdr.height() % 4 != 0 {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} dims ({}x{}) not multiples of 4",
+                    sx1 - sx0,
+                    strip_hdr.height()
+                )));
+            }
+
+            // Decode strip's chunk stream.
+            let payload_start = cursor + STRIP_HEADER_SIZE;
+            let payload_end = cursor + strip_size;
+            let strip_payload = &frame_bytes[payload_start..payload_end];
+
+            let mut v4 = self.prev_v4.clone().unwrap_or_default();
+            let mut v1 = self.prev_v1.clone().unwrap_or_default();
+
+            let (mbs, strip_mode) = decode_strip_chunks(
+                strip_payload,
+                &mut v4,
+                &mut v1,
+                strip_hdr_mb_count(&strip_hdr, sx1 - sx0),
+                strip_hdr.raw.is_intra(),
+            )?;
+
+            // Pixel-mode unification across strips of the same frame.
+            frame_mode = Some(match frame_mode {
+                None => strip_mode,
+                Some(m) => m.unify(strip_mode)?,
+            });
+
+            // Render macroblocks into the output buffer.
+            render_strip(
+                &mbs,
+                &v4,
+                &v1,
+                strip_mode,
+                strip_hdr.actual_y_top,
+                sx0,
+                sx1 - sx0,
+                strip_hdr.height(),
+                width,
+                height,
+                self.prev_frame.as_ref(),
+                &mut out_pixels,
+                out_stride,
+            )?;
+
+            // Carry codebooks forward.
+            self.prev_v4 = Some(v4);
+            self.prev_v1 = Some(v1);
+
+            prev_y_bottom = strip_hdr.actual_y_bottom;
+            cursor = payload_end;
+        }
+
+        // If frame turned out to be grayscale, repack to a Gray8 plane.
+        let mode = frame_mode.unwrap_or(PixelMode::Yuv12);
+        let (pixel_format, pixels, stride) = match mode {
+            PixelMode::Yuv12 => (CinepakPixelFormat::Rgb24, out_pixels, out_stride),
+            PixelMode::Gray8 => {
+                // Repack: every R/G/B triple in `out_pixels` was written
+                // with R==G==B==Y already (see render_strip's grayscale
+                // path), so we just take every third byte to compact.
+                let mut gray = Vec::with_capacity((width * height) as usize);
+                for row in 0..height as usize {
+                    let base = row * out_stride;
+                    for col in 0..width as usize {
+                        gray.push(out_pixels[base + col * 3]);
+                    }
+                }
+                out_stride = width as usize;
+                (CinepakPixelFormat::Gray8, gray, out_stride)
+            }
+        };
+
+        let frame = CinepakFrame {
+            width,
+            height,
+            pixel_format,
+            pts,
+            planes: vec![CinepakPlane {
+                stride,
+                data: pixels,
+            }],
+        };
+        self.prev_frame = Some(frame.clone());
+        Ok(frame)
+    }
+}
+
+fn strip_hdr_mb_count(s: &StripHeader, width: u32) -> usize {
+    ((s.height() / 4) * (width / 4)) as usize
+}
+
+/// Walk a strip's chunk stream, applying codebook chunks in the order
+/// they appear and dispatching the (single) vector chunk to the
+/// vector-chunk decoder. Returns the decoded macroblock list together
+/// with the strip's pixel mode.
+fn decode_strip_chunks(
+    payload: &[u8],
+    v4: &mut Codebook,
+    v1: &mut Codebook,
+    mb_count: usize,
+    is_intra: bool,
+) -> Result<(Vec<Mb>, PixelMode)> {
+    let mut p = 0usize;
+    let mut mode: Option<PixelMode> = None;
+    let mut mbs: Option<Vec<Mb>> = None;
+
+    while p < payload.len() {
+        if payload.len() - p < CHUNK_HEADER_SIZE {
+            return Err(CinepakError::invalid("strip chunk header truncated"));
+        }
+        let chunk_id = u16::from_be_bytes([payload[p], payload[p + 1]]);
+        let chunk_size = u16::from_be_bytes([payload[p + 2], payload[p + 3]]) as usize;
+        if chunk_size < CHUNK_HEADER_SIZE {
+            return Err(CinepakError::invalid(format!(
+                "chunk_size {chunk_size} smaller than 4-byte header"
+            )));
+        }
+        if payload.len() - p < chunk_size {
+            return Err(CinepakError::invalid(format!(
+                "chunk 0x{chunk_id:04x} truncated: declared {chunk_size}, have {}",
+                payload.len() - p
+            )));
+        }
+        let chunk_payload = &payload[p + CHUNK_HEADER_SIZE..p + chunk_size];
+        if let Some(kind) = CodebookChunkKind::from_id(chunk_id) {
+            // Selective updates aren't legal on intra strips per spec
+            // §2.3 of 02-codebooks.md.
+            if is_intra && kind.style == UpdateStyle::Selective {
+                return Err(CinepakError::invalid(format!(
+                    "selective-update chunk 0x{chunk_id:04x} on intra strip"
+                )));
+            }
+            // Consistency: if a previous chunk pinned a mode, keep it.
+            mode = Some(match mode {
+                Some(m) => m.unify(kind.mode)?,
+                None => kind.mode,
+            });
+            let cb = match kind.which {
+                WhichCodebook::V4 => &mut *v4,
+                WhichCodebook::V1 => &mut *v1,
+            };
+            apply_codebook_chunk(kind, chunk_payload, cb)?;
+        } else if matches!(chunk_id, 0x3000 | 0x3100 | 0x3200) {
+            if mbs.is_some() {
+                return Err(CinepakError::invalid(
+                    "strip carries more than one vector chunk",
+                ));
+            }
+            // Inter `0x3100` may legally only appear on inter strips
+            // (spec §2 of 03-vectors-and-macroblocks.md).
+            if chunk_id == 0x3100 && is_intra {
+                return Err(CinepakError::invalid(
+                    "inter vector chunk 0x3100 on intra strip",
+                ));
+            }
+            mbs = Some(decode_vector_chunk(chunk_id, chunk_payload, mb_count)?);
+        } else {
+            return Err(CinepakError::invalid(format!(
+                "unknown strip chunk id 0x{chunk_id:04x}"
+            )));
+        }
+        p += chunk_size;
+    }
+
+    let mbs = mbs.ok_or_else(|| CinepakError::invalid("strip carries no vector chunk"))?;
+    // If no codebook chunks appeared (legal when both codebooks are
+    // inherited), default to the YUV mode — but if any V1 macroblock
+    // index is referenced we have nothing to validate against here, so
+    // we accept the default and rely on the rendered output staying
+    // sensible (zero-init codebook → black). Spec §3.4 of 02 lays this
+    // out: header-only / omitted codebook chunks reuse the previous
+    // strip's codebook of the same flavour. If we have no previous
+    // codebook (intra strip with no chunks) the entries are undefined
+    // per spec, and rendering uses zero-init which produces black
+    // content.
+    let mode = mode.unwrap_or(PixelMode::Yuv12);
+    Ok((mbs, mode))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_strip(
+    mbs: &[Mb],
+    v4: &Codebook,
+    v1: &Codebook,
+    mode: PixelMode,
+    y_top: u32,
+    x_top: u32,
+    width: u32,
+    _height: u32,
+    frame_width: u32,
+    frame_height: u32,
+    prev_frame: Option<&CinepakFrame>,
+    out: &mut [u8],
+    out_stride: usize,
+) -> Result<()> {
+    let mb_cols = (width / 4) as usize;
+    for (i, mb) in mbs.iter().enumerate() {
+        let mb_row = i / mb_cols;
+        let mb_col = i % mb_cols;
+        let py = y_top as usize + mb_row * 4;
+        let px = x_top as usize + mb_col * 4;
+        match mb {
+            Mb::V1(idx) => {
+                let e = &v1.entries[*idx as usize];
+                draw_v1_mb(e, mode, px, py, out, out_stride);
+            }
+            Mb::V4(idx) => {
+                let r0 = &v4.entries[idx[0] as usize];
+                let r1 = &v4.entries[idx[1] as usize];
+                let r2 = &v4.entries[idx[2] as usize];
+                let r3 = &v4.entries[idx[3] as usize];
+                draw_v4_mb([r0, r1, r2, r3], mode, px, py, out, out_stride);
+            }
+            Mb::Skip => {
+                let prev = prev_frame.ok_or_else(|| {
+                    CinepakError::invalid(
+                        "0x3100 skip macroblock on first frame (no previous reconstruction)",
+                    )
+                })?;
+                copy_mb_from_prev(
+                    prev,
+                    mode,
+                    px,
+                    py,
+                    out,
+                    out_stride,
+                    frame_width,
+                    frame_height,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_v1_mb(
+    e: &crate::codebook::CodebookEntry,
+    mode: PixelMode,
+    px: usize,
+    py: usize,
+    out: &mut [u8],
+    stride: usize,
+) {
+    // V1: each Yi populates a 2×2 quadrant. (U, V) shared across the
+    // whole 4×4 macroblock. Quadrant layout:
+    //   (0,0) Y0 Y0 Y1 Y1
+    //   (1,0) Y0 Y0 Y1 Y1
+    //   (2,0) Y2 Y2 Y3 Y3
+    //   (3,0) Y2 Y2 Y3 Y3
+    let ys = [e.y0, e.y0, e.y1, e.y1, e.y2, e.y2, e.y3, e.y3];
+    for sub_row in 0..2 {
+        for sub_col in 0..2 {
+            // Each (sub_row, sub_col) covers a 2×2 region.
+            // (sub_row=0, sub_col=0) → Y0; (0,1) → Y1; (1,0) → Y2; (1,1) → Y3
+            let y_idx = sub_row * 2 + sub_col;
+            let y = match y_idx {
+                0 => e.y0,
+                1 => e.y1,
+                2 => e.y2,
+                _ => e.y3,
+            };
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let row = py + sub_row * 2 + dy;
+                    let col = px + sub_col * 2 + dx;
+                    write_pixel(out, stride, row, col, mode, y, e.u, e.v);
+                }
+            }
+        }
+    }
+    let _ = ys;
+}
+
+fn draw_v4_mb(
+    rs: [&crate::codebook::CodebookEntry; 4],
+    mode: PixelMode,
+    px: usize,
+    py: usize,
+    out: &mut [u8],
+    stride: usize,
+) {
+    // V4: r0 = TL 2×2, r1 = TR 2×2, r2 = BL 2×2, r3 = BR 2×2.
+    // Within each 2×2, Y0..Y3 cover (0,0), (0,1), (1,0), (1,1).
+    for (sub_idx, r) in rs.iter().enumerate() {
+        let sub_row = sub_idx / 2;
+        let sub_col = sub_idx % 2;
+        let ys = [r.y0, r.y1, r.y2, r.y3];
+        for (pixel_idx, y) in ys.iter().enumerate() {
+            let dy = pixel_idx / 2;
+            let dx = pixel_idx % 2;
+            let row = py + sub_row * 2 + dy;
+            let col = px + sub_col * 2 + dx;
+            write_pixel(out, stride, row, col, mode, *y, r.u, r.v);
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn write_pixel(
+    out: &mut [u8],
+    stride: usize,
+    row: usize,
+    col: usize,
+    mode: PixelMode,
+    y: u8,
+    u: i8,
+    v: i8,
+) {
+    let off = row * stride + col * 3;
+    match mode {
+        PixelMode::Yuv12 => {
+            let (r, g, b) = yuv_to_rgb(y, u, v);
+            out[off] = r;
+            out[off + 1] = g;
+            out[off + 2] = b;
+        }
+        PixelMode::Gray8 => {
+            // Pack the luminance into all three RGB bytes; the outer
+            // decode_frame compacts to a single Gray8 plane after all
+            // strips are drawn.
+            out[off] = y;
+            out[off + 1] = y;
+            out[off + 2] = y;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_mb_from_prev(
+    prev: &CinepakFrame,
+    mode: PixelMode,
+    px: usize,
+    py: usize,
+    out: &mut [u8],
+    out_stride: usize,
+    frame_width: u32,
+    frame_height: u32,
+) {
+    let _ = (frame_width, frame_height);
+    let prev_stride = prev.planes[0].stride;
+    let prev_data = &prev.planes[0].data;
+    match (mode, prev.pixel_format) {
+        (PixelMode::Yuv12, CinepakPixelFormat::Rgb24) => {
+            for dy in 0..4 {
+                let prev_off = (py + dy) * prev_stride + px * 3;
+                let out_off = (py + dy) * out_stride + px * 3;
+                out[out_off..out_off + 12].copy_from_slice(&prev_data[prev_off..prev_off + 12]);
+            }
+        }
+        (PixelMode::Gray8, CinepakPixelFormat::Gray8) => {
+            // Previous frame is Gray8; out buffer is RGB-shaped during
+            // render. Write Y into all three RGB lanes.
+            for dy in 0..4 {
+                let prev_off = (py + dy) * prev_stride + px;
+                let out_off = (py + dy) * out_stride + px * 3;
+                for dx in 0..4 {
+                    let y = prev_data[prev_off + dx];
+                    out[out_off + dx * 3] = y;
+                    out[out_off + dx * 3 + 1] = y;
+                    out[out_off + dx * 3 + 2] = y;
+                }
+            }
+        }
+        _ => {
+            // Mode mismatch — should be caught earlier by mode unification.
+            // Fill with zeros defensively.
+            for dy in 0..4 {
+                let off = (py + dy) * out_stride + px * 3;
+                for dx in 0..12 {
+                    out[off + dx] = 0;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a synthesised V1-only intra frame: 4×4 single MB with
+    /// known luminance values. Verifies the V1 quadrant expansion.
+    #[test]
+    fn decodes_minimal_v1_only_intra_frame() {
+        // 4×4 frame, 1 strip, 1 MB.
+        // Codebook chunks: empty V4 (header-only) + V1 with one entry
+        // (Y0=50, Y1=100, Y2=150, Y3=200, U=0, V=0).
+        // Vector chunk: 0x3200 with one byte (V1 index 0).
+        let mut bytes = Vec::new();
+        // Frame header (10 bytes): flags=0, frame_length=?, w=4, h=4, sc=1
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 4, 0, 4, 0, 1]);
+        // Strip header (12 bytes): strip_id=0x1000, strip_size=?, y_top=0, x_top=0, y_bottom=4, x_bottom=4
+        let strip_hdr_pos = bytes.len();
+        bytes.extend_from_slice(&[0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 4, 0, 4]);
+        // Codebook chunks: header-only V4 full + V1 full with 1 entry.
+        bytes.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]); // 0x2000, size=4
+        bytes.extend_from_slice(&[0x22, 0x00, 0x00, 0x0a]); // 0x2200, size=10
+        bytes.extend_from_slice(&[50, 100, 150, 200, 0, 0]);
+        // Vector chunk 0x3200 with 1 MB.
+        bytes.extend_from_slice(&[0x32, 0x00, 0x00, 0x05]); // 0x3200, size=5
+        bytes.push(0); // V1 index 0
+
+        // Patch strip_size and frame_length.
+        let strip_size = (bytes.len() - strip_hdr_pos) as u16;
+        bytes[strip_hdr_pos + 2..strip_hdr_pos + 4].copy_from_slice(&strip_size.to_be_bytes());
+        let frame_len = bytes.len() as u32;
+        bytes[1] = ((frame_len >> 16) & 0xff) as u8;
+        bytes[2] = ((frame_len >> 8) & 0xff) as u8;
+        bytes[3] = (frame_len & 0xff) as u8;
+
+        let mut dec = CinepakDecoder::new();
+        let f = dec.decode_frame(&bytes, None).unwrap();
+        assert_eq!(f.width, 4);
+        assert_eq!(f.height, 4);
+        assert_eq!(f.pixel_format, CinepakPixelFormat::Rgb24);
+        // Y0=50 covers TL 2×2 → rows 0..1, cols 0..1.
+        // RGB for U=V=0: R = Y, G = Y, B = Y.
+        let p = f.pixels();
+        // Row 0, col 0: (50, 50, 50)
+        assert_eq!(p[0], 50);
+        assert_eq!(p[1], 50);
+        assert_eq!(p[2], 50);
+        // Row 0, col 2: Y1=100
+        assert_eq!(p[6], 100);
+        // Row 2, col 0: Y2=150
+        let row2_off = 2 * f.stride();
+        assert_eq!(p[row2_off], 150);
+        // Row 2, col 2: Y3=200
+        assert_eq!(p[row2_off + 6], 200);
+    }
+}

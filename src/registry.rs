@@ -11,11 +11,12 @@
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Error, Frame, Packet, PixelFormat, Result, RuntimeContext, VideoFrame,
+    Error, Frame, Packet, PixelFormat, ProbeContext, Result, RuntimeContext, VideoFrame,
 };
 
 use crate::decoder::CinepakDecoder;
 use crate::error::CinepakError;
+use crate::header::{FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER, STRIP_ID_INTRA};
 use crate::image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 use crate::CODEC_ID_STR;
 
@@ -79,6 +80,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(make_decoder)
+            .probe(probe_cvid)
             .tags([
                 CodecTag::fourcc(b"CVID"),
                 // QuickTime sample-entry tag `cvid` is also legal — the
@@ -86,6 +88,61 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
                 CodecTag::fourcc(b"cvid"),
             ]),
     );
+}
+
+/// Disambiguating probe for `CVID` FourCC. Confirms the first packet's
+/// 10-byte Cinepak frame header is structurally valid:
+/// - `flags & 0xfe == 0` (only bit 0 is defined),
+/// - `frame_length >= 10 + 12` (header + at least one strip header),
+/// - `width` and `height` non-zero, multiples of 4, ≤ 4096,
+/// - `strip_count >= 1`,
+/// - the first strip's `strip_id` is `0x1000` (intra) or `0x1100` (inter),
+/// - the first strip's `strip_size >= 12` and fits inside `frame_length`.
+///
+/// When no packet is available, returns `0.5` — Cinepak's `'cvid'`
+/// FourCC is rare enough to outweigh similar-named codecs even on weak
+/// evidence (no other codec in the registry currently claims `'cvid'`).
+pub fn probe_cvid(ctx: &ProbeContext) -> f32 {
+    let Some(pkt) = ctx.packet else {
+        return 0.5;
+    };
+    if pkt.len() < FRAME_HEADER_SIZE + STRIP_HEADER_SIZE {
+        return 0.0;
+    }
+    // Frame header structural checks.
+    let flags = pkt[0];
+    if flags & 0xfe != 0 {
+        return 0.0;
+    }
+    let frame_length = (u32::from(pkt[1]) << 16) | (u32::from(pkt[2]) << 8) | u32::from(pkt[3]);
+    if (frame_length as usize) < FRAME_HEADER_SIZE + STRIP_HEADER_SIZE {
+        return 0.0;
+    }
+    let width = u16::from_be_bytes([pkt[4], pkt[5]]);
+    let height = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
+        return 0.0;
+    }
+    if width > 4096 || height > 4096 {
+        return 0.0;
+    }
+    let strip_count = u16::from_be_bytes([pkt[8], pkt[9]]);
+    if strip_count == 0 {
+        return 0.0;
+    }
+    // First strip header.
+    let strip_id = u16::from_be_bytes([pkt[10], pkt[11]]);
+    if strip_id != STRIP_ID_INTRA && strip_id != STRIP_ID_INTER {
+        return 0.0;
+    }
+    let strip_size = u16::from_be_bytes([pkt[12], pkt[13]]);
+    if (strip_size as usize) < STRIP_HEADER_SIZE {
+        return 0.0;
+    }
+    if (FRAME_HEADER_SIZE + strip_size as usize) > frame_length as usize {
+        return 0.0;
+    }
+    1.0
 }
 
 /// Unified entry point: install the Cinepak codec into a
@@ -164,5 +221,51 @@ mod tests {
         let mut ctx = RuntimeContext::new();
         super::register(&mut ctx);
         assert!(ctx.codecs.decoder_ids().any(|id| id.as_str() == "cinepak"));
+    }
+
+    fn build_minimal_cvid_packet() -> Vec<u8> {
+        // 10-byte frame header + 12-byte strip header, no chunks. Not a
+        // *complete* decodable frame, but structurally valid for the probe.
+        let mut bytes = Vec::new();
+        // flags=0, frame_length=22, width=8, height=8, strip_count=1
+        bytes.extend_from_slice(&[0, 0, 0, 22, 0, 8, 0, 8, 0, 1]);
+        // strip_id=0x1000, strip_size=12, y_top=0, x_top=0, y_bottom=8, x_bottom=8
+        bytes.extend_from_slice(&[0x10, 0x00, 0, 12, 0, 0, 0, 0, 0, 8, 0, 8]);
+        bytes
+    }
+
+    #[test]
+    fn probe_accepts_valid_cvid_header() {
+        let pkt = build_minimal_cvid_packet();
+        let tag = CodecTag::fourcc(b"CVID");
+        let ctx = ProbeContext::new(&tag).packet(&pkt);
+        assert_eq!(super::probe_cvid(&ctx), 1.0);
+    }
+
+    #[test]
+    fn probe_rejects_misaligned_dims() {
+        let mut pkt = build_minimal_cvid_packet();
+        // Patch width to 7 (not multiple of 4).
+        pkt[4..6].copy_from_slice(&7u16.to_be_bytes());
+        let tag = CodecTag::fourcc(b"CVID");
+        let ctx = ProbeContext::new(&tag).packet(&pkt);
+        assert_eq!(super::probe_cvid(&ctx), 0.0);
+    }
+
+    #[test]
+    fn probe_rejects_bad_strip_id() {
+        let mut pkt = build_minimal_cvid_packet();
+        // Patch strip_id to 0x1234.
+        pkt[10..12].copy_from_slice(&0x1234u16.to_be_bytes());
+        let tag = CodecTag::fourcc(b"CVID");
+        let ctx = ProbeContext::new(&tag).packet(&pkt);
+        assert_eq!(super::probe_cvid(&ctx), 0.0);
+    }
+
+    #[test]
+    fn probe_returns_partial_confidence_without_packet() {
+        let tag = CodecTag::fourcc(b"CVID");
+        let ctx = ProbeContext::new(&tag);
+        assert_eq!(super::probe_cvid(&ctx), 0.5);
     }
 }

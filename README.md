@@ -5,12 +5,20 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Round 1 — clean-room rebuild from `docs/video/cinepak/spec/`.** The
-prior implementation was retired by the OxideAV docs audit dated
+**Rounds 1 + 2 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
 US patent 5,467,413, behavioural observation of system FFmpeg as a
 black-box CLI). FFmpeg source is not consulted at any phase.
+
+Round 1 landed a full clean-room decoder. Round 2 added a
+median-cut-quantiser **encoder** (V1+V4 codebooks, intra only), the
+**Sega FILM (CPK) demuxer** for the non-deviant `film_cpk` variant,
+synth-test coverage for the four selective-update codebook chunk types
+the FFmpeg encoder never emits (`0x2100` / `0x2300` / `0x2500` /
+`0x2700` — spec §4.4), and a **probe function** wired into the codec
+registry for `CVID` FourCC disambiguation.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -38,6 +46,30 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
+Encode side (round 2):
+
+- `encode_rgb24` / `encode_gray8` — single-strip intra encoder with
+  configurable codebook entry counts (default 64 V4 + 64 V1, matching
+  FFmpeg's `-q:v 10` "default quality" point per spec §4 of
+  `05-container-carriage.md`).
+- Median-cut codebook quantiser builds V1 and V4 codebooks
+  independently; per-MB nearest-neighbour selection picks V1 vs V4 by
+  squared-error against the source.
+- RGB→YUV forward transform algebraically inverts the spec's decoder
+  matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
+  to within the codec's quantisation tolerance.
+
+Container side (round 2):
+
+- `FilmDemuxer::parse` — Sega FILM / CPK header walker (FILM + FDSC +
+  STAB chunks). Standard 32-byte FDSC (FFmpeg `film_cpk`) and
+  abbreviated 20-byte FDSC (early Sega CD variants) both supported.
+- `probe_film` — lightweight `'FILM'` signature check.
+- `SampleRecord::is_keyframe` / `is_audio` / `timestamp_ticks` —
+  decode `sample_info_1` per spec §2.4.
+- Deviant Saturn variant (§2.6) is documented but not yet handled
+  beyond signature recognition (no Saturn fixture in corpus).
+
 ## Output pixel formats
 
 - `Rgb24` — 12-bit YUV streams converted via the spec's inverse
@@ -47,7 +79,12 @@ Decode side, end-to-end:
 ## FourCCs registered
 
 `CVID` (AVI `biCompression`, QuickTime `cvid` codec tag, Sega FILM
-`cvid` — all upper-cased through `CodecTag::fourcc`).
+`cvid` — all upper-cased through `CodecTag::fourcc`). Round 2 attached
+a probe function (`probe_cvid`) that confirms the 10-byte frame header
++ 12-byte first-strip header structure, returning `1.0` confidence
+when the structural fields are all valid and `0.0` when any check
+fails. Without packet bytes, returns `0.5` (Cinepak's `'cvid'` FourCC
+is unique enough that even weak evidence dominates).
 
 ## Standalone vs registry-integrated
 

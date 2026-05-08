@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 2: synth-test coverage for the four selective-update codebook
+  chunk types FFmpeg never emits (`0x2100` V4 YUV update, `0x2500` V4
+  grayscale update, `0x2700` V1 grayscale update; the existing
+  `0x2300` already had a regression test). Spec §4.4 documents these
+  as "wire-legal but encoder-optional"; the corresponding decode path
+  was already in round 1 but lacked dedicated test coverage.
+- Round 2: median-cut codebook-quantiser **encoder** (`encode_rgb24` /
+  `encode_gray8`). Single-strip intra only, configurable per-codebook
+  entry count (default 64+64, matching FFmpeg `-q:v 10`). Self-roundtrip
+  tests confirm pixel-correctness within codec quantisation tolerance
+  (±10 on RGB, ±8 on luma).
+- Round 2: **Sega FILM (CPK) demuxer** (`FilmDemuxer::parse`,
+  `probe_film`). Parses the FILM header + FDSC + STAB chunks per spec
+  §2 of `05-container-carriage.md`. Supports both the standard 32-byte
+  FDSC layout (FFmpeg `film_cpk` muxer) and the abbreviated 20-byte
+  layout (early Sega CD variants). Sample-record helpers
+  (`is_keyframe`, `is_audio`, `timestamp_ticks`) decode the
+  `sample_info_1` discriminator per §2.4.
+- Round 2: **probe function** for the `CVID` FourCC registration.
+  Validates the 10-byte frame header + 12-byte first-strip header
+  structure (flags, width/height alignment, strip_id 0x1000/0x1100,
+  size accounting). Returns 1.0 on structural validity, 0.5 without
+  packet bytes, 0.0 on failed checks.
+- Round 2: `encode_selective_chunk` helper for synthesising
+  `0x2100`/`0x2300`/`0x2500`/`0x2700` chunks; used by the
+  selective-chunk encode-roundtrip test.
+
 - Round 1 clean-room rebuild from `docs/video/cinepak/spec/`. Decode
   path covers:
   - 10-byte frame header parse (`flags`, 24-bit `frame_length`,

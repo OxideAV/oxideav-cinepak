@@ -324,6 +324,52 @@ pub fn encode_header_only_chunk(kind: CodebookChunkKind, out: &mut Vec<u8>) {
     out.extend_from_slice(&(CHUNK_HEADER_SIZE as u16).to_be_bytes());
 }
 
+/// Encode a selective-update chunk that replaces every entry index in
+/// `slots` with the corresponding entry from `cb`. `slots` must be in
+/// strictly ascending order and every index must be `< 256`.
+///
+/// The encoded chunk emits one 32-bit flag word per group of 32 slots
+/// (groups `0..31`, `32..63`, …, `224..255`). A group with no selected
+/// slots is still emitted as a zero flag word **only if** a later group
+/// has selected slots; trailing all-zero groups are elided. Per spec
+/// §4.2 the encoder MUST NOT emit more than 8 groups.
+///
+/// FFmpeg 7.1.2 never emits selective-update chunks (spec §4.4); this
+/// helper exists for the crate's encoder and roundtrip-test harnesses.
+pub fn encode_selective_chunk(
+    kind: CodebookChunkKind,
+    cb: &Codebook,
+    slots: &[u8],
+    out: &mut Vec<u8>,
+) {
+    debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
+    let entry_size = kind.mode.entry_size();
+    let mut groups: [(u32, Vec<u8>); 8] = Default::default();
+    let mut last_nonempty_group = 0usize;
+    for &slot in slots {
+        let g = (slot / 32) as usize;
+        let bit = slot % 32;
+        groups[g].0 |= 1u32 << (31 - bit);
+        let entry = &cb.entries[slot as usize];
+        let mut entry_bytes = [0u8; 6];
+        write_entry(kind.mode, entry, &mut entry_bytes);
+        groups[g].1.extend_from_slice(&entry_bytes[..entry_size]);
+        last_nonempty_group = last_nonempty_group.max(g);
+    }
+    // Compute payload size.
+    let mut payload_size = 0usize;
+    for g in groups.iter().take(last_nonempty_group + 1) {
+        payload_size += 4 + g.1.len();
+    }
+    let chunk_size = (CHUNK_HEADER_SIZE + payload_size) as u16;
+    out.extend_from_slice(&kind.to_id().to_be_bytes());
+    out.extend_from_slice(&chunk_size.to_be_bytes());
+    for g in groups.iter().take(last_nonempty_group + 1) {
+        out.extend_from_slice(&g.0.to_be_bytes());
+        out.extend_from_slice(&g.1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +465,76 @@ mod tests {
         let mut buf = Vec::new();
         encode_header_only_chunk(kind, &mut buf);
         assert_eq!(buf, vec![0x20, 0x00, 0x00, 0x04]);
+    }
+
+    /// Selective update on V4 12-bit YUV (`0x2100`). FFmpeg never emits
+    /// `0x2100` in any test corpus configuration (spec §4.4), so this
+    /// is a synthesis-only test of the wire-format decode path.
+    #[test]
+    fn applies_selective_v4_yuv_2100() {
+        let kind = CodebookChunkKind::from_id(0x2100).unwrap();
+        // Bits 31, 30, 29 = 1 → slots 0, 1, 2 of group 0.
+        let mut payload = vec![0xe0, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[10, 20, 30, 40, 5, 6]);
+        payload.extend_from_slice(&[50, 60, 70, 80, 7, 8]);
+        payload.extend_from_slice(&[90, 100, 110, 120, 9, 10]);
+        let mut cb = Codebook::default();
+        apply_codebook_chunk(kind, &payload, &mut cb).unwrap();
+        assert_eq!(cb.entries[0], CodebookEntry::from_yuv(10, 20, 30, 40, 5, 6));
+        assert_eq!(
+            cb.entries[2],
+            CodebookEntry::from_yuv(90, 100, 110, 120, 9, 10)
+        );
+        assert_eq!(cb.entries[3], CodebookEntry::default()); // unchanged
+    }
+
+    /// Selective update on V4 grayscale (`0x2500`). 4-byte entries.
+    /// Synthesis-only: spec §4.4.
+    #[test]
+    fn applies_selective_v4_gray_2500() {
+        let kind = CodebookChunkKind::from_id(0x2500).unwrap();
+        // Bit 30 of group 1 (= slot 33).
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[11, 22, 33, 44]);
+        let mut cb = Codebook::default();
+        apply_codebook_chunk(kind, &payload, &mut cb).unwrap();
+        assert_eq!(cb.entries[33], CodebookEntry::from_y(11, 22, 33, 44));
+        assert_eq!(cb.entries[32], CodebookEntry::default());
+    }
+
+    /// Selective update on V1 grayscale (`0x2700`). Synthesis-only.
+    #[test]
+    fn applies_selective_v1_gray_2700() {
+        let kind = CodebookChunkKind::from_id(0x2700).unwrap();
+        // Bit 0 of group 7 (slot 255).
+        let mut payload = vec![0x00; 4 * 7];
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        let mut cb = Codebook::default();
+        apply_codebook_chunk(kind, &payload, &mut cb).unwrap();
+        assert_eq!(cb.entries[255], CodebookEntry::from_y(1, 2, 3, 4));
+    }
+
+    /// Encoder roundtrip: encode a selective-update chunk + decode.
+    #[test]
+    fn selective_chunk_encode_roundtrip() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut cb = Codebook::default();
+        cb.entries[0] = CodebookEntry::from_yuv(1, 2, 3, 4, 5, 6);
+        cb.entries[33] = CodebookEntry::from_yuv(7, 8, 9, 10, 11, 12);
+        cb.entries[200] = CodebookEntry::from_yuv(13, 14, 15, 16, -1, -2);
+        let slots = [0u8, 33, 200];
+        let mut buf = Vec::new();
+        encode_selective_chunk(kind, &cb, &slots, &mut buf);
+        // Strip header.
+        let payload = &buf[CHUNK_HEADER_SIZE..];
+        let mut out = Codebook::default();
+        apply_codebook_chunk(kind, payload, &mut out).unwrap();
+        for &s in &slots {
+            assert_eq!(out.entries[s as usize], cb.entries[s as usize]);
+        }
+        // Untouched entries.
+        assert_eq!(out.entries[1], CodebookEntry::default());
     }
 
     #[test]

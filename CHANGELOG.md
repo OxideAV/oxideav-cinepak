@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 3: **multi-strip encoder** (`EncoderOptions::strip_count`).
+  Splits the frame into N horizontal bands and runs the median-cut
+  quantiser independently per strip, so each band gets its own V1+V4
+  codebook pair tuned to its local pixel population. Round-trips
+  through the decoder with the y-sentinel rule (first strip carries
+  absolute coords; subsequent strips ride on the previous strip's
+  `y_bottom`).
+- Round 3: **inter-frame encoder** (`encode_rgb24_inter`). For each
+  macroblock, computes per-pixel MSE against the same-position 4×4
+  block in the previous reconstructed frame; below
+  `EncoderOptions::skip_threshold` the macroblock is emitted as a
+  `0x3100` SKIP code, otherwise a V1/V4 update is selected by the
+  same nearest-neighbour rule as intra. Strips are tagged
+  `STRIP_ID_INTER` (`0x1100`) and the vector chunk is `0x3100`.
+- Round 3: **PSNR-driven quality knob**
+  (`EncoderOptions::from_quality(q)`, `q ∈ 0..=100`). Maps to codebook
+  size (8..=256, log scale), strip count (1..=4), and skip threshold
+  (256.0..=16.0, exponential). One call covers the full quality–wire-size
+  trade-off curve without hand-tuning each knob.
+- Round 3: **black-box behavioural verification against FFmpeg**
+  (`tests/ffmpeg_psnr.rs`). Encodes a synthetic 320×240 RGB24 gradient
+  fixture with `quality = 50`, packages the frame in a minimal AVI
+  container, decodes via system `ffmpeg` (treated as an opaque CLI
+  oracle), and asserts PSNR ≥ 28 dB versus the source. Observed PSNR
+  ≈ 30.1 dB. Test gracefully skips when `ffmpeg` is unavailable or
+  `OXIDEAV_SKIP_FFMPEG_TESTS` is set.
 - Round 2: synth-test coverage for the four selective-update codebook
   chunk types FFmpeg never emits (`0x2100` V4 YUV update, `0x2500` V4
   grayscale update, `0x2700` V1 grayscale update; the existing

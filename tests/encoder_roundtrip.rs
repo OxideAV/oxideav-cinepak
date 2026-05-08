@@ -116,6 +116,7 @@ fn rgb24_tiny_codebook_4_entries() {
     let opts = EncoderOptions {
         v4_entries: 4,
         v1_entries: 4,
+        ..EncoderOptions::default()
     };
     let bytes = encode_rgb24(&rgb, w as u32, h as u32, opts).unwrap();
     let mut dec = CinepakDecoder::new();

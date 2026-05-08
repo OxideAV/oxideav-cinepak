@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -18,7 +18,15 @@ median-cut-quantiser **encoder** (V1+V4 codebooks, intra only), the
 synth-test coverage for the four selective-update codebook chunk types
 the FFmpeg encoder never emits (`0x2100` / `0x2300` / `0x2500` /
 `0x2700` — spec §4.4), and a **probe function** wired into the codec
-registry for `CVID` FourCC disambiguation.
+registry for `CVID` FourCC disambiguation. Round 3 extended the
+encoder with **multi-strip** output + per-strip codebook adaptation, an
+**inter-frame encoder** with skip-MB selection (per-pixel MSE
+threshold), a **PSNR-driven quality knob** (`EncoderOptions::from_quality(q)`
+mapping `q ∈ 0..=100` to codebook size + strip count + skip threshold),
+and a **black-box behavioural-verification test** that wraps an
+encoder-emitted frame in AVI, decodes it through system `ffmpeg`, and
+asserts PSNR ≥ 28 dB versus the source (≈ 30 dB on the synthetic 320×240
+gradient fixture).
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -46,14 +54,21 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (round 2):
+Encode side (rounds 2 + 3):
 
-- `encode_rgb24` / `encode_gray8` — single-strip intra encoder with
+- `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
   FFmpeg's `-q:v 10` "default quality" point per spec §4 of
   `05-container-carriage.md`).
+- `encode_rgb24_inter` — inter-frame encoder. Compares each macroblock
+  against the same-position 4×4 block in the previous reconstructed
+  frame; macroblocks whose per-pixel MSE is below `skip_threshold` are
+  emitted as `0x3100` SKIP codes, the rest carry V1/V4 updates.
+- `EncoderOptions::from_quality(q)` — single PSNR-style knob `q ∈
+  0..=100` mapping to codebook size (8..=256, log scale), strip count
+  (1..=4), and skip threshold (256.0..=16.0, exponential).
 - Median-cut codebook quantiser builds V1 and V4 codebooks
-  independently; per-MB nearest-neighbour selection picks V1 vs V4 by
+  per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`

@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 4: **selective-update codebook chunks on inter strips**
+  (`CinepakEncoder` stateful struct). The encoder tracks the rolling
+  V4/V1 codebook the decoder will hold across strips and frames, and
+  for each inter strip emits a `0x2100` / `0x2300` selective-update
+  chunk (only changed slots) when smaller than the equivalent
+  `0x2000` / `0x2200` full-replace — or omits the codebook chunk
+  entirely (spec §3.4: "header-only / omitted = inherit previous
+  strip's codebook") when the previous codebook already has the
+  correct values for every slot the strip's macroblocks reference.
+  Free-function entry points (`encode_rgb24` / `encode_rgb24_inter` /
+  `encode_gray8`) are unchanged — they remain stateless and always
+  emit full-replace. Public surface: `CinepakEncoder::new` /
+  `::reset` / `::encode_intra` / `::encode_inter`.
+- Round 4: **multi-frame static-fixture wire-size validation test**
+  (`tests/static_fixture_multi_frame.rs`). Drives `CinepakEncoder`
+  with one intra keyframe + five identical inter frames and asserts:
+  (a) every frame round-trips through `CinepakDecoder` within the
+  codec's quantisation tolerance, (b) total inter-frame wire size is
+  strictly smaller than the equivalent stateless `encode_rgb24_inter`
+  run (observed: 91.6% wire savings — 250 B vs 2990 B for 5 inter
+  frames at quality 50), (c) the SKIP-MB fraction grows / saturates
+  across frames (observed: 64 / 64 macroblocks SKIP'd from frame 1
+  through frame 5 once the rolling codebook stabilises).
+
+### Round 3
+
 - Round 3: **multi-strip encoder** (`EncoderOptions::strip_count`).
   Splits the frame into N horizontal bands and runs the median-cut
   quantiser independently per strip, so each band gets its own V1+V4

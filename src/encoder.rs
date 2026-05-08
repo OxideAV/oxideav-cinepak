@@ -35,13 +35,40 @@
 //! higher PSNR, at the cost of larger wire size from N codebook
 //! chunks).
 //!
+//! ## Selective-update codebook chunks (round 4)
+//!
+//! For **inter** strips emitted via [`CinepakEncoder::encode_inter`],
+//! the encoder tracks the rolling V4/V1 codebook state that the
+//! decoder will see (across strips and across frames) and, for each
+//! strip, compares the freshly-trained codebook against the previous
+//! one. If most slots are unchanged it emits a `0x2100` / `0x2300`
+//! selective-update chunk (only changed slots) instead of `0x2000` /
+//! `0x2200` full-replace; on a perfectly-static fixture the codebook
+//! is byte-identical and no codebook chunk is emitted at all (spec
+//! §3.4: omitted codebook chunk = inherit previous strip's).
+//!
+//! Wire-size cost (per chunk):
+//!
+//! ```text
+//! full-replace V4 12-bit YUV      = 4 + N × 6           (N = entry count)
+//! selective-update V4 12-bit YUV  = 4 + Σ_g (4 + 6 × popcount(flag_g))
+//! ```
+//!
+//! Selective wins when the changed-slot count `K` plus the group-flag
+//! overhead beats `N × 6 / entry_size`. The encoder picks whichever is
+//! smaller, falling back to full-replace on first frames or whenever
+//! `K ≥ N`.
+//!
+//! Free-function entry points ([`encode_rgb24`] / [`encode_rgb24_inter`]
+//! / [`encode_gray8`]) remain stateless and always emit full-replace —
+//! they don't carry the prior-codebook context selective updates need.
+//!
 //! ## Limitations
 //!
-//! - 12-bit YUV via `encode_rgb24` / `encode_rgb24_inter`; 8-bit
-//!   grayscale via `encode_gray8`.
-//! - No selective-update chunks for inter streams (decoder accepts
-//!   them but our encoder uses full-replace per strip — simpler and
-//!   matches FFmpeg's behaviour, spec §4.4).
+//! - 12-bit YUV via `encode_rgb24` / `encode_rgb24_inter` /
+//!   [`CinepakEncoder`]; 8-bit grayscale via `encode_gray8` only.
+//! - Selective-update chunks are emitted by the stateful
+//!   [`CinepakEncoder`] only.
 
 // The encoder uses index-based loops (`for sub_idx in 0..4`) to keep
 // the spatial-position arithmetic (`sub_row = idx / 2`, `sub_col = idx
@@ -50,8 +77,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::codebook::{
-    encode_full_chunk, Codebook, CodebookChunkKind, CodebookEntry, PixelMode, UpdateStyle,
-    WhichCodebook, CHUNK_HEADER_SIZE,
+    encode_full_chunk, encode_selective_chunk, Codebook, CodebookChunkKind, CodebookEntry,
+    PixelMode, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
 };
 use crate::error::{CinepakError, Result};
 use crate::header::{
@@ -166,6 +193,138 @@ pub fn encode_rgb24(rgb: &[u8], width: u32, height: u32, opts: EncoderOptions) -
     encode_intra_frame(rgb, width, height, PixelMode::Yuv12, opts)
 }
 
+/// Stateful Cinepak encoder. Tracks the rolling V4/V1 codebook the
+/// decoder will hold across strips and frames so that **inter** frames
+/// can emit selective-update codebook chunks (`0x2100` / `0x2300` /
+/// `0x2500` / `0x2700`) — and omit codebook chunks entirely when the
+/// previous codebook is already correct for the strip's referenced
+/// slots — instead of always emitting full-replace.
+///
+/// Use [`CinepakEncoder::encode_intra`] to start a sequence (or to
+/// inject a keyframe) and [`CinepakEncoder::encode_inter`] for
+/// subsequent frames. The encoder also tracks the previous
+/// reconstructed frame internally for SKIP-MB selection, so callers
+/// don't need to thread it through.
+///
+/// On a perfectly-static fixture (input pixels unchanged across
+/// frames), `encode_inter` after the second frame typically emits
+/// **no** codebook chunks at all — only an empty `0x3100` vector
+/// chunk full of SKIP codes. This is the headline wire-size win
+/// motivating the round-4 design.
+#[derive(Default)]
+pub struct CinepakEncoder {
+    rolling: RollingCodebooks,
+    /// Previous reconstructed frame, decoded back from our last
+    /// emitted bitstream. Required for `encode_inter`'s SKIP-MB
+    /// detection.
+    prev_frame: Option<CinepakFrame>,
+    /// Internal decoder used to reconstruct the previous frame from
+    /// our own emitted bytes. Held so its prev-frame state is in sync
+    /// with what an external receiver-side decoder will see.
+    decoder: crate::decoder::CinepakDecoder,
+}
+
+impl CinepakEncoder {
+    /// Construct a fresh encoder. The first call must be
+    /// [`Self::encode_intra`] (no prev frame for SKIP comparison).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset all state. The encoder behaves as if it had never seen a
+    /// frame — the next call must be [`Self::encode_intra`].
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Encode an intra frame from packed `Rgb24` input. Resets the
+    /// rolling codebook state (intra strips always emit full-replace
+    /// codebook chunks anyway, but this also clears any stale
+    /// selective-update reference).
+    pub fn encode_intra(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
+        validate_dims(width, height)?;
+        validate_opts(&opts)?;
+        validate_input_size(rgb, width, height, PixelMode::Yuv12)?;
+
+        let mb_rows = (height / 4) as usize;
+        let strips = plan_strips(mb_rows, opts.strip_count as usize);
+        let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
+        // Intra resets rolling: intra strips always emit full-replace.
+        self.rolling = RollingCodebooks::default();
+        for s in &strips {
+            let bytes =
+                encode_intra_strip(rgb, width, PixelMode::Yuv12, &opts, s, &mut self.rolling)?;
+            frame_strips.push(bytes);
+        }
+        let bytes = assemble_frame(width, height, &frame_strips)?;
+        // Reconstruct frame for next-call SKIP-MB selection.
+        self.decoder.reset();
+        let f = self.decoder.decode_frame(&bytes, None)?;
+        self.prev_frame = Some(f);
+        Ok(bytes)
+    }
+
+    /// Encode an inter frame from packed `Rgb24` input, referencing
+    /// the previously-emitted frame for SKIP-MB selection and using
+    /// the rolling codebook state for selective-update emission.
+    ///
+    /// Returns an error if no prior frame has been emitted (the first
+    /// call must be [`Self::encode_intra`]).
+    pub fn encode_inter(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
+        validate_dims(width, height)?;
+        validate_opts(&opts)?;
+        validate_input_size(rgb, width, height, PixelMode::Yuv12)?;
+
+        let prev = self.prev_frame.as_ref().ok_or_else(|| {
+            CinepakError::other("encoder: encode_inter called before encode_intra; no prev frame")
+        })?;
+        if prev.width != width || prev.height != height {
+            return Err(CinepakError::other(format!(
+                "encoder: prev frame dims {}x{} != current {width}x{height}",
+                prev.width, prev.height
+            )));
+        }
+
+        let mb_rows = (height / 4) as usize;
+        let strips = plan_strips(mb_rows, opts.strip_count as usize);
+        let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
+        let prev = self.prev_frame.as_ref().unwrap().clone();
+        for s in &strips {
+            let bytes = encode_inter_strip(
+                rgb,
+                &prev,
+                width,
+                PixelMode::Yuv12,
+                &opts,
+                s,
+                &mut self.rolling,
+                true,
+            )?;
+            frame_strips.push(bytes);
+        }
+        let bytes = assemble_frame(width, height, &frame_strips)?;
+        // Reconstruct frame for next-call SKIP-MB selection. The
+        // internal decoder picks up from where it left off, so its
+        // codebook + prev-frame state stays in sync with an external
+        // receiver-side decoder.
+        let f = self.decoder.decode_frame(&bytes, None)?;
+        self.prev_frame = Some(f);
+        Ok(bytes)
+    }
+}
+
 /// Encode an 8-bit grayscale intra frame from packed `Gray8` input
 /// (`width × height` bytes).
 pub fn encode_gray8(gray: &[u8], width: u32, height: u32, opts: EncoderOptions) -> Result<Vec<u8>> {
@@ -224,8 +383,9 @@ fn encode_intra_frame(
     let strips = plan_strips(mb_rows, opts.strip_count as usize);
 
     let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
+    let mut roll = RollingCodebooks::default();
     for s in &strips {
-        let bytes = encode_intra_strip(pixels, width, mode, &opts, s)?;
+        let bytes = encode_intra_strip(pixels, width, mode, &opts, s, &mut roll)?;
         frame_strips.push(bytes);
     }
     assemble_frame(width, height, &frame_strips)
@@ -250,9 +410,12 @@ fn encode_inter_frame(
     let mb_rows = (height / 4) as usize;
     let strips = plan_strips(mb_rows, opts.strip_count as usize);
 
+    // Stateless free-function path: no rolling codebook context, so
+    // every strip emits full-replace codebook chunks.
     let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
+    let mut roll = RollingCodebooks::default();
     for s in &strips {
-        let bytes = encode_inter_strip(pixels, prev, width, mode, &opts, s)?;
+        let bytes = encode_inter_strip(pixels, prev, width, mode, &opts, s, &mut roll, false)?;
         frame_strips.push(bytes);
     }
     assemble_frame(width, height, &frame_strips)
@@ -297,12 +460,13 @@ fn encode_intra_strip(
     mode: PixelMode,
     opts: &EncoderOptions,
     s: &StripPlan,
+    roll: &mut RollingCodebooks,
 ) -> Result<Vec<u8>> {
     let plan = build_codebooks_and_decisions(pixels, width, mode, opts, s, None, false)?;
     let StripPlanResult { v4_cb, v1_cb, mbs } = plan;
 
     let mut chunks = Vec::new();
-    emit_codebook_chunks(mode, &v4_cb, &v1_cb, opts, &mut chunks);
+    emit_codebook_chunks_full(mode, &v4_cb, &v1_cb, opts, &mut chunks);
 
     // Vector chunk 0x3000 (mixed intra).
     let mut vec_payload = Vec::new();
@@ -312,9 +476,15 @@ fn encode_intra_strip(
     chunks.extend_from_slice(&vec_chunk_size.to_be_bytes());
     chunks.extend_from_slice(&vec_payload);
 
+    // Update rolling state — intra always replaces both codebooks
+    // wholesale at sizes `opts.v?_entries`.
+    roll.set(WhichCodebook::V4, v4_cb, opts.v4_entries as usize);
+    roll.set(WhichCodebook::V1, v1_cb, opts.v1_entries as usize);
+
     finalise_strip(STRIP_ID_INTRA, s, width, &chunks)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_inter_strip(
     pixels: &[u8],
     prev: &CinepakFrame,
@@ -322,12 +492,31 @@ fn encode_inter_strip(
     mode: PixelMode,
     opts: &EncoderOptions,
     s: &StripPlan,
+    roll: &mut RollingCodebooks,
+    selective_enabled: bool,
 ) -> Result<Vec<u8>> {
     let plan = build_codebooks_and_decisions(pixels, width, mode, opts, s, Some(prev), true)?;
     let StripPlanResult { v4_cb, v1_cb, mbs } = plan;
 
+    // Determine which slots in each codebook are actually referenced by
+    // the strip's macroblocks. Slots not referenced don't need to be
+    // present in the decoder's codebook for this strip — and skipping
+    // their emission saves wire bytes.
+    let v4_used = used_v4_slots(&mbs);
+    let v1_used = used_v1_slots(&mbs);
+
     let mut chunks = Vec::new();
-    emit_codebook_chunks(mode, &v4_cb, &v1_cb, opts, &mut chunks);
+    emit_codebook_chunks_inter(
+        mode,
+        &v4_cb,
+        &v1_cb,
+        opts,
+        roll,
+        selective_enabled,
+        &v4_used,
+        &v1_used,
+        &mut chunks,
+    );
 
     // Vector chunk 0x3100 (mixed inter with skip).
     let mut vec_payload = Vec::new();
@@ -435,7 +624,7 @@ fn build_codebooks_and_decisions(
     })
 }
 
-fn emit_codebook_chunks(
+fn emit_codebook_chunks_full(
     mode: PixelMode,
     v4_cb: &Codebook,
     v1_cb: &Codebook,
@@ -454,6 +643,199 @@ fn emit_codebook_chunks(
     };
     encode_full_chunk(v4_kind, v4_cb, opts.v4_entries as usize, out);
     encode_full_chunk(v1_kind, v1_cb, opts.v1_entries as usize, out);
+}
+
+/// Emit codebook chunks for an inter strip, choosing between
+/// full-replace, selective-update, and "no chunk at all" (= inherit
+/// previous strip's codebook) per codebook flavour. Updates `roll`'s
+/// state to reflect what the decoder will hold after applying these
+/// chunks, since subsequent strips (and frames) inherit from there.
+///
+/// Wire-size budget per chunk:
+///
+/// - `full-replace`: `4 + N × entry_size`.
+/// - `selective`: `4 + Σ_g (4 + entry_size × popcount(flag_g))`,
+///   where `entry_size` is `6` (Yuv12) or `4` (Gray8).
+/// - `none`: 0 (legal when the codebook is identical to the inherited
+///   one and all referenced slots are already populated correctly).
+#[allow(clippy::too_many_arguments)]
+fn emit_codebook_chunks_inter(
+    mode: PixelMode,
+    v4_cb: &Codebook,
+    v1_cb: &Codebook,
+    opts: &EncoderOptions,
+    roll: &mut RollingCodebooks,
+    selective_enabled: bool,
+    v4_used: &[bool; 256],
+    v1_used: &[bool; 256],
+    out: &mut Vec<u8>,
+) {
+    emit_codebook_chunk_one(
+        mode,
+        WhichCodebook::V4,
+        v4_cb,
+        opts.v4_entries as usize,
+        roll,
+        selective_enabled,
+        v4_used,
+        out,
+    );
+    emit_codebook_chunk_one(
+        mode,
+        WhichCodebook::V1,
+        v1_cb,
+        opts.v1_entries as usize,
+        roll,
+        selective_enabled,
+        v1_used,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_codebook_chunk_one(
+    mode: PixelMode,
+    which: WhichCodebook,
+    cb: &Codebook,
+    n: usize,
+    roll: &mut RollingCodebooks,
+    selective_enabled: bool,
+    used: &[bool; 256],
+    out: &mut Vec<u8>,
+) {
+    let entry_size = mode.entry_size();
+    let prev = roll.get(which);
+
+    // Compute "differing-slot" mask vs prev codebook (only meaningful
+    // if a prev exists with the same N).
+    let prev_matches = match prev {
+        Some((prev_cb, prev_n)) if *prev_n == n => Some(prev_cb),
+        _ => None,
+    };
+
+    // 1) Determine which slots actually need to differ from the
+    //    decoder's current state. Slots not used by any MB in this
+    //    strip don't need to be "correct" — their decoder-side value
+    //    is irrelevant.
+    let mut need_update: Vec<u8> = Vec::new();
+    for slot in 0..n {
+        if !used[slot] {
+            continue;
+        }
+        let differs = match prev_matches {
+            Some(prev_cb) => prev_cb.entries[slot] != cb.entries[slot],
+            None => true,
+        };
+        if differs {
+            need_update.push(slot as u8);
+        }
+    }
+
+    // 2) Decide chunk format by wire-size cost.
+    let full_size = CHUNK_HEADER_SIZE + n * entry_size;
+    let none_size = 0usize;
+    let selective_size = if need_update.is_empty() {
+        // Empty selective-update would still cost a 4-byte header +
+        // 4-byte zero flag word = 8 bytes. The "none" form (omit chunk
+        // entirely) wins.
+        usize::MAX
+    } else {
+        let max_slot = *need_update.last().unwrap() as usize;
+        let groups = (max_slot / 32) + 1;
+        CHUNK_HEADER_SIZE + groups * 4 + need_update.len() * entry_size
+    };
+
+    // Conditions: emitting "none" only legal if the prev codebook
+    // satisfies all referenced slots already (i.e. no need_update
+    // entries). For first-strip-of-first-frame (no prev), full is the
+    // only option.
+    let can_emit_none = prev_matches.is_some() && need_update.is_empty();
+
+    let kind_full = CodebookChunkKind {
+        which,
+        style: UpdateStyle::Full,
+        mode,
+    };
+    let kind_sel = CodebookChunkKind {
+        which,
+        style: UpdateStyle::Selective,
+        mode,
+    };
+
+    if can_emit_none && none_size <= full_size {
+        // Omit chunk entirely. Decoder inherits prev codebook (spec §5).
+        // Roll-state update: codebook stays exactly as `prev` — the
+        // slots not referenced by this strip's MBs may differ between
+        // `cb` and `prev`, so we MUST record the decoder's actual
+        // view (= `prev`) rather than our freshly-trained `cb` to
+        // keep cross-strip codebook tracking accurate.
+        let prev_cb = prev_matches.unwrap().clone();
+        roll.set(which, prev_cb, n);
+    } else if selective_enabled
+        && prev_matches.is_some()
+        && !need_update.is_empty()
+        && selective_size < full_size
+    {
+        encode_selective_chunk(kind_sel, cb, &need_update, out);
+        // After selective-update, the decoder's codebook = prev's
+        // codebook with the listed slots replaced. Build that view.
+        let mut new_cb = prev_matches.unwrap().clone();
+        for &slot in &need_update {
+            new_cb.entries[slot as usize] = cb.entries[slot as usize];
+        }
+        roll.set(which, new_cb, n);
+    } else {
+        encode_full_chunk(kind_full, cb, n, out);
+        roll.set(which, cb.clone(), n);
+    }
+}
+
+/// Bitmask of V4 codebook slots referenced by any V4 macroblock.
+fn used_v4_slots(mbs: &[Mb]) -> [bool; 256] {
+    let mut used = [false; 256];
+    for mb in mbs {
+        if let Mb::V4(idx) = mb {
+            for &i in idx {
+                used[i as usize] = true;
+            }
+        }
+    }
+    used
+}
+
+/// Bitmask of V1 codebook slots referenced by any V1 macroblock.
+fn used_v1_slots(mbs: &[Mb]) -> [bool; 256] {
+    let mut used = [false; 256];
+    for mb in mbs {
+        if let Mb::V1(idx) = mb {
+            used[*idx as usize] = true;
+        }
+    }
+    used
+}
+
+/// Tracks the V4 and V1 codebook the decoder will hold at the start of
+/// the next strip. Updated after emitting each strip's codebook chunks.
+#[derive(Clone, Default)]
+struct RollingCodebooks {
+    v4: Option<(Codebook, usize)>,
+    v1: Option<(Codebook, usize)>,
+}
+
+impl RollingCodebooks {
+    fn get(&self, which: WhichCodebook) -> Option<&(Codebook, usize)> {
+        match which {
+            WhichCodebook::V4 => self.v4.as_ref(),
+            WhichCodebook::V1 => self.v1.as_ref(),
+        }
+    }
+
+    fn set(&mut self, which: WhichCodebook, cb: Codebook, n: usize) {
+        match which {
+            WhichCodebook::V4 => self.v4 = Some((cb, n)),
+            WhichCodebook::V1 => self.v1 = Some((cb, n)),
+        }
+    }
 }
 
 fn finalise_strip(strip_id: u16, s: &StripPlan, width: u32, chunks: &[u8]) -> Result<Vec<u8>> {

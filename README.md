@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -26,7 +26,13 @@ mapping `q ∈ 0..=100` to codebook size + strip count + skip threshold),
 and a **black-box behavioural-verification test** that wraps an
 encoder-emitted frame in AVI, decodes it through system `ffmpeg`, and
 asserts PSNR ≥ 28 dB versus the source (≈ 30 dB on the synthetic 320×240
-gradient fixture).
+gradient fixture). Round 4 added a stateful **`CinepakEncoder`** that
+tracks the rolling V4/V1 codebook across strips and frames so inter
+frames can emit `0x2100` / `0x2300` **selective-update** codebook
+chunks (only changed slots) — or omit the chunk entirely when the
+previous codebook is already correct for the strip's referenced slots.
+On a static fixture the round-4 path drops 91.6% of the inter-frame
+wire bytes versus the stateless round-3 `encode_rgb24_inter` helper.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -67,6 +73,14 @@ Encode side (rounds 2 + 3):
 - `EncoderOptions::from_quality(q)` — single PSNR-style knob `q ∈
   0..=100` mapping to codebook size (8..=256, log scale), strip count
   (1..=4), and skip threshold (256.0..=16.0, exponential).
+- `CinepakEncoder` (round 4, stateful) — tracks the rolling V4/V1
+  codebook the decoder will hold across strips and frames; emits
+  `0x2100` / `0x2300` **selective-update** codebook chunks (only
+  changed slots) when smaller than full-replace, or omits the
+  codebook chunk entirely (spec §3.4: "inherit previous strip's
+  codebook") when the previous codebook is already correct. Saves
+  91.6% of inter-frame wire bytes on a static 32×32 fixture vs. the
+  stateless `encode_rgb24_inter` path.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -33,6 +33,15 @@ chunks (only changed slots) — or omit the chunk entirely when the
 previous codebook is already correct for the strip's referenced slots.
 On a static fixture the round-4 path drops 91.6% of the inter-frame
 wire bytes versus the stateless round-3 `encode_rgb24_inter` helper.
+Round 5 added **cross-frame codebook persistence** at the median-cut
+training step (Lloyd warm-start with prior centroids; preserves slot
+identity for chunk-omission), **multi-strip inter selective-update**
+verification (44.0% wire savings on slow-pan 4-strip content vs the
+stateless full-replace path), a **two-pass rate control** wrapper
+(`TwoPassRateControl` — grid-search on quality knob to hit a
+target byte budget per frame), and a fix for a **`0x3100`
+selector-spillover decoder bug** uncovered by the new
+multi-strip-inter wire patterns.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -60,7 +69,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3):
+Encode side (rounds 2 + 3 + 4 + 5):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -81,6 +90,16 @@ Encode side (rounds 2 + 3):
   codebook") when the previous codebook is already correct. Saves
   91.6% of inter-frame wire bytes on a static 32×32 fixture vs. the
   stateless `encode_rgb24_inter` path.
+- `CinepakEncoder::set_cross_frame_codebook_persistence(bool)` (round
+  5, default `true`) — the median-cut quantiser warm-starts each inter
+  frame's training with the prior frame's codebook centroids (one
+  Lloyd refinement pass), preserving slot identity so chunk-omission
+  / selective-update fires on slow-pan content too. Multi-strip inter
+  on slow-pan: **44.0% wire savings** vs the stateless full-replace
+  path on a 64×64 4-strip fixture.
+- `TwoPassRateControl` / `RateControlledFrame` (round 5) — first
+  pass collects per-frame byte stats at a reference quality, second
+  pass picks the largest grid-quality whose byte count is `≤ target`.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

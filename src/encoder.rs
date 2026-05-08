@@ -211,7 +211,19 @@ pub fn encode_rgb24(rgb: &[u8], width: u32, height: u32, opts: EncoderOptions) -
 /// **no** codebook chunks at all — only an empty `0x3100` vector
 /// chunk full of SKIP codes. This is the headline wire-size win
 /// motivating the round-4 design.
-#[derive(Default)]
+///
+/// ## Cross-frame codebook persistence (round 5)
+///
+/// On `encode_inter`, the median-cut quantiser is warm-started with
+/// the previous frame's codebook centroids (one Lloyd refinement
+/// pass): each new vector is assigned to the slot of its nearest
+/// prior centroid, and that slot's new centroid is the average of the
+/// vectors that landed there. Slots with no incoming vectors retain
+/// the prior centroid byte-identical, which lets the chunk-omission
+/// path keep firing on slow-pan content where most macroblocks shift
+/// but the codebook population is roughly stable. Disable via
+/// [`Self::set_cross_frame_codebook_persistence`] for A/B
+/// measurements.
 pub struct CinepakEncoder {
     rolling: RollingCodebooks,
     /// Previous reconstructed frame, decoded back from our last
@@ -222,6 +234,19 @@ pub struct CinepakEncoder {
     /// our own emitted bytes. Held so its prev-frame state is in sync
     /// with what an external receiver-side decoder will see.
     decoder: crate::decoder::CinepakDecoder,
+    /// Round-5 cross-frame codebook persistence toggle. Default `true`.
+    cross_frame_persistence: bool,
+}
+
+impl Default for CinepakEncoder {
+    fn default() -> Self {
+        Self {
+            rolling: RollingCodebooks::default(),
+            prev_frame: None,
+            decoder: crate::decoder::CinepakDecoder::new(),
+            cross_frame_persistence: true,
+        }
+    }
 }
 
 impl CinepakEncoder {
@@ -232,9 +257,27 @@ impl CinepakEncoder {
     }
 
     /// Reset all state. The encoder behaves as if it had never seen a
-    /// frame — the next call must be [`Self::encode_intra`].
+    /// frame — the next call must be [`Self::encode_intra`]. Preserves
+    /// the cross-frame persistence flag.
     pub fn reset(&mut self) {
+        let cf = self.cross_frame_persistence;
         *self = Self::default();
+        self.cross_frame_persistence = cf;
+    }
+
+    /// Toggle round-5 cross-frame codebook persistence (warm-starting
+    /// the median-cut quantiser with the previous frame's centroids).
+    /// Default `true`.
+    ///
+    /// Useful for A/B wire-size measurements; for production encoding
+    /// the default is the recommended setting.
+    pub fn set_cross_frame_codebook_persistence(&mut self, on: bool) {
+        self.cross_frame_persistence = on;
+    }
+
+    /// Whether cross-frame codebook persistence is currently enabled.
+    pub fn cross_frame_codebook_persistence(&self) -> bool {
+        self.cross_frame_persistence
     }
 
     /// Encode an intra frame from packed `Rgb24` input. Resets the
@@ -311,6 +354,7 @@ impl CinepakEncoder {
                 s,
                 &mut self.rolling,
                 true,
+                self.cross_frame_persistence,
             )?;
             frame_strips.push(bytes);
         }
@@ -329,6 +373,208 @@ impl CinepakEncoder {
 /// (`width × height` bytes).
 pub fn encode_gray8(gray: &[u8], width: u32, height: u32, opts: EncoderOptions) -> Result<Vec<u8>> {
     encode_intra_frame(gray, width, height, PixelMode::Gray8, opts)
+}
+
+/// Two-pass rate control wrapping a [`CinepakEncoder`] (round 5).
+///
+/// Pass 1 ([`Self::stats_pass`]): drives the encoder at a fixed
+/// reference quality across the full input sequence and records
+/// per-frame byte counts. The aggregate gives the average frame size
+/// at that quality — used as a starting point for pass-2 budgeting.
+///
+/// Pass 2 ([`Self::encode_at_target_bytes`]): for each frame, picks
+/// the **largest** `q ∈ 0..=100` from a sparse grid whose encoded
+/// byte count is `≤ target_bytes`. If no quality satisfies the
+/// target (even q=0 overflows), the q=0 result is returned with a
+/// positive [`RateControlledFrame::byte_delta`] — the API never
+/// errors on rate overshoot.
+///
+/// Each per-frame quality search re-encodes the entire prior
+/// sub-sequence through a throwaway encoder, so total cost is
+/// O(N² × G) where N = frame count and G = grid size (11). This is
+/// acceptable for offline two-pass rate control which isn't on the
+/// real-time hot path; the structure is the same as ffmpeg's
+/// `--passlogfile` two-pass mode but with a coarser grid.
+///
+/// Limitations:
+///
+/// - Per-frame budget — no rate smoothing across frames. The caller
+///   averages `target_bytes` across a window themselves.
+/// - Quality knob is coarse (codebook sizes log-spaced 8..=256), so
+///   achievable byte-size resolution is also coarse.
+/// - The chosen q is the largest from `[0, 10, 20, …, 100]` whose
+///   bytes ≤ target; sub-quality interpolation is not attempted.
+pub struct TwoPassRateControl {
+    /// First-pass reference quality (0..=100). Default `50`.
+    pub reference_quality: u8,
+    per_frame_bytes: Vec<usize>,
+}
+
+/// Per-frame outcome from [`TwoPassRateControl::encode_at_target_bytes`].
+#[derive(Clone, Debug)]
+pub struct RateControlledFrame {
+    /// The encoded bitstream.
+    pub bytes: Vec<u8>,
+    /// The quality knob the search settled on (0..=100).
+    pub quality: u8,
+    /// `bytes.len() - target_bytes` as `i64`. Negative ⇒ under budget,
+    /// positive ⇒ over (q=0 still couldn't fit).
+    pub byte_delta: i64,
+}
+
+impl Default for TwoPassRateControl {
+    fn default() -> Self {
+        Self {
+            reference_quality: 50,
+            per_frame_bytes: Vec::new(),
+        }
+    }
+}
+
+impl TwoPassRateControl {
+    /// Construct a fresh two-pass controller.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stats-collection pass: encode the full sequence at the
+    /// reference quality and record per-frame byte counts. Returns
+    /// the total wire size at that quality.
+    ///
+    /// The first frame in `frames` is encoded as intra; subsequent
+    /// frames are encoded as inter against the encoder's rolling
+    /// state. Each `frame` is `(width × height × 3)` bytes of packed
+    /// `Rgb24`.
+    pub fn stats_pass(&mut self, frames: &[Vec<u8>], width: u32, height: u32) -> Result<usize> {
+        self.per_frame_bytes.clear();
+        let opts = EncoderOptions::from_quality(self.reference_quality);
+        let mut enc = CinepakEncoder::new();
+        let mut total = 0usize;
+        for (i, f) in frames.iter().enumerate() {
+            let bytes = if i == 0 {
+                enc.encode_intra(f, width, height, opts)?
+            } else {
+                enc.encode_inter(f, width, height, opts)?
+            };
+            total += bytes.len();
+            self.per_frame_bytes.push(bytes.len());
+        }
+        Ok(total)
+    }
+
+    /// Per-frame byte counts from the most recent
+    /// [`Self::stats_pass`]. Empty until a stats pass runs.
+    pub fn per_frame_bytes(&self) -> &[usize] {
+        &self.per_frame_bytes
+    }
+
+    /// Average per-frame bytes across the most recent stats pass.
+    /// Returns `None` if `stats_pass` has not been called or yielded
+    /// no frames.
+    pub fn average_frame_bytes(&self) -> Option<f64> {
+        if self.per_frame_bytes.is_empty() {
+            None
+        } else {
+            let total: usize = self.per_frame_bytes.iter().sum();
+            Some(total as f64 / self.per_frame_bytes.len() as f64)
+        }
+    }
+
+    /// Pass-2: encode `frames` with each frame's quality chosen by a
+    /// grid search over `EncoderOptions::from_quality(q)` for
+    /// `q ∈ {0, 10, 20, …, 100}`, picking the **largest** `q` whose
+    /// encoded byte count is `≤ target_bytes`.
+    ///
+    /// Returns one [`RateControlledFrame`] per input frame. The
+    /// `bytes` field is the encoded stream at the chosen quality;
+    /// concatenating them in order produces a decodable Cinepak
+    /// sequence whose decoder state matches the encoder trajectory at
+    /// the chosen per-frame qualities.
+    pub fn encode_at_target_bytes(
+        &self,
+        frames: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        target_bytes: usize,
+    ) -> Result<Vec<RateControlledFrame>> {
+        let trial_qs: [u8; 11] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let mut chosen_qs: Vec<u8> = Vec::with_capacity(frames.len());
+        let mut out: Vec<RateControlledFrame> = Vec::with_capacity(frames.len());
+        for frame_idx in 0..frames.len() {
+            // Find the largest q whose encode of frame `frame_idx`
+            // (with all prior frames at their already-chosen q) is
+            // ≤ target_bytes.
+            let mut best: Option<(u8, Vec<u8>, usize)> = None;
+            for &q in &trial_qs {
+                let bytes = replay_to_frame_at_q(frames, width, height, &chosen_qs, frame_idx, q)?;
+                let len = bytes.len();
+                if len <= target_bytes {
+                    // Largest-q-under-budget wins — overwrite when q
+                    // is larger.
+                    let take = best
+                        .as_ref()
+                        .map(|(prev_q, _, _)| q > *prev_q)
+                        .unwrap_or(true);
+                    if take {
+                        best = Some((q, bytes, len));
+                    }
+                }
+            }
+            let (chosen_q, chosen_bytes, chosen_len) = match best {
+                Some(b) => b,
+                None => {
+                    // Nothing fits — encode at q=0 and report
+                    // overshoot.
+                    let bytes =
+                        replay_to_frame_at_q(frames, width, height, &chosen_qs, frame_idx, 0)?;
+                    let len = bytes.len();
+                    (0u8, bytes, len)
+                }
+            };
+            chosen_qs.push(chosen_q);
+            out.push(RateControlledFrame {
+                bytes: chosen_bytes,
+                quality: chosen_q,
+                byte_delta: chosen_len as i64 - target_bytes as i64,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Replay frames `0..frame_idx` at their already-chosen qualities,
+/// then encode frame `frame_idx` at quality `q`. Returns the encoded
+/// bytes for frame `frame_idx`.
+///
+/// Cost: O(frame_idx) encodes per call. Used by
+/// [`TwoPassRateControl::encode_at_target_bytes`] to do per-frame
+/// quality grid search without exposing internal encoder state.
+fn replay_to_frame_at_q(
+    frames: &[Vec<u8>],
+    width: u32,
+    height: u32,
+    chosen_qs: &[u8],
+    frame_idx: usize,
+    q: u8,
+) -> Result<Vec<u8>> {
+    let mut enc = CinepakEncoder::new();
+    // Replay 0..frame_idx at their chosen qualities.
+    for i in 0..frame_idx {
+        let opts = EncoderOptions::from_quality(chosen_qs[i]);
+        if i == 0 {
+            enc.encode_intra(&frames[i], width, height, opts)?;
+        } else {
+            enc.encode_inter(&frames[i], width, height, opts)?;
+        }
+    }
+    // Encode frame_idx at q.
+    let opts = EncoderOptions::from_quality(q);
+    let bytes = if frame_idx == 0 {
+        enc.encode_intra(&frames[frame_idx], width, height, opts)?
+    } else {
+        enc.encode_inter(&frames[frame_idx], width, height, opts)?
+    };
+    Ok(bytes)
 }
 
 /// Encode a 12-bit YUV inter frame from packed `Rgb24` input,
@@ -411,11 +657,15 @@ fn encode_inter_frame(
     let strips = plan_strips(mb_rows, opts.strip_count as usize);
 
     // Stateless free-function path: no rolling codebook context, so
-    // every strip emits full-replace codebook chunks.
+    // every strip emits full-replace codebook chunks. Cross-frame
+    // seeding is also disabled here — the free-function path has no
+    // notion of "previous frame's codebook", only "previous frame's
+    // pixels".
     let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
     let mut roll = RollingCodebooks::default();
     for s in &strips {
-        let bytes = encode_inter_strip(pixels, prev, width, mode, &opts, s, &mut roll, false)?;
+        let bytes =
+            encode_inter_strip(pixels, prev, width, mode, &opts, s, &mut roll, false, false)?;
         frame_strips.push(bytes);
     }
     assemble_frame(width, height, &frame_strips)
@@ -462,7 +712,13 @@ fn encode_intra_strip(
     s: &StripPlan,
     roll: &mut RollingCodebooks,
 ) -> Result<Vec<u8>> {
-    let plan = build_codebooks_and_decisions(pixels, width, mode, opts, s, None, false)?;
+    // Intra strips emit a fresh codebook with no cross-frame seeding —
+    // the decoder drops its codebook state on intra anyway, so seeding
+    // would only spend training cycles biasing toward stale centroids
+    // that the decoder won't have. (Intra-within-frame across strips
+    // also doesn't seed: each strip carries its own full-replace chunk
+    // and the decoder treats each strip's codebook as authoritative.)
+    let plan = build_codebooks_and_decisions(pixels, width, mode, opts, s, None, false, None)?;
     let StripPlanResult { v4_cb, v1_cb, mbs } = plan;
 
     let mut chunks = Vec::new();
@@ -494,8 +750,49 @@ fn encode_inter_strip(
     s: &StripPlan,
     roll: &mut RollingCodebooks,
     selective_enabled: bool,
+    cross_frame_seeding: bool,
 ) -> Result<Vec<u8>> {
-    let plan = build_codebooks_and_decisions(pixels, width, mode, opts, s, Some(prev), true)?;
+    // Cross-frame codebook persistence (round 5): seed the median-cut
+    // quantiser with the rolling codebook the decoder currently holds.
+    // When the previous codebook entry count matches `opts.v?_entries`
+    // we feed its centroids into median_cut so newly-trained slots track
+    // the slot indices the decoder already references — slots that
+    // remain stable across frames stay byte-identical, which lets
+    // `emit_codebook_chunk_one` either emit no chunk (chunk-omission)
+    // or shrink the selective-update slot list. On slow-pan content
+    // this dramatically shortens the inter-strip wire size.
+    //
+    // The seed is also valid *across strips* of the same frame: by the
+    // time strip 2 runs, `roll` carries strip 1's emitted codebook, so
+    // strip 2's median-cut anchors to strip 1's slot identities. This
+    // is what makes selective-update wire-cheaper than full-replace
+    // within a single multi-strip inter frame.
+    let seed_opt = if cross_frame_seeding {
+        let v4_seed = roll
+            .get(WhichCodebook::V4)
+            .filter(|(_, n)| *n == opts.v4_entries as usize)
+            .map(|(cb, _)| cb.clone());
+        let v1_seed = roll
+            .get(WhichCodebook::V1)
+            .filter(|(_, n)| *n == opts.v1_entries as usize)
+            .map(|(cb, _)| cb.clone());
+        Some(SeedCodebooks {
+            v4: v4_seed,
+            v1: v1_seed,
+        })
+    } else {
+        None
+    };
+    let plan = build_codebooks_and_decisions(
+        pixels,
+        width,
+        mode,
+        opts,
+        s,
+        Some(prev),
+        true,
+        seed_opt.as_ref(),
+    )?;
     let StripPlanResult { v4_cb, v1_cb, mbs } = plan;
 
     // Determine which slots in each codebook are actually referenced by
@@ -536,12 +833,29 @@ struct StripPlanResult {
     mbs: Vec<Mb>,
 }
 
+/// Optional seed codebooks for cross-frame median-cut warm-start
+/// (round 5). When present, each codebook's centroids are used as the
+/// initial assignments for one Lloyd-style refinement pass on the
+/// freshly-sampled vectors. Slots whose seed centroid attracts no
+/// vectors retain the seed value (so the decoder's existing entry at
+/// that slot stays valid — important for selective-update / chunk
+/// omission).
+#[derive(Clone, Default)]
+struct SeedCodebooks {
+    v4: Option<Codebook>,
+    v1: Option<Codebook>,
+}
+
 /// Sample the strip's macroblocks, build V1 + V4 codebooks via
 /// median-cut, and decide V1 / V4 / Skip per MB.
 ///
 /// On `is_inter == true` and `prev = Some(...)`, MBs whose per-pixel
 /// MSE against the prev frame is below `opts.skip_threshold` are coded
 /// as `Mb::Skip`.
+///
+/// `seed`, when `Some`, supplies prior-frame codebooks to warm-start
+/// the median-cut quantiser (cross-frame codebook persistence).
+#[allow(clippy::too_many_arguments)]
 fn build_codebooks_and_decisions(
     pixels: &[u8],
     width: u32,
@@ -550,6 +864,7 @@ fn build_codebooks_and_decisions(
     s: &StripPlan,
     prev: Option<&CinepakFrame>,
     is_inter: bool,
+    seed: Option<&SeedCodebooks>,
 ) -> Result<StripPlanResult> {
     let mb_cols = (width / 4) as usize;
     let strip_h_mb = ((s.y_bottom - s.y_top) / 4) as usize;
@@ -597,8 +912,15 @@ fn build_codebooks_and_decisions(
     // Build codebooks via median-cut on the non-skipped vectors. If
     // every MB is a skip, leave codebooks at default (zero) — fine,
     // they won't be referenced.
-    let v4_codebook = median_cut(&v4_vectors, opts.v4_entries as usize, mode);
-    let v1_codebook = median_cut(&v1_vectors, opts.v1_entries as usize, mode);
+    //
+    // When a seed codebook (matching N + mode) is supplied, warm-start
+    // median-cut with one Lloyd-style refinement pass anchored to the
+    // seed centroids; this preserves slot identity across frames and
+    // amplifies selective-update / chunk-omission wins downstream.
+    let v4_seed = seed.and_then(|s| s.v4.as_ref());
+    let v1_seed = seed.and_then(|s| s.v1.as_ref());
+    let v4_codebook = median_cut_seeded(&v4_vectors, opts.v4_entries as usize, mode, v4_seed);
+    let v1_codebook = median_cut_seeded(&v1_vectors, opts.v1_entries as usize, mode, v1_seed);
 
     // Classify each MB.
     let mut mbs: Vec<Mb> = Vec::with_capacity(mb_count);
@@ -1170,6 +1492,59 @@ fn mb_mse_against_prev(
 // ---------------------------------------------------------------------------
 // Median-cut codebook quantiser
 // ---------------------------------------------------------------------------
+
+/// Build a codebook of up to `n` entries from the population
+/// `vectors`, optionally seeded with prior-frame centroids.
+///
+/// When `seed` is `None`, this is the round-2 cold-start median-cut
+/// quantiser. When `seed = Some(prev_cb)` and `prev_cb` has at least
+/// `n` populated entries, each input vector is assigned to the slot of
+/// its nearest seed centroid (one Lloyd iteration); the new codebook's
+/// slot `i` is the centroid of the vectors that landed in the seed's
+/// slot `i`. Slots that attract no vectors retain the seed centroid —
+/// this is the round-5 cross-frame persistence behaviour: a codebook
+/// slot that was correct last frame stays byte-identical this frame
+/// even if no current MB happens to need it, so the decoder's prior
+/// state for that slot remains valid for chunk-omission / selective-
+/// update.
+///
+/// The Lloyd warm-start is **single-pass** (no iteration to
+/// convergence): one pass costs O(N × k) distance computations and is
+/// sufficient to keep slot identities stable from frame to frame on
+/// slow-pan content. Multiple iterations would re-cluster the seeds
+/// out from under us and defeat the persistence goal.
+fn median_cut_seeded(
+    vectors: &[CodebookEntry],
+    n: usize,
+    mode: PixelMode,
+    seed: Option<&Codebook>,
+) -> Codebook {
+    if let Some(prev) = seed {
+        if !vectors.is_empty() && n > 0 {
+            // Lloyd warm-start: assign each vector to its nearest seed
+            // centroid, then recompute that slot's centroid.
+            let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
+            for v in vectors {
+                let (slot, _) = nearest(v, prev, n, mode);
+                clusters[slot as usize].push(*v);
+            }
+            let mut cb = prev.clone();
+            for (i, c) in clusters.iter().enumerate().take(n) {
+                if !c.is_empty() {
+                    cb.entries[i] = centroid(c, mode);
+                }
+                // else: keep prev.entries[i] verbatim (chunk-omission
+                // friendliness).
+            }
+            return cb;
+        }
+        // Empty input but we have a seed → return the seed unchanged.
+        if vectors.is_empty() && n > 0 {
+            return prev.clone();
+        }
+    }
+    median_cut(vectors, n, mode)
+}
 
 /// Build a codebook of up to `n` entries from the population
 /// `vectors`. Median-cut: recursively bisect the population along the

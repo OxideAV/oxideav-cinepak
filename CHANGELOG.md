@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 5: **cross-frame codebook persistence at the median-cut
+  training step**. `CinepakEncoder::encode_inter` now warm-starts the
+  median-cut quantiser with the prior frame's codebook centroids: each
+  freshly-sampled vector is assigned to the slot of its nearest seed
+  centroid (one Lloyd-style refinement pass), and that slot's new
+  centroid is the average of the vectors that landed there. Slots
+  with no incoming vectors retain the seed centroid byte-identical,
+  which lets the chunk-omission / selective-update path keep firing
+  on slow-pan content where most macroblocks shift but the codebook
+  population is roughly stable. The seed is also valid across strips
+  of the same frame, so multi-strip inter frames inherit the prior
+  strip's codebook by default. Toggle via
+  `CinepakEncoder::set_cross_frame_codebook_persistence(bool)`
+  (default `true`); on a 32×32 slow-pan fixture (8 inter frames at
+  q=50) persistence-on shrinks the cumulative inter-frame wire size
+  by 5.3% (2807 B vs 2965 B).
+- Round 5: **multi-strip inter selective-update verification**. New
+  `tests/round5_persistence_and_multistrip.rs::multi_strip_inter_selective_update_beats_full_replace`
+  drives a 64×64 4-strip inter encode chain on slow-pan content and
+  asserts the stateful selective-update + cross-frame-persistence
+  path beats the stateless full-replace path on cumulative wire size
+  (observed: **44.0% wire savings** — 4358 B vs 7788 B for 6 inter
+  frames). A second test
+  (`multi_strip_inter_static_fixture_chunk_omission_across_strips`)
+  asserts that on a static 4-strip fixture the inter frame emits
+  zero codebook chunks (chunk-omission inheritance across strips).
+- Round 5: **two-pass rate control** (`TwoPassRateControl` /
+  `RateControlledFrame`). Pass-1 (`stats_pass`) records per-frame
+  byte counts at a reference quality; pass-2 (`encode_at_target_bytes`)
+  searches an 11-point quality grid for the largest `q` whose
+  per-frame byte count is `≤ target_bytes`, falling back to `q=0`
+  with a positive `byte_delta` when nothing fits. Per-frame search
+  cost is O(N × 11) replays.
+- Round 5: **`0x3100` selector-spillover decoder bug fix** + 4 new
+  payload-roundtrip regression tests in
+  `tests/inter_payload_straddle.rs`. The decoder previously read 1
+  index byte for a deferred-V1/V4 placeholder mb in the *current*
+  group and never read the rest of its bytes from the *next* group
+  (per spec §3.3 step 5 the index bytes belong wholly to the next
+  group). The fix defers the placeholder push until step 1 of the
+  next iteration so its bytes are read with the correct group;
+  static-fixture / mixed-V1+V4-+Skip patterns that triggered this
+  now round-trip cleanly.
+
 - Round 4: **selective-update codebook chunks on inter strips**
   (`CinepakEncoder` stateful struct). The encoder tracks the rolling
   V4/V1 codebook the decoder will hold across strips and frames, and

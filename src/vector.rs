@@ -106,10 +106,21 @@ fn decode_mixed_intra(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
 /// the current flag word, the next flag word's MSB is read as the
 /// selector before any of its remaining bits are interpreted as
 /// macroblock-codes.
+///
+/// Per spec §3.3 step 5, the index bytes for a macroblock whose code
+/// straddles a flag-word boundary appear in the **next** group's
+/// index-data block (i.e. with the flag word that carried the
+/// selector bit). The decoder defers pushing the macroblock into
+/// `out` until the next iteration so its index bytes are read with
+/// the correct group.
 fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
     let mut out = Vec::with_capacity(mb_count);
     let mut p = 0usize;
-    // Pending "first bit was 1; need selector from the next flag word".
+    // When `pending_selector == true` the previous flag word ended on
+    // a leading `1`; the current flag word's MSB carries the V1/V4
+    // selector and the macroblock's index bytes belong to **this**
+    // group's index data. The mb is pushed into `out` here, not in
+    // the previous iteration.
     let mut pending_selector = false;
     while out.len() < mb_count {
         if payload.len() - p < 4 {
@@ -118,16 +129,14 @@ fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
         let flag = u32::from_be_bytes([payload[p], payload[p + 1], payload[p + 2], payload[p + 3]]);
         p += 4;
         let mut bit = 0u32;
-        // Track which macroblocks of *this group* need index bytes.
-        // `kinds` holds (is_v4) for each "set" macroblock we classify in
-        // this group; after the bit-grammar pass we read 1 or 4 index
-        // bytes per entry from the payload.
-        //
-        // The macroblocks themselves are pushed into `out` immediately
-        // (with placeholder index bytes that we patch up below).
+        // Index of the first mb that belongs to this group; its idx
+        // bytes are read in step 3 below.
         let group_start_in_out = out.len();
 
-        // 1) Resolve any pending selector from the *previous* flag word.
+        // 1) Resolve any pending selector from the *previous* flag word
+        //    by pushing the deferred macroblock into `out` *now*. Its
+        //    index bytes will be read in step 3 of this iteration with
+        //    the rest of this group's idx data.
         if pending_selector {
             if bit >= 32 {
                 return Err(CinepakError::invalid(
@@ -137,16 +146,10 @@ fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
             let mask = 1u32 << (31 - bit);
             bit += 1;
             let is_v4 = flag & mask != 0;
-            // The macroblock that triggered this pending selector was
-            // pushed into `out` in the previous iteration as a placeholder
-            // V1(0); patch it to V4(...) here. We can't read its index
-            // bytes yet — they belong to *this* group's index data,
-            // collected after we finish the bit-grammar pass.
-            let last_idx = out.len() - 1;
             if is_v4 {
-                out[last_idx] = Mb::V4([0, 0, 0, 0]);
+                out.push(Mb::V4([0, 0, 0, 0]));
             } else {
-                out[last_idx] = Mb::V1(0);
+                out.push(Mb::V1(0));
             }
             pending_selector = false;
         }
@@ -163,12 +166,11 @@ fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
             }
             // Leading `1` — need one more bit as the V1/V4 selector.
             if bit >= 32 {
-                // Selector bit must come from the next flag word.
+                // Selector bit must come from the next flag word; defer
+                // pushing this macroblock until step 1 of the next
+                // iteration so its index bytes are read in the next
+                // group (where the encoder placed them).
                 pending_selector = true;
-                // Push a V1(0) placeholder; we'll either keep it as V1
-                // (and patch to V1(byte) in step 3) or upgrade to
-                // V4([0; 4]) when the next flag word's MSB is read.
-                out.push(Mb::V1(0));
                 break;
             }
             let sel_mask = 1u32 << (31 - bit);
@@ -183,7 +185,9 @@ fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
 
         // 3) Read this group's index data — 1 byte per V1 mb, 4 bytes
         //    per V4 mb. Iterate over the just-classified macroblocks
-        //    (group_start_in_out..out.len()), in scan order.
+        //    (group_start_in_out..out.len()), in scan order. The mb
+        //    that resolved a pending selector is the first in this
+        //    range, so its idx bytes are read with the rest.
         for mb in out.iter_mut().skip(group_start_in_out) {
             match mb {
                 Mb::Skip => {}

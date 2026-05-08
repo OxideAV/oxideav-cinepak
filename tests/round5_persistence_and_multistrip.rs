@@ -166,6 +166,7 @@ fn multi_strip_inter_selective_update_beats_full_replace() {
         v1_entries: 32,
         strip_count: 4,
         skip_threshold: 32.0,
+        ..EncoderOptions::default()
     };
 
     // Slow-pan: 6 inter frames each shifting by 1 column.
@@ -247,6 +248,7 @@ fn multi_strip_inter_static_fixture_chunk_omission_across_strips() {
         v1_entries: 16,
         strip_count: 4,
         skip_threshold: 32.0,
+        ..EncoderOptions::default()
     };
     // Solid colour — every strip's codebook will train to the same
     // single-cluster value, so the rolling state across strips will

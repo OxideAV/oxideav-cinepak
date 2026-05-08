@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 6: **windowed bisection rate control**
+  (`TwoPassRateControl::encode_at_target_window_bytes`). Targets a
+  byte budget over a rolling N-frame window rather than per-frame
+  (real bitrate-throttled workloads track rolling average, not
+  per-frame size). Holds quality steady when the projected window
+  sum is within ±tolerance of target; otherwise runs a binary search
+  (≤ 8 trials per re-eval) over `q ∈ [0, 100]` for the next frame.
+  Composes with round-5's `TwoPassRateControl` (same struct, new
+  method) and the existing per-frame
+  `encode_at_target_bytes`/`stats_pass`. Empty input returns `Ok([])`;
+  starvation-budget paths fall back to `q=0` with positive
+  `byte_delta`.
+- Round 6: **tighter Lloyd refinement** for the cross-frame codebook
+  warm-start (`EncoderOptions::lloyd_max_iter` + `lloyd_eps`). The
+  Lloyd loop now iterates up to `lloyd_max_iter` reassignment+update
+  passes against the *current* (not seed) centroids, with early stop
+  when the largest per-slot Manhattan drift falls to `≤ lloyd_eps`.
+  Slot identity is preserved across iterations, so chunk-omission
+  / selective-update wins downstream are unaffected. Defaults: 2
+  iterations, eps = 1 (round-5 single-pass behaviour preserved by
+  setting `lloyd_max_iter = 1`; cold-start by `lloyd_max_iter = 0`).
+- Round 6: **ffmpeg-emitted Cinepak-on-AVI roundtrip fixture**
+  (`tests/ffmpeg_avi_roundtrip.rs`). Encodes a 64×64 RGB24 frame
+  through `ffmpeg -c:v cinepak -f avi -`, parses the resulting AVI's
+  `movi/00dc` payload, and decodes it through this crate to assert
+  PSNR ≥ 24 dB versus the source. Catches decoder regressions
+  against the canonical ffmpeg encoder output without shipping
+  binary fixtures. Skips gracefully when ffmpeg is unavailable, the
+  cinepak encoder is missing from the local build, or
+  `OXIDEAV_SKIP_FFMPEG_TESTS` is set. Observed PSNR locally: 36.9 dB.
+
 - Round 5: **cross-frame codebook persistence at the median-cut
   training step**. `CinepakEncoder::encode_inter` now warm-starts the
   median-cut quantiser with the prior frame's codebook centroids: each

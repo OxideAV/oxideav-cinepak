@@ -118,6 +118,22 @@ pub struct EncoderOptions {
     /// Per-pixel MSE threshold below which an inter macroblock is
     /// coded as SKIP. Default `64.0` (≈ ±8 per channel).
     pub skip_threshold: f32,
+    /// Round-6 tighter Lloyd refinement: maximum number of
+    /// Lloyd-style refinement iterations applied to the seeded
+    /// median-cut warm-start (cross-frame codebook persistence). The
+    /// quantiser stops earlier if the per-iteration centroid movement
+    /// drops below [`Self::lloyd_eps`]. `1` reproduces the round-5
+    /// single-pass behaviour; `0` disables refinement entirely (raw
+    /// nearest-seed assignment with no centroid update). Default `2`.
+    pub lloyd_max_iter: u8,
+    /// Round-6 tighter Lloyd refinement: early-stop epsilon. When the
+    /// largest per-slot centroid Manhattan distance from the previous
+    /// iteration is `≤ lloyd_eps`, refinement halts before reaching
+    /// `lloyd_max_iter`. Measured in raw codebook-entry units summed
+    /// across all 4..=6 dims (L1 norm). Default `1` (one unit of
+    /// total drift across all dims = "stable enough"). Only takes
+    /// effect when `lloyd_max_iter ≥ 2`.
+    pub lloyd_eps: u32,
 }
 
 impl Default for EncoderOptions {
@@ -127,6 +143,8 @@ impl Default for EncoderOptions {
             v1_entries: 64,
             strip_count: 1,
             skip_threshold: 64.0,
+            lloyd_max_iter: 2,
+            lloyd_eps: 1,
         }
     }
 }
@@ -179,6 +197,10 @@ impl EncoderOptions {
             v1_entries: n,
             strip_count,
             skip_threshold,
+            // Round-6 default: 2 Lloyd iterations with eps=1 (early-stop
+            // on essentially-stable centroids).
+            lloyd_max_iter: 2,
+            lloyd_eps: 1,
         }
     }
 }
@@ -480,6 +502,119 @@ impl TwoPassRateControl {
         }
     }
 
+    /// Round-6 windowed bisection rate control.
+    ///
+    /// Encodes `frames` while targeting a byte budget over a rolling
+    /// window of `window_size` frames (e.g. `target_window_bytes =
+    /// bitrate_bps × window_size / 8 / fps_per_window`). The encoder
+    /// holds quality at the previous frame's chosen `q` while the
+    /// rolling sum of the last `window_size` frame sizes stays within
+    /// ±`tolerance_pct` of `target_window_bytes`; when it drifts
+    /// outside, the encoder runs a binary search over `q ∈ [0, 100]`
+    /// for the next frame to pull the window back toward target.
+    ///
+    /// Compared with [`Self::encode_at_target_bytes`] (per-frame grid
+    /// search), the windowed path:
+    ///
+    /// - Targets a window-budget rather than per-frame budget — real
+    ///   bitrate-throttled workloads only care about the rolling
+    ///   average, not the per-frame size.
+    /// - Holds quality steady when in-band — fewer per-frame quality
+    ///   transitions in the output stream.
+    /// - Uses bisection (≤ 7 trials per re-evaluation) instead of an
+    ///   11-point grid → tighter quality resolution on the same
+    ///   per-frame replay budget.
+    ///
+    /// The first frame always re-evaluates quality (no history). The
+    /// returned [`RateControlledFrame::byte_delta`] is computed against
+    /// `target_window_bytes / window_size` — the per-frame slice of
+    /// the window budget — for compatibility with the per-frame API.
+    ///
+    /// Panics in debug builds if `window_size == 0` or `tolerance_pct
+    /// < 0.0`.
+    pub fn encode_at_target_window_bytes(
+        &self,
+        frames: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        target_window_bytes: usize,
+        window_size: usize,
+        tolerance_pct: f32,
+    ) -> Result<Vec<RateControlledFrame>> {
+        debug_assert!(window_size > 0, "window_size must be ≥ 1");
+        debug_assert!(tolerance_pct >= 0.0, "tolerance_pct must be ≥ 0");
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let window = window_size.max(1);
+        let tol = tolerance_pct.max(0.0);
+        let per_frame_target = target_window_bytes / window;
+
+        let mut chosen_qs: Vec<u8> = Vec::with_capacity(frames.len());
+        let mut frame_sizes: Vec<usize> = Vec::with_capacity(frames.len());
+        let mut out: Vec<RateControlledFrame> = Vec::with_capacity(frames.len());
+        let mut current_q: u8 = 50; // Mid-quality starting point.
+
+        for frame_idx in 0..frames.len() {
+            // Recent-window byte sum (excluding the current frame).
+            let lo = frame_idx.saturating_sub(window);
+            let win_sum: usize = frame_sizes[lo..frame_idx].iter().sum();
+
+            // Decide whether to bisect or hold.
+            // - First frame: always bisect (no prior chosen_q).
+            // - Otherwise: bisect only when projected window sum
+            //   deviates from target by more than tol%.
+            let must_bisect = if frame_idx == 0 {
+                true
+            } else {
+                // Project the window sum if we re-used current_q: use
+                // the avg of past in-window frame sizes as the
+                // estimate (cheap; bisection itself does the precise
+                // job when triggered).
+                let in_win = frame_idx - lo;
+                let est_next = win_sum.checked_div(in_win).unwrap_or(per_frame_target);
+                let projected = win_sum + est_next;
+                let projected_target = target_window_bytes
+                    .saturating_sub(window.saturating_sub(in_win + 1) * per_frame_target);
+                let drift_pct = if projected_target > 0 {
+                    let d = projected as i64 - projected_target as i64;
+                    d.unsigned_abs() as f32 * 100.0 / projected_target as f32
+                } else {
+                    f32::INFINITY
+                };
+                drift_pct > tol
+            };
+
+            let (chosen_q, chosen_bytes, chosen_len) = if must_bisect {
+                bisect_q_for_window(
+                    frames,
+                    width,
+                    height,
+                    &chosen_qs,
+                    frame_idx,
+                    win_sum,
+                    target_window_bytes,
+                    window,
+                )?
+            } else {
+                let bytes =
+                    replay_to_frame_at_q(frames, width, height, &chosen_qs, frame_idx, current_q)?;
+                let len = bytes.len();
+                (current_q, bytes, len)
+            };
+
+            chosen_qs.push(chosen_q);
+            frame_sizes.push(chosen_len);
+            current_q = chosen_q;
+            out.push(RateControlledFrame {
+                bytes: chosen_bytes,
+                quality: chosen_q,
+                byte_delta: chosen_len as i64 - per_frame_target as i64,
+            });
+        }
+        Ok(out)
+    }
+
     /// Pass-2: encode `frames` with each frame's quality chosen by a
     /// grid search over `EncoderOptions::from_quality(q)` for
     /// `q ∈ {0, 10, 20, …, 100}`, picking the **largest** `q` whose
@@ -540,6 +675,83 @@ impl TwoPassRateControl {
         }
         Ok(out)
     }
+}
+
+/// Round-6 bisection: find the largest `q ∈ [0, 100]` whose encoded
+/// frame size, when added to `win_sum_before`, keeps the rolling
+/// `window`-frame sum at or below `target_window_bytes`.
+///
+/// Falls back to `q=0` (smallest possible frame) when even the lowest
+/// quality overflows the projected window — caller treats the
+/// overshoot as positive `byte_delta`.
+///
+/// Cost: ≤ 8 replay-encodes per call (binary search over 0..=100 with
+/// step granularity 1 bottoms out in 7 trials; we cap at 8 for
+/// safety). Each replay is O(frame_idx) full-encodes through prior
+/// frames.
+#[allow(clippy::too_many_arguments)]
+fn bisect_q_for_window(
+    frames: &[Vec<u8>],
+    width: u32,
+    height: u32,
+    chosen_qs: &[u8],
+    frame_idx: usize,
+    win_sum_before: usize,
+    target_window_bytes: usize,
+    window: usize,
+) -> Result<(u8, Vec<u8>, usize)> {
+    // Per-frame slice of remaining window budget. The first
+    // `window-1` frames in a window have 1 frame's allowance each;
+    // once at steady state, each step rolls one frame off and admits
+    // a new one with 1 frame's allowance ≈ target_window_bytes /
+    // window.
+    let per_frame_target = target_window_bytes / window.max(1);
+    // Projected post-frame window sum if we add a frame of size `b`:
+    // win_sum_before + b, evicting nothing (since we're still inside
+    // the window). For a strict window we'd evict the oldest member
+    // of `frame_sizes` once the window is full, but the caller
+    // already passes `win_sum` over `lo..frame_idx` (length ≤
+    // `window`), so adding `b` here is the correct projected sum.
+    let cap = target_window_bytes.saturating_sub(win_sum_before);
+
+    let mut lo: u8 = 0;
+    let mut hi: u8 = 100;
+    let mut best: Option<(u8, Vec<u8>, usize)> = None;
+    // Up to 8 bisection trials: ceil(log2(101)) = 7.
+    for _ in 0..8 {
+        if lo > hi {
+            break;
+        }
+        let mid = lo + (hi - lo) / 2;
+        let bytes = replay_to_frame_at_q(frames, width, height, chosen_qs, frame_idx, mid)?;
+        let len = bytes.len();
+        if len <= cap {
+            // Fits — try higher.
+            best = Some((mid, bytes, len));
+            if mid == 100 {
+                break;
+            }
+            lo = mid + 1;
+        } else if mid == 0 {
+            // Even q=0 overflows; record it as the best-effort
+            // smallest-frame option.
+            if best.is_none() {
+                best = Some((mid, bytes, len));
+            }
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if let Some(b) = best {
+        return Ok(b);
+    }
+    // Defensive: bisection never landed on a tested q. Run q=0 as a
+    // last resort so caller has a frame.
+    let bytes = replay_to_frame_at_q(frames, width, height, chosen_qs, frame_idx, 0)?;
+    let len = bytes.len();
+    let _ = per_frame_target; // suppress unused warning (used by docs)
+    Ok((0u8, bytes, len))
 }
 
 /// Replay frames `0..frame_idx` at their already-chosen qualities,
@@ -914,13 +1126,28 @@ fn build_codebooks_and_decisions(
     // they won't be referenced.
     //
     // When a seed codebook (matching N + mode) is supplied, warm-start
-    // median-cut with one Lloyd-style refinement pass anchored to the
-    // seed centroids; this preserves slot identity across frames and
+    // median-cut with `opts.lloyd_max_iter` Lloyd-style refinement
+    // passes anchored to the seed centroids (round-6 tighter Lloyd
+    // refinement); this preserves slot identity across frames and
     // amplifies selective-update / chunk-omission wins downstream.
     let v4_seed = seed.and_then(|s| s.v4.as_ref());
     let v1_seed = seed.and_then(|s| s.v1.as_ref());
-    let v4_codebook = median_cut_seeded(&v4_vectors, opts.v4_entries as usize, mode, v4_seed);
-    let v1_codebook = median_cut_seeded(&v1_vectors, opts.v1_entries as usize, mode, v1_seed);
+    let v4_codebook = median_cut_seeded(
+        &v4_vectors,
+        opts.v4_entries as usize,
+        mode,
+        v4_seed,
+        opts.lloyd_max_iter,
+        opts.lloyd_eps,
+    );
+    let v1_codebook = median_cut_seeded(
+        &v1_vectors,
+        opts.v1_entries as usize,
+        mode,
+        v1_seed,
+        opts.lloyd_max_iter,
+        opts.lloyd_eps,
+    );
 
     // Classify each MB.
     let mut mbs: Vec<Mb> = Vec::with_capacity(mb_count);
@@ -1499,7 +1726,7 @@ fn mb_mse_against_prev(
 /// When `seed` is `None`, this is the round-2 cold-start median-cut
 /// quantiser. When `seed = Some(prev_cb)` and `prev_cb` has at least
 /// `n` populated entries, each input vector is assigned to the slot of
-/// its nearest seed centroid (one Lloyd iteration); the new codebook's
+/// its nearest seed centroid (Lloyd iteration); the new codebook's
 /// slot `i` is the centroid of the vectors that landed in the seed's
 /// slot `i`. Slots that attract no vectors retain the seed centroid —
 /// this is the round-5 cross-frame persistence behaviour: a codebook
@@ -1508,33 +1735,60 @@ fn mb_mse_against_prev(
 /// state for that slot remains valid for chunk-omission / selective-
 /// update.
 ///
-/// The Lloyd warm-start is **single-pass** (no iteration to
-/// convergence): one pass costs O(N × k) distance computations and is
-/// sufficient to keep slot identities stable from frame to frame on
-/// slow-pan content. Multiple iterations would re-cluster the seeds
-/// out from under us and defeat the persistence goal.
+/// `max_iter` controls the round-6 tighter Lloyd refinement loop: each
+/// iteration reassigns vectors against the *current* (not seed)
+/// centroids and recomputes them, with early stop when the largest
+/// per-slot Manhattan drift falls to `≤ eps`. `max_iter = 0` falls
+/// back to the cold-start median-cut (no warm-start), `max_iter = 1`
+/// reproduces the round-5 single-pass behaviour. Slot identity is
+/// preserved across iterations because each step reassigns to the
+/// nearest *current-iteration* centroid (which started as the seed),
+/// so slots that began as seed-i remain "the seed-i lineage" and the
+/// chunk-omission / selective-update wins downstream are unaffected.
 fn median_cut_seeded(
     vectors: &[CodebookEntry],
     n: usize,
     mode: PixelMode,
     seed: Option<&Codebook>,
+    max_iter: u8,
+    eps: u32,
 ) -> Codebook {
+    if max_iter == 0 {
+        // Lloyd disabled — cold-start median-cut (ignores seed).
+        return median_cut(vectors, n, mode);
+    }
     if let Some(prev) = seed {
         if !vectors.is_empty() && n > 0 {
-            // Lloyd warm-start: assign each vector to its nearest seed
-            // centroid, then recompute that slot's centroid.
-            let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
-            for v in vectors {
-                let (slot, _) = nearest(v, prev, n, mode);
-                clusters[slot as usize].push(*v);
-            }
+            // Iterative Lloyd refinement starting from the seed
+            // centroids. We keep the seed's slot order so that
+            // cross-frame slot-identity is preserved (slot `i` of the
+            // returned codebook is the descendant of the seed's slot
+            // `i`; slots that attract no vectors at any iteration
+            // retain the seed's slot `i` byte-identical).
             let mut cb = prev.clone();
-            for (i, c) in clusters.iter().enumerate().take(n) {
-                if !c.is_empty() {
-                    cb.entries[i] = centroid(c, mode);
+            for _iter in 0..max_iter {
+                let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
+                for v in vectors {
+                    let (slot, _) = nearest(v, &cb, n, mode);
+                    clusters[slot as usize].push(*v);
                 }
-                // else: keep prev.entries[i] verbatim (chunk-omission
-                // friendliness).
+                let mut max_drift: u32 = 0;
+                let mut next_cb = cb.clone();
+                for (i, c) in clusters.iter().enumerate().take(n) {
+                    if !c.is_empty() {
+                        let new_centroid = centroid(c, mode);
+                        max_drift =
+                            max_drift.max(entry_l1_distance(&cb.entries[i], &new_centroid, mode));
+                        next_cb.entries[i] = new_centroid;
+                    }
+                    // else: keep cb.entries[i] verbatim (no drift
+                    // contribution — empty cluster locks the slot).
+                }
+                cb = next_cb;
+                // Early stop: centroids are essentially stable.
+                if max_drift <= eps {
+                    break;
+                }
             }
             return cb;
         }
@@ -1544,6 +1798,20 @@ fn median_cut_seeded(
         }
     }
     median_cut(vectors, n, mode)
+}
+
+/// L1 (Manhattan) distance between two codebook entries summed across
+/// all dims; used for Lloyd early-stop convergence detection.
+fn entry_l1_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode) -> u32 {
+    let mut d = (i32::from(a.y0) - i32::from(b.y0)).unsigned_abs()
+        + (i32::from(a.y1) - i32::from(b.y1)).unsigned_abs()
+        + (i32::from(a.y2) - i32::from(b.y2)).unsigned_abs()
+        + (i32::from(a.y3) - i32::from(b.y3)).unsigned_abs();
+    if let PixelMode::Yuv12 = mode {
+        d += (i32::from(a.u) - i32::from(b.u)).unsigned_abs()
+            + (i32::from(a.v) - i32::from(b.v)).unsigned_abs();
+    }
+    d
 }
 
 /// Build a codebook of up to `n` entries from the population
@@ -1855,6 +2123,7 @@ mod tests {
             v1_entries: 8,
             strip_count: 4,
             skip_threshold: 64.0,
+            ..EncoderOptions::default()
         };
         let bytes = encode_rgb24(&rgb, w as u32, h as u32, opts).unwrap();
         let h_parsed = FrameHeader::parse(&bytes).unwrap();
@@ -1891,6 +2160,7 @@ mod tests {
             v1_entries: 8,
             strip_count: 1,
             skip_threshold: 32.0,
+            ..EncoderOptions::default()
         };
         let bytes_inter = encode_rgb24_inter(&rgb, &prev, w as u32, h as u32, opts).unwrap();
         // Verify it carries an inter strip (0x1100).
@@ -1956,6 +2226,7 @@ mod tests {
             v1_entries: 8,
             strip_count: 1,
             skip_threshold: f32::NAN,
+            ..EncoderOptions::default()
         };
         let rgb = vec![0u8; 8 * 8 * 3];
         assert!(encode_rgb24(&rgb, 8, 8, opts).is_err());
@@ -1969,6 +2240,7 @@ mod tests {
             v1_entries: 8,
             strip_count: 0,
             skip_threshold: 64.0,
+            ..EncoderOptions::default()
         };
         let rgb = vec![0u8; 8 * 8 * 3];
         assert!(encode_rgb24(&rgb, 8, 8, opts).is_err());

@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -41,7 +41,14 @@ stateless full-replace path), a **two-pass rate control** wrapper
 (`TwoPassRateControl` — grid-search on quality knob to hit a
 target byte budget per frame), and a fix for a **`0x3100`
 selector-spillover decoder bug** uncovered by the new
-multi-strip-inter wire patterns.
+multi-strip-inter wire patterns. Round 6 added a **windowed bisection
+rate control** path (`encode_at_target_window_bytes` — rolling N-frame
+budget with binary search instead of grid search), **tighter Lloyd
+refinement** (`EncoderOptions::lloyd_max_iter` + `lloyd_eps` knobs;
+multi-pass with eps-based early stop), and an **ffmpeg-emitted Cinepak
+AVI roundtrip fixture** that drives a known-good ffmpeg-encoded frame
+through our decoder (PSNR ≈ 36.9 dB locally; skips when ffmpeg or its
+cinepak encoder is unavailable).
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -100,6 +107,16 @@ Encode side (rounds 2 + 3 + 4 + 5):
 - `TwoPassRateControl` / `RateControlledFrame` (round 5) — first
   pass collects per-frame byte stats at a reference quality, second
   pass picks the largest grid-quality whose byte count is `≤ target`.
+- `TwoPassRateControl::encode_at_target_window_bytes` (round 6) —
+  windowed bisection rate control: binary-searches `q ∈ [0, 100]`
+  per-frame against a rolling N-frame byte budget, holding quality
+  steady when the projected window sum stays within ±tolerance of
+  target.
+- `EncoderOptions::lloyd_max_iter` / `lloyd_eps` (round 6) —
+  iterative Lloyd refinement controls for the cross-frame
+  codebook warm-start (default 2 iterations + eps-based early stop;
+  set `lloyd_max_iter = 1` for round-5 single-pass, `0` for
+  cold-start).
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

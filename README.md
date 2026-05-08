@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -48,7 +48,18 @@ refinement** (`EncoderOptions::lloyd_max_iter` + `lloyd_eps` knobs;
 multi-pass with eps-based early stop), and an **ffmpeg-emitted Cinepak
 AVI roundtrip fixture** that drives a known-good ffmpeg-encoded frame
 through our decoder (PSNR ≈ 36.9 dB locally; skips when ffmpeg or its
-cinepak encoder is unavailable).
+cinepak encoder is unavailable). Round 7 added **empty-cluster slot
+reclamation** (`EncoderOptions::stale_slot_threshold`; per-slot
+staleness counters; reseed-from-high-residual + forced full-replace
+chunk on reclamation) — closes the cross-frame-persistence
+"frozen slot" issue where a stale slot would survive forever holding
+content the codebook can no longer use; also added
+**adaptive-tolerance windowed bisection**
+(`TwoPassRateControl::encode_at_target_window_bytes_adaptive` —
+couples bisection tolerance to the running stdev of prior frame
+sizes, tighter on stable scenes / looser on cuts) and a
+**`CinepakEncoder::last_frame_stats() -> FrameStats`** telemetry
+accessor for reclamation-count debugging.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -76,7 +87,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -117,6 +128,23 @@ Encode side (rounds 2 + 3 + 4 + 5):
   codebook warm-start (default 2 iterations + eps-based early stop;
   set `lloyd_max_iter = 1` for round-5 single-pass, `0` for
   cold-start).
+- `EncoderOptions::stale_slot_threshold` (round 7) — per-slot
+  staleness counter + reclamation. When a codebook slot has been
+  unreferenced for strictly more than `n` consecutive inter frames
+  (default `Some(8)`), the encoder reseeds it from a high-residual
+  sample MB and forces a full-replace codebook chunk so the decoder
+  sees the new value. Closes the persistence "frozen slot" issue
+  on scene-change content. `None` disables.
+- `CinepakEncoder::last_frame_stats() -> FrameStats` (round 7) —
+  per-frame telemetry: `reclaimed_v4_slots`, `reclaimed_v1_slots`,
+  `forced_full_chunks`. Resets at the start of each frame.
+- `TwoPassRateControl::encode_at_target_window_bytes_adaptive`
+  (round 7) — adaptive-tolerance windowed bisection. Tolerance
+  shrinks on low byte-size variance (stable scenes), grows on high
+  variance (scene cuts), saturating between
+  `tolerance_pct_min` and `tolerance_pct_max` per the
+  `variance_scale_pct` cutoff. Equal-bound input matches the
+  round-6 fixed-tolerance behaviour exactly.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

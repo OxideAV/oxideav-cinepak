@@ -134,6 +134,34 @@ pub struct EncoderOptions {
     /// total drift across all dims = "stable enough"). Only takes
     /// effect when `lloyd_max_iter ≥ 2`.
     pub lloyd_eps: u32,
+    /// Round-7 empty-cluster slot reclamation: number of consecutive
+    /// inter frames a Lloyd slot may go *unreferenced* (no MB in this
+    /// strip's codebook flavour points at it) before the encoder
+    /// recycles it for a high-residual MB instead of letting it sit
+    /// frozen forever via cross-frame persistence.
+    ///
+    /// `None` disables reclamation (round-6 behaviour: a slot that
+    /// becomes unreferenced stays byte-identical across frames as long
+    /// as the chunk-omission / selective-update path can avoid
+    /// emitting it). `Some(n)` reclaims any slot that has been
+    /// unreferenced for **strictly more than** `n` consecutive inter
+    /// frames *during this encoder session*; the encoder reseeds those
+    /// slots from the strip's high-residual macroblocks (those whose
+    /// nearest-codebook error is largest) and **forces a full-replace
+    /// chunk emission** for the codebook flavour whose slot was
+    /// reclaimed, since the decoder needs to see the new slot value
+    /// (selective-update + the reclaimed slot list also works, but
+    /// full-replace is simpler and the wire-size delta is small for a
+    /// one-shot reclaim). Strict-greater-than rather than ≥ so an
+    /// 8-frame slow-pan can run all the way through with persistence
+    /// active without triggering reclamation on the final frame.
+    ///
+    /// Default `Some(8)`: a slot frozen for 8 consecutive inter frames
+    /// is recycled. On slow-pan content this typically never triggers;
+    /// on scene changes / wipes it triggers within a few frames and
+    /// adapts the codebook to the new content faster than waiting for
+    /// median-cut to overwhelm the inertia.
+    pub stale_slot_threshold: Option<u8>,
 }
 
 impl Default for EncoderOptions {
@@ -145,6 +173,7 @@ impl Default for EncoderOptions {
             skip_threshold: 64.0,
             lloyd_max_iter: 2,
             lloyd_eps: 1,
+            stale_slot_threshold: Some(8),
         }
     }
 }
@@ -201,6 +230,9 @@ impl EncoderOptions {
             // on essentially-stable centroids).
             lloyd_max_iter: 2,
             lloyd_eps: 1,
+            // Round-7 default: reclaim slots frozen for 8 consecutive
+            // inter frames.
+            stale_slot_threshold: Some(8),
         }
     }
 }
@@ -258,6 +290,31 @@ pub struct CinepakEncoder {
     decoder: crate::decoder::CinepakDecoder,
     /// Round-5 cross-frame codebook persistence toggle. Default `true`.
     cross_frame_persistence: bool,
+    /// Round-7 telemetry: counters from the most recent
+    /// `encode_intra` / `encode_inter` call. Reset at the start of
+    /// each frame.
+    last_stats: FrameStats,
+}
+
+/// Round-7 per-frame telemetry, queried via
+/// [`CinepakEncoder::last_frame_stats`] after each
+/// [`CinepakEncoder::encode_intra`] / [`CinepakEncoder::encode_inter`]
+/// call. Counters are reset at the start of each frame and accumulate
+/// across all of the frame's strips (so a 4-strip frame can produce up
+/// to 4 reclamations per codebook flavour).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    /// Number of V4 codebook slots reclaimed via round-7 empty-cluster
+    /// recovery during the most recent frame. Zero on intra frames or
+    /// when reclamation is disabled (`stale_slot_threshold = None`).
+    pub reclaimed_v4_slots: usize,
+    /// Number of V1 codebook slots reclaimed via round-7 empty-cluster
+    /// recovery during the most recent frame.
+    pub reclaimed_v1_slots: usize,
+    /// Number of full-replace codebook chunks the encoder was forced
+    /// to emit due to slot reclamation in the most recent frame.
+    /// Maxes at `2 × strip_count` (one per V4/V1 codebook per strip).
+    pub forced_full_chunks: usize,
 }
 
 impl Default for CinepakEncoder {
@@ -267,6 +324,7 @@ impl Default for CinepakEncoder {
             prev_frame: None,
             decoder: crate::decoder::CinepakDecoder::new(),
             cross_frame_persistence: true,
+            last_stats: FrameStats::default(),
         }
     }
 }
@@ -302,6 +360,18 @@ impl CinepakEncoder {
         self.cross_frame_persistence
     }
 
+    /// Round-7 telemetry: per-frame counters accumulated during the
+    /// most recent [`Self::encode_intra`] / [`Self::encode_inter`]
+    /// call. See [`FrameStats`] for the per-counter semantics.
+    ///
+    /// Reset at the start of each frame, so calling this between
+    /// `encode_inter` invocations always returns the previous frame's
+    /// values; calling it before the first frame returns
+    /// [`FrameStats::default`] (all zeros).
+    pub fn last_frame_stats(&self) -> FrameStats {
+        self.last_stats
+    }
+
     /// Encode an intra frame from packed `Rgb24` input. Resets the
     /// rolling codebook state (intra strips always emit full-replace
     /// codebook chunks anyway, but this also clears any stale
@@ -321,7 +391,12 @@ impl CinepakEncoder {
         let strips = plan_strips(mb_rows, opts.strip_count as usize);
         let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
         // Intra resets rolling: intra strips always emit full-replace.
+        // Round-7: this also zeros all per-slot staleness counters.
         self.rolling = RollingCodebooks::default();
+        // Reset round-7 telemetry; intra never reclaims (no rolling
+        // staleness state to consult anyway), so the counters stay zero
+        // unless something below changes (it doesn't).
+        self.last_stats = FrameStats::default();
         for s in &strips {
             let bytes =
                 encode_intra_strip(rgb, width, PixelMode::Yuv12, &opts, s, &mut self.rolling)?;
@@ -366,8 +441,11 @@ impl CinepakEncoder {
         let strips = plan_strips(mb_rows, opts.strip_count as usize);
         let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
         let prev = self.prev_frame.as_ref().unwrap().clone();
+        // Round-7 telemetry: reset before this frame; encode_inter_strip_with_stats
+        // will accumulate into `acc`.
+        let mut acc = FrameStatsAccum::default();
         for s in &strips {
-            let bytes = encode_inter_strip(
+            let bytes = encode_inter_strip_with_stats(
                 rgb,
                 &prev,
                 width,
@@ -377,9 +455,30 @@ impl CinepakEncoder {
                 &mut self.rolling,
                 true,
                 self.cross_frame_persistence,
+                Some(&mut acc),
             )?;
             frame_strips.push(bytes);
         }
+        // Round-7: now that all strips have run, update per-slot
+        // staleness using the per-frame OR of all strips' `used`
+        // masks. This is the per-frame increment semantic — multi-strip
+        // frames don't bump staleness once per strip, only once per
+        // frame.
+        self.rolling.update_staleness(
+            WhichCodebook::V4,
+            &acc.frame_v4_used,
+            opts.v4_entries as usize,
+        );
+        self.rolling.update_staleness(
+            WhichCodebook::V1,
+            &acc.frame_v1_used,
+            opts.v1_entries as usize,
+        );
+        self.last_stats = FrameStats {
+            reclaimed_v4_slots: acc.reclaimed_v4_slots,
+            reclaimed_v1_slots: acc.reclaimed_v1_slots,
+            forced_full_chunks: acc.forced_full_chunks,
+        };
         let bytes = assemble_frame(width, height, &frame_strips)?;
         // Reconstruct frame for next-call SKIP-MB selection. The
         // internal decoder picks up from where it left off, so its
@@ -572,6 +671,149 @@ impl TwoPassRateControl {
                 // estimate (cheap; bisection itself does the precise
                 // job when triggered).
                 let in_win = frame_idx - lo;
+                let est_next = win_sum.checked_div(in_win).unwrap_or(per_frame_target);
+                let projected = win_sum + est_next;
+                let projected_target = target_window_bytes
+                    .saturating_sub(window.saturating_sub(in_win + 1) * per_frame_target);
+                let drift_pct = if projected_target > 0 {
+                    let d = projected as i64 - projected_target as i64;
+                    d.unsigned_abs() as f32 * 100.0 / projected_target as f32
+                } else {
+                    f32::INFINITY
+                };
+                drift_pct > tol
+            };
+
+            let (chosen_q, chosen_bytes, chosen_len) = if must_bisect {
+                bisect_q_for_window(
+                    frames,
+                    width,
+                    height,
+                    &chosen_qs,
+                    frame_idx,
+                    win_sum,
+                    target_window_bytes,
+                    window,
+                )?
+            } else {
+                let bytes =
+                    replay_to_frame_at_q(frames, width, height, &chosen_qs, frame_idx, current_q)?;
+                let len = bytes.len();
+                (current_q, bytes, len)
+            };
+
+            chosen_qs.push(chosen_q);
+            frame_sizes.push(chosen_len);
+            current_q = chosen_q;
+            out.push(RateControlledFrame {
+                bytes: chosen_bytes,
+                quality: chosen_q,
+                byte_delta: chosen_len as i64 - per_frame_target as i64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Round-7 adaptive-tolerance windowed bisection.
+    ///
+    /// Identical to [`Self::encode_at_target_window_bytes`] but couples
+    /// the per-frame "are we drifting?" tolerance to the **running
+    /// stdev** of the prior `window` frames' actual byte counts.
+    /// Tighter rate control during stable scenes (low byte-size
+    /// variance ⇒ tolerance shrinks toward `tolerance_pct_min`) and
+    /// looser control during scene changes / wipes (high variance ⇒
+    /// tolerance grows toward `tolerance_pct_max`). Without this,
+    /// round-6's fixed tolerance is either too tight on volatile
+    /// content (bisects every frame, wasting trials) or too loose on
+    /// stable content (lets drift accumulate).
+    ///
+    /// The effective tolerance is computed per-frame as:
+    ///
+    /// ```text
+    /// tol = tolerance_pct_min
+    ///     + (tolerance_pct_max - tolerance_pct_min)
+    ///     × clamp(stdev_pct / variance_scale_pct, 0, 1)
+    /// ```
+    ///
+    /// where `stdev_pct = stdev(window_sizes) / mean(window_sizes) ×
+    /// 100`. `variance_scale_pct` is the stdev-pct above which
+    /// tolerance saturates at the upper bound (default `25.0` — a
+    /// common scene-change variance).
+    ///
+    /// Until the encoder has produced `≥ 2` prior frames there's no
+    /// meaningful stdev; the first two frames use the upper bound
+    /// (`tolerance_pct_max`) so the controller bisects opportunistically
+    /// during start-up.
+    ///
+    /// Compared with the fixed-tolerance variant on a 6-frame
+    /// slow-pan-then-cut fixture: tolerance settles to ~ min during
+    /// the slow pan (controller holds quality steady at 1 bisection
+    /// per ~5 frames), then jumps to max at the cut (controller
+    /// re-bisects on the cut frame and the one after to converge to
+    /// the new content's byte profile).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_at_target_window_bytes_adaptive(
+        &self,
+        frames: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        target_window_bytes: usize,
+        window_size: usize,
+        tolerance_pct_min: f32,
+        tolerance_pct_max: f32,
+        variance_scale_pct: f32,
+    ) -> Result<Vec<RateControlledFrame>> {
+        debug_assert!(window_size > 0, "window_size must be ≥ 1");
+        debug_assert!(tolerance_pct_min >= 0.0, "tolerance_pct_min must be ≥ 0");
+        debug_assert!(
+            tolerance_pct_max >= tolerance_pct_min,
+            "tolerance_pct_max must be ≥ tolerance_pct_min"
+        );
+        debug_assert!(variance_scale_pct > 0.0, "variance_scale_pct must be > 0");
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let window = window_size.max(1);
+        let per_frame_target = target_window_bytes / window;
+
+        let mut chosen_qs: Vec<u8> = Vec::with_capacity(frames.len());
+        let mut frame_sizes: Vec<usize> = Vec::with_capacity(frames.len());
+        let mut out: Vec<RateControlledFrame> = Vec::with_capacity(frames.len());
+        let mut current_q: u8 = 50;
+
+        for frame_idx in 0..frames.len() {
+            let lo = frame_idx.saturating_sub(window);
+            let win_sum: usize = frame_sizes[lo..frame_idx].iter().sum();
+            let in_win = frame_idx - lo;
+
+            // Compute the effective tolerance for this frame from the
+            // running stdev of the prior window's byte sizes. Use the
+            // upper bound when we don't have enough history yet.
+            let tol = if in_win >= 2 {
+                let mean = win_sum as f64 / in_win as f64;
+                let var: f64 = frame_sizes[lo..frame_idx]
+                    .iter()
+                    .map(|&s| {
+                        let d = s as f64 - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / in_win as f64;
+                let stdev = var.sqrt();
+                let stdev_pct = if mean > 0.0 {
+                    (stdev / mean) * 100.0
+                } else {
+                    0.0
+                };
+                let scale = (stdev_pct as f32 / variance_scale_pct).clamp(0.0, 1.0);
+                tolerance_pct_min + (tolerance_pct_max - tolerance_pct_min) * scale
+            } else {
+                tolerance_pct_max
+            };
+
+            let must_bisect = if frame_idx == 0 {
+                true
+            } else {
                 let est_next = win_sum.checked_div(in_win).unwrap_or(per_frame_target);
                 let projected = win_sum + est_next;
                 let projected_target = target_window_bytes
@@ -964,6 +1206,38 @@ fn encode_inter_strip(
     selective_enabled: bool,
     cross_frame_seeding: bool,
 ) -> Result<Vec<u8>> {
+    encode_inter_strip_with_stats(
+        pixels,
+        prev,
+        width,
+        mode,
+        opts,
+        s,
+        roll,
+        selective_enabled,
+        cross_frame_seeding,
+        None,
+    )
+}
+
+/// Internal sibling of [`encode_inter_strip`] that also accumulates
+/// per-strip telemetry into `stats`, when `Some`. The free-function /
+/// stateless paths pass `None`; the stateful [`CinepakEncoder`] passes
+/// `Some(&mut stats)` so it can expose round-7 reclamation counts /
+/// forced-full counts to callers.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_strip_with_stats(
+    pixels: &[u8],
+    prev: &CinepakFrame,
+    width: u32,
+    mode: PixelMode,
+    opts: &EncoderOptions,
+    s: &StripPlan,
+    roll: &mut RollingCodebooks,
+    selective_enabled: bool,
+    cross_frame_seeding: bool,
+    stats: Option<&mut FrameStatsAccum>,
+) -> Result<Vec<u8>> {
     // Cross-frame codebook persistence (round 5): seed the median-cut
     // quantiser with the rolling codebook the decoder currently holds.
     // When the previous codebook entry count matches `opts.v?_entries`
@@ -979,7 +1253,7 @@ fn encode_inter_strip(
     // strip 2's median-cut anchors to strip 1's slot identities. This
     // is what makes selective-update wire-cheaper than full-replace
     // within a single multi-strip inter frame.
-    let seed_opt = if cross_frame_seeding {
+    let mut seed_opt = if cross_frame_seeding {
         let v4_seed = roll
             .get(WhichCodebook::V4)
             .filter(|(_, n)| *n == opts.v4_entries as usize)
@@ -995,6 +1269,72 @@ fn encode_inter_strip(
     } else {
         None
     };
+
+    // Round-7 empty-cluster slot reclamation (PRIMARY round-7 feature).
+    //
+    // When a slot has been unreferenced for `≥ stale_slot_threshold`
+    // consecutive inter frames, its persistent (warm-started)
+    // centroid has gone stale — it's surviving cross-frame persistence
+    // but no longer represents any current content. We "reclaim" the
+    // slot by overwriting its seed centroid with a high-residual
+    // sample MB from this strip *before* Lloyd refinement kicks in;
+    // Lloyd's nearest-seed assignment then naturally pulls a small
+    // outlier cluster onto the reclaimed slot, retraining it for
+    // current content.
+    //
+    // Reclamation only applies when:
+    // - `opts.stale_slot_threshold` is `Some(n)`.
+    // - `cross_frame_seeding` is true (otherwise there's no seed to
+    //   patch and the cold-start median-cut already retrains everything).
+    // - The seed for the codebook flavour matches the requested entry
+    //   count (`v?_seed.is_some()`).
+    //
+    // After reclamation, `force_full_*` is set so the codebook chunk
+    // emits full-replace (rather than risking a chunk-omission /
+    // selective-update path that doesn't list the reclaimed slot — the
+    // decoder MUST see the new slot value to stay in sync).
+    let (force_full_v4, force_full_v1, reclaimed_v4, reclaimed_v1) =
+        if let (Some(threshold), Some(seed_ref)) = (
+            opts.stale_slot_threshold,
+            seed_opt.as_mut().filter(|_| cross_frame_seeding),
+        ) {
+            let v4_recl = if let Some(seed_v4) = seed_ref.v4.as_mut() {
+                reclaim_stale_slots_v4(
+                    pixels,
+                    width,
+                    mode,
+                    opts,
+                    s,
+                    Some(prev),
+                    seed_v4,
+                    roll.staleness(WhichCodebook::V4),
+                    threshold,
+                    opts.v4_entries as usize,
+                )
+            } else {
+                Vec::new()
+            };
+            let v1_recl = if let Some(seed_v1) = seed_ref.v1.as_mut() {
+                reclaim_stale_slots_v1(
+                    pixels,
+                    width,
+                    mode,
+                    opts,
+                    s,
+                    Some(prev),
+                    seed_v1,
+                    roll.staleness(WhichCodebook::V1),
+                    threshold,
+                    opts.v1_entries as usize,
+                )
+            } else {
+                Vec::new()
+            };
+            (!v4_recl.is_empty(), !v1_recl.is_empty(), v4_recl, v1_recl)
+        } else {
+            (false, false, Vec::new(), Vec::new())
+        };
+
     let plan = build_codebooks_and_decisions(
         pixels,
         width,
@@ -1024,8 +1364,45 @@ fn encode_inter_strip(
         selective_enabled,
         &v4_used,
         &v1_used,
+        force_full_v4,
+        force_full_v1,
         &mut chunks,
     );
+
+    // Round-7: accumulate per-strip "used" masks into the
+    // FrameStatsAccum so we can update staleness at the end of the
+    // frame (not per-strip — a slot used in strip B but not strip A
+    // shouldn't have its A-strip increment retroactively undone).
+    // Also reset reclaimed slots immediately (they were just retrained
+    // from current content).
+    roll.reset_staleness(WhichCodebook::V4, &reclaimed_v4);
+    roll.reset_staleness(WhichCodebook::V1, &reclaimed_v1);
+
+    // Round-7 telemetry: accumulate per-strip stats (reclaimed-slot
+    // count, forced-full count) and per-frame "any-strip-used" masks.
+    // The free-function path passes None.
+    if let Some(acc) = stats {
+        acc.reclaimed_v4_slots += reclaimed_v4.len();
+        acc.reclaimed_v1_slots += reclaimed_v1.len();
+        if force_full_v4 {
+            acc.forced_full_chunks += 1;
+        }
+        if force_full_v1 {
+            acc.forced_full_chunks += 1;
+        }
+        for slot in 0..256 {
+            acc.frame_v4_used[slot] |= v4_used[slot];
+            acc.frame_v1_used[slot] |= v1_used[slot];
+        }
+    } else {
+        // Stateless path: no per-frame aggregation, so update
+        // staleness per-strip. The stateless path also doesn't
+        // benefit from reclamation (cross_frame_seeding=false), so
+        // staleness counters here are mostly cosmetic — but we keep
+        // the logic consistent.
+        roll.update_staleness(WhichCodebook::V4, &v4_used, opts.v4_entries as usize);
+        roll.update_staleness(WhichCodebook::V1, &v1_used, opts.v1_entries as usize);
+    }
 
     // Vector chunk 0x3100 (mixed inter with skip).
     let mut vec_payload = Vec::new();
@@ -1036,6 +1413,189 @@ fn encode_inter_strip(
     chunks.extend_from_slice(&vec_payload);
 
     finalise_strip(STRIP_ID_INTER, s, width, &chunks)
+}
+
+/// Round-7 telemetry accumulator: a thin per-frame counter struct that
+/// the stateful encoder threads into each per-strip call so it can
+/// report after-the-fact stats (reclaimed-slot counts, forced-full
+/// chunks). Callers query this via [`CinepakEncoder::last_frame_stats`].
+///
+/// Also accumulates the per-frame "any strip referenced this slot?"
+/// masks (`frame_v?_used`) so the post-frame staleness update is done
+/// once per frame, not once per strip — otherwise slots would
+/// over-count staleness on multi-strip frames (each unused strip
+/// stripping the counter towards reclamation 1.5..N× faster than
+/// intended).
+#[derive(Clone, Copy)]
+struct FrameStatsAccum {
+    reclaimed_v4_slots: usize,
+    reclaimed_v1_slots: usize,
+    forced_full_chunks: usize,
+    frame_v4_used: [bool; 256],
+    frame_v1_used: [bool; 256],
+}
+
+impl Default for FrameStatsAccum {
+    fn default() -> Self {
+        Self {
+            reclaimed_v4_slots: 0,
+            reclaimed_v1_slots: 0,
+            forced_full_chunks: 0,
+            frame_v4_used: [false; 256],
+            frame_v1_used: [false; 256],
+        }
+    }
+}
+
+/// Reclaim stale V4 slots in `seed` by overwriting their centroids
+/// with high-residual sample sub-block vectors from the strip. Returns
+/// the list of slot indices that were reclaimed (empty when no slot is
+/// stale enough or the strip has no candidate vectors).
+///
+/// "High-residual" means: among non-skip sample vectors, the ones
+/// whose distance to their nearest seed centroid is largest. We pick
+/// distinct vectors (at least 2 codebook units of L1 separation) so
+/// reclaiming N slots actually injects N distinct outliers, not N
+/// copies of the same MB.
+#[allow(clippy::too_many_arguments)]
+fn reclaim_stale_slots_v4(
+    pixels: &[u8],
+    width: u32,
+    mode: PixelMode,
+    opts: &EncoderOptions,
+    s: &StripPlan,
+    prev: Option<&CinepakFrame>,
+    seed: &mut Codebook,
+    staleness: &[u16; 256],
+    threshold: u8,
+    n: usize,
+) -> Vec<u8> {
+    // Identify stale slots (counter strictly greater-than-or-equal to
+    // threshold ⇒ trigger reclamation; use >= so threshold = 1 means
+    // "after 1 frame of staleness").
+    let stale_slots: Vec<u8> = (0..n.min(256))
+        .filter(|&slot| staleness[slot] > threshold as u16)
+        .map(|slot| slot as u8)
+        .collect();
+    if stale_slots.is_empty() {
+        return Vec::new();
+    }
+    // Sample the strip's non-skip V4 sub-block vectors.
+    let mb_cols = (width / 4) as usize;
+    let strip_h_mb = ((s.y_bottom - s.y_top) / 4) as usize;
+    let mut samples: Vec<CodebookEntry> = Vec::with_capacity(strip_h_mb * mb_cols * 4);
+    for r in 0..strip_h_mb {
+        for c in 0..mb_cols {
+            let py = s.y_top as usize + r * 4;
+            let px = c * 4;
+            let is_skip = if let Some(prev_f) = prev {
+                let mse = mb_mse_against_prev(pixels, prev_f, px, py, width, mode);
+                mse < opts.skip_threshold
+            } else {
+                false
+            };
+            if is_skip {
+                continue;
+            }
+            samples.extend_from_slice(&sample_v4_block(pixels, width as usize, px, py, mode));
+        }
+    }
+    reclaim_with_samples(&samples, mode, n, seed, &stale_slots)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reclaim_stale_slots_v1(
+    pixels: &[u8],
+    width: u32,
+    mode: PixelMode,
+    opts: &EncoderOptions,
+    s: &StripPlan,
+    prev: Option<&CinepakFrame>,
+    seed: &mut Codebook,
+    staleness: &[u16; 256],
+    threshold: u8,
+    n: usize,
+) -> Vec<u8> {
+    let stale_slots: Vec<u8> = (0..n.min(256))
+        .filter(|&slot| staleness[slot] > threshold as u16)
+        .map(|slot| slot as u8)
+        .collect();
+    if stale_slots.is_empty() {
+        return Vec::new();
+    }
+    let mb_cols = (width / 4) as usize;
+    let strip_h_mb = ((s.y_bottom - s.y_top) / 4) as usize;
+    let mut samples: Vec<CodebookEntry> = Vec::with_capacity(strip_h_mb * mb_cols);
+    for r in 0..strip_h_mb {
+        for c in 0..mb_cols {
+            let py = s.y_top as usize + r * 4;
+            let px = c * 4;
+            let is_skip = if let Some(prev_f) = prev {
+                let mse = mb_mse_against_prev(pixels, prev_f, px, py, width, mode);
+                mse < opts.skip_threshold
+            } else {
+                false
+            };
+            if is_skip {
+                continue;
+            }
+            samples.push(sample_v1_block(pixels, width as usize, px, py, mode));
+        }
+    }
+    reclaim_with_samples(&samples, mode, n, seed, &stale_slots)
+}
+
+/// Common reclamation kernel: given non-skip `samples`, the codebook
+/// `n`, the seed codebook to patch, and the list of `stale_slots` to
+/// reclaim, picks one distinct high-residual sample per stale slot and
+/// overwrites the seed centroid with it. Returns the list of slots
+/// that were actually reclaimed (a slot is skipped if no
+/// sufficiently-distinct outlier remains).
+fn reclaim_with_samples(
+    samples: &[CodebookEntry],
+    mode: PixelMode,
+    n: usize,
+    seed: &mut Codebook,
+    stale_slots: &[u8],
+) -> Vec<u8> {
+    if samples.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    // Score every sample by its distance to its nearest seed centroid.
+    // Reclaim the highest-residual samples first; within that ranking,
+    // skip samples too close to an already-picked outlier (so two
+    // reclaimed slots don't end up with the same centroid).
+    let mut scored: Vec<(i64, usize)> = (0..samples.len())
+        .map(|i| {
+            let (_, d) = nearest(&samples[i], seed, n, mode);
+            (d, i)
+        })
+        .collect();
+    scored.sort_by_key(|x| std::cmp::Reverse(x.0)); // descending residual
+    let min_separation: u32 = 4; // L1 units
+    let mut chosen_indices: Vec<usize> = Vec::with_capacity(stale_slots.len());
+    for (_, idx) in scored {
+        if chosen_indices.len() >= stale_slots.len() {
+            break;
+        }
+        let candidate = &samples[idx];
+        let too_close = chosen_indices
+            .iter()
+            .any(|&j| entry_l1_distance(candidate, &samples[j], mode) < min_separation);
+        if !too_close {
+            chosen_indices.push(idx);
+        }
+    }
+    if chosen_indices.is_empty() {
+        return Vec::new();
+    }
+    let mut reclaimed: Vec<u8> = Vec::with_capacity(chosen_indices.len());
+    for (slot_idx, sample_idx) in chosen_indices.iter().enumerate() {
+        let slot = stale_slots[slot_idx];
+        seed.entries[slot as usize] = samples[*sample_idx];
+        reclaimed.push(slot);
+    }
+    reclaimed
 }
 
 /// Per-strip codebook + per-MB decision result.
@@ -1217,6 +1777,8 @@ fn emit_codebook_chunks_inter(
     selective_enabled: bool,
     v4_used: &[bool; 256],
     v1_used: &[bool; 256],
+    force_full_v4: bool,
+    force_full_v1: bool,
     out: &mut Vec<u8>,
 ) {
     emit_codebook_chunk_one(
@@ -1227,6 +1789,7 @@ fn emit_codebook_chunks_inter(
         roll,
         selective_enabled,
         v4_used,
+        force_full_v4,
         out,
     );
     emit_codebook_chunk_one(
@@ -1237,6 +1800,7 @@ fn emit_codebook_chunks_inter(
         roll,
         selective_enabled,
         v1_used,
+        force_full_v1,
         out,
     );
 }
@@ -1250,6 +1814,7 @@ fn emit_codebook_chunk_one(
     roll: &mut RollingCodebooks,
     selective_enabled: bool,
     used: &[bool; 256],
+    force_full: bool,
     out: &mut Vec<u8>,
 ) {
     let entry_size = mode.entry_size();
@@ -1311,7 +1876,15 @@ fn emit_codebook_chunk_one(
         mode,
     };
 
-    if can_emit_none && none_size <= full_size {
+    if force_full {
+        // Round-7: a stale slot was reclaimed for this codebook
+        // flavour, so we MUST emit the full codebook so the decoder
+        // sees the reclaimed slot value (selective + listing the
+        // reclaimed slot would also work, but full-replace is simpler
+        // and the wire-size delta is small for a one-shot reclaim).
+        encode_full_chunk(kind_full, cb, n, out);
+        roll.set(which, cb.clone(), n);
+    } else if can_emit_none && none_size <= full_size {
         // Omit chunk entirely. Decoder inherits prev codebook (spec §5).
         // Roll-state update: codebook stays exactly as `prev` — the
         // slots not referenced by this strip's MBs may differ between
@@ -1320,15 +1893,13 @@ fn emit_codebook_chunk_one(
         // keep cross-strip codebook tracking accurate.
         let prev_cb = prev_matches.unwrap().clone();
         roll.set(which, prev_cb, n);
-    } else if selective_enabled
-        && prev_matches.is_some()
-        && !need_update.is_empty()
-        && selective_size < full_size
+    } else if let Some(prev_cb) = prev_matches
+        .filter(|_| selective_enabled && !need_update.is_empty() && selective_size < full_size)
     {
         encode_selective_chunk(kind_sel, cb, &need_update, out);
         // After selective-update, the decoder's codebook = prev's
         // codebook with the listed slots replaced. Build that view.
-        let mut new_cb = prev_matches.unwrap().clone();
+        let mut new_cb = prev_cb.clone();
         for &slot in &need_update {
             new_cb.entries[slot as usize] = cb.entries[slot as usize];
         }
@@ -1365,10 +1936,36 @@ fn used_v1_slots(mbs: &[Mb]) -> [bool; 256] {
 
 /// Tracks the V4 and V1 codebook the decoder will hold at the start of
 /// the next strip. Updated after emitting each strip's codebook chunks.
-#[derive(Clone, Default)]
+///
+/// Round-7 additions: also tracks a per-slot **staleness counter** for
+/// each codebook flavour — incremented at the end of every inter strip
+/// for any slot not referenced in that strip, reset to zero for any
+/// slot that *was* referenced. The encoder reads these counters before
+/// the next strip's codebook training step to decide whether any slot
+/// has gone unreferenced long enough that it should be reclaimed
+/// (re-seeded from a high-residual MB) rather than left frozen forever
+/// via cross-frame persistence.
+#[derive(Clone)]
 struct RollingCodebooks {
     v4: Option<(Codebook, usize)>,
     v1: Option<(Codebook, usize)>,
+    /// Round-7 per-slot staleness: number of consecutive inter strips
+    /// since the slot was last referenced by an MB. Indexed `[slot]`,
+    /// `0..256`. Reset when a slot is reseeded or when an intra frame
+    /// resets the rolling state. Saturates at `u16::MAX`.
+    v4_stale: [u16; 256],
+    v1_stale: [u16; 256],
+}
+
+impl Default for RollingCodebooks {
+    fn default() -> Self {
+        Self {
+            v4: None,
+            v1: None,
+            v4_stale: [0u16; 256],
+            v1_stale: [0u16; 256],
+        }
+    }
 }
 
 impl RollingCodebooks {
@@ -1383,6 +1980,45 @@ impl RollingCodebooks {
         match which {
             WhichCodebook::V4 => self.v4 = Some((cb, n)),
             WhichCodebook::V1 => self.v1 = Some((cb, n)),
+        }
+    }
+
+    /// Bump the per-slot staleness counters for the codebook flavour
+    /// `which`: increment each slot in `0..n` not present in `used`,
+    /// reset to zero each slot that *is* present. Slots `≥ n` are
+    /// untouched. Saturates at `u16::MAX`.
+    fn update_staleness(&mut self, which: WhichCodebook, used: &[bool; 256], n: usize) {
+        let stale = match which {
+            WhichCodebook::V4 => &mut self.v4_stale,
+            WhichCodebook::V1 => &mut self.v1_stale,
+        };
+        for slot in 0..n.min(256) {
+            if used[slot] {
+                stale[slot] = 0;
+            } else {
+                stale[slot] = stale[slot].saturating_add(1);
+            }
+        }
+    }
+
+    /// Read the current per-slot staleness counters for `which`.
+    fn staleness(&self, which: WhichCodebook) -> &[u16; 256] {
+        match which {
+            WhichCodebook::V4 => &self.v4_stale,
+            WhichCodebook::V1 => &self.v1_stale,
+        }
+    }
+
+    /// Reset the per-slot staleness counters for `which` to all zero.
+    /// Called after slot reclamation (those slots have just been
+    /// reseeded) and on intra frames (rolling state reset).
+    fn reset_staleness(&mut self, which: WhichCodebook, slots: &[u8]) {
+        let stale = match which {
+            WhichCodebook::V4 => &mut self.v4_stale,
+            WhichCodebook::V1 => &mut self.v1_stale,
+        };
+        for &s in slots {
+            stale[s as usize] = 0;
         }
     }
 }

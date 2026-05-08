@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7: **empty-cluster slot reclamation**
+  (`EncoderOptions::stale_slot_threshold`). The stateful
+  `CinepakEncoder` now tracks a per-slot staleness counter for each
+  V4/V1 codebook flavour: incremented every inter frame the slot is
+  not referenced by any macroblock, reset when it is. When a slot's
+  counter exceeds `stale_slot_threshold` (default `Some(8)`; `None`
+  disables), the encoder reseeds it from the strip's
+  highest-residual sample MB (its distance to its nearest seed
+  centroid) before Lloyd refinement, then forces a full-replace
+  codebook chunk so the decoder sees the reclaimed slot value. Closes
+  the long-running cross-frame-persistence "frozen slot" issue where
+  an unreferenced slot would survive forever, holding stale content
+  the codebook could no longer use. Telemetry exposed via
+  `CinepakEncoder::last_frame_stats() -> FrameStats` (reclaimed-slot
+  counts per flavour, forced-full-chunk count). Strict-greater-than
+  comparison on the threshold means the round-5 8-frame slow-pan
+  fixture runs all the way through with persistence active without
+  triggering reclamation on the final frame; on a content-cut fixture
+  with threshold=2, ~89 slots reclaim across V4+V1 on the cut frame,
+  bringing pixel fidelity back to a bounded MAE within 1 frame.
+  Per-frame (not per-strip) staleness increments — multi-strip frames
+  don't bump the counter once per strip.
+- Round 7: **adaptive bisection tolerance**
+  (`TwoPassRateControl::encode_at_target_window_bytes_adaptive`).
+  Couples the windowed bisection's "are we drifting?" tolerance to
+  the running stdev of the prior `window_size` frames' actual byte
+  counts: tight on stable scenes (low byte-size variance ⇒ tolerance
+  shrinks toward `tolerance_pct_min`), loose on scene changes /
+  wipes (high variance ⇒ tolerance grows toward
+  `tolerance_pct_max`). `variance_scale_pct` is the stdev-pct above
+  which tolerance saturates at the upper bound (default test value
+  `25.0` — a common scene-change variance). Equal-bound input
+  reproduces the round-6 fixed-tolerance behaviour exactly. First
+  two frames use `tolerance_pct_max` (no meaningful stdev yet).
+
 - Round 6: **windowed bisection rate control**
   (`TwoPassRateControl::encode_at_target_window_bytes`). Targets a
   byte budget over a rolling N-frame window rather than per-frame

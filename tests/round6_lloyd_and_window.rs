@@ -134,7 +134,16 @@ fn lloyd_max_iter_0_loses_persistence_wire_savings() {
     let w = 32usize;
     let h = 32usize;
     let n_inter = 6usize;
-    let base = EncoderOptions::from_quality(50);
+    // Round-3 (round-47) note: this test measures the *isolated* effect
+    // of Lloyd warm-start on inter-frame wire size, so pin `rdo_lambda`
+    // to `None` (legacy round-2 V1/V4 selection). With RDO enabled the
+    // V4-bias shifts the V1/V4 distribution; the cold-vs-warm
+    // chunk-omission delta then depends on factors orthogonal to the
+    // Lloyd knob we're characterising.
+    let base = EncoderOptions {
+        rdo_lambda: None,
+        ..EncoderOptions::from_quality(50)
+    };
 
     fn total_inter_bytes(opts: EncoderOptions, w: usize, h: usize, n_inter: usize) -> usize {
         let mut enc = CinepakEncoder::new();

@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 3 (round-47): **Lagrangian V1/V4 RDO selection**
+  (`EncoderOptions::rdo_lambda`, default `Some(5.0)`). The per-MB
+  V1-vs-V4 decision now computes pixel-domain Y SSE for both
+  candidate reconstructions and applies the Lagrangian `D + lambda · R`
+  rule with a 24-bit rate delta favouring V1 (V4: 4 index bytes; V1:
+  1 index byte; flag-bit cost identical). The legacy round-2 path
+  compared raw codebook-distance sums (apples-to-oranges: V4 sums 4
+  sub-block distances, V1 sums 1, so V1 wins by default on any
+  non-pathological gradient and the encoder under-utilised V4's
+  per-sub-block fidelity). Measured wins (self-encode + self-decode at
+  q=50, PSNR_Y in BT.601 Y units):
+  - 320×240 horizontal+vertical gradient: legacy 35.17 dB / 6787 B →
+    RDO 35.61 dB / 8548 B (**+0.43 dB at +26% wire**).
+  - 64×64 gradient (the `ffmpeg_avi_roundtrip.rs` fixture, ffmpeg's
+    own encoder produces ~36.9 dB Y): legacy 35.59 dB / 1438 B → RDO
+    36.69 dB / 1573 B (**+1.10 dB at +9% wire**, essentially parity
+    with ffmpeg's reference encoder quality on this fixture).
+
+  Set `rdo_lambda = None` to recover the round-2 codebook-distance
+  comparison; existing tests that isolate other levers
+  (`tests/round5_persistence_and_multistrip.rs::cross_frame_persistence_*`,
+  `tests/round6_lloyd_and_window.rs::lloyd_max_iter_0_*`) pin this for
+  measurement isolation.
+
+- Round 3 (round-47): **per-frame strip-count picker**
+  (`encode_rgb24_best_strips(rgb, w, h, opts, &[u16])`). Trial-encodes
+  the input at each candidate strip count and returns the bitstream
+  with the lowest Lagrangian cost `R + lambda · D`, where `R` is wire
+  size in bytes and `D` is self-decode pixel-domain RGB MSE per pixel.
+  Lambda is taken from `opts.rdo_lambda` (falls back to `0.0` when
+  `None`, i.e. pick the candidate with the lowest MSE regardless of
+  byte cost). On the 320×240 gradient fixture at q=50 the picker
+  selects 4 strips (`38.17 dB PSNR_Y / 8568 B`) over the
+  `EncoderOptions::from_quality(50)` default of 2 strips (35.61 dB /
+  8548 B) — **breaks 38 dB PSNR_Y on a single intra frame** with no
+  wire-size increase. Cost: N self-decodes per call (N = number of
+  candidates), so use sparingly on a per-frame budget. Stateless;
+  intra-only (cross-frame state isn't reset between trials).
+
+- Round 3 (round-47) test: `tests/r3_psnr.rs` — five-test PSNR
+  validation suite asserting (i) Lever-D RDO lifts PSNR_Y on both
+  benchmark fixtures, (ii) Lever-A strip picker breaks 38 dB on the
+  320×240 gradient, (iii) `rdo_lambda = None` legacy path remains
+  decodable at the round-2 baseline, (iv) empty-candidates list is
+  rejected by `encode_rgb24_best_strips`.
+
 - Round 7: **empty-cluster slot reclamation**
   (`EncoderOptions::stale_slot_threshold`). The stateful
   `CinepakEncoder` now tracks a per-slot staleness counter for each

@@ -58,8 +58,8 @@ pub const CODEC_ID_STR: &str = "cinepak";
 // Standalone, framework-free re-exports.
 pub use decoder::CinepakDecoder;
 pub use encoder::{
-    encode_gray8, encode_rgb24, encode_rgb24_inter, CinepakEncoder, EncoderOptions, FrameStats,
-    RateControlledFrame, TwoPassRateControl,
+    encode_gray8, encode_rgb24, encode_rgb24_best_strips, encode_rgb24_inter, CinepakEncoder,
+    EncoderOptions, FrameStats, RateControlledFrame, TwoPassRateControl,
 };
 pub use error::{CinepakError, Result};
 pub use film::{probe_film, Fdsc, FilmDemuxer, FilmHeader, SampleRecord, StabHeader};

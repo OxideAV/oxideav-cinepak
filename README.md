@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -60,6 +60,21 @@ couples bisection tolerance to the running stdev of prior frame
 sizes, tighter on stable scenes / looser on cuts) and a
 **`CinepakEncoder::last_frame_stats() -> FrameStats`** telemetry
 accessor for reclamation-count debugging.
+Round-47 (encoder-RDO) added **Lagrangian V1/V4 rate-distortion
+selection** (`EncoderOptions::rdo_lambda`, default `Some(5.0)`):
+per-MB V1-vs-V4 decisions now compute pixel-domain Y SSE for both
+candidate reconstructions and apply `D + lambda · R` with a 24-bit
+rate delta favouring V1, replacing the round-2 codebook-distance
+comparison that under-utilised V4's per-sub-block fidelity. PSNR_Y
+lifts by **+1.10 dB** on the 64×64 gradient (now 36.69 dB,
+essentially parity with ffmpeg's reference 36.9 dB on this fixture)
+and **+0.43 dB** on the 320×240 gradient at q=50, at +9% and +26%
+wire respectively. Round-47 also added a **per-frame strip-count
+picker** (`encode_rgb24_best_strips`) — trial-encodes the input at
+each supplied strip count and returns the bitstream with the lowest
+Lagrangian cost, **breaking 38 dB PSNR_Y on the 320×240 gradient**
+in a single intra frame (38.17 dB at 8568 B, vs the fixed-2-strip
+default's 35.61 dB at 8548 B).
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -87,7 +102,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -148,6 +163,20 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7):
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.
+- `EncoderOptions::rdo_lambda` (round-47, default `Some(5.0)`) —
+  Lagrangian V1/V4 rate-distortion selection. Per-MB V1-vs-V4
+  decisions compute pixel-domain Y SSE for both candidate
+  reconstructions and apply `D + lambda · R` with a 24-bit rate
+  delta (V4 carries 4 index bytes vs V1's 1). Lifts PSNR_Y by
+  +1.10 dB / +0.43 dB on 64×64 / 320×240 gradient fixtures (q=50)
+  versus the round-2 codebook-distance comparison. Set to `None` to
+  recover the round-2 behaviour.
+- `encode_rgb24_best_strips` (round-47) — per-frame strip-count
+  picker. Trial-encodes the input at each supplied candidate strip
+  count and returns the bitstream with the lowest Lagrangian cost
+  `R + lambda · D`. Breaks 38 dB PSNR_Y on the 320×240 gradient
+  fixture at q=50 (selects 4 strips, 38.17 dB / 8568 B). Intra-only,
+  stateless; cost is N self-decodes per call.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

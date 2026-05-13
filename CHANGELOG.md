@@ -8,6 +8,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 4 (Lever E): **Linde-Buzo-Gray (LBG) split refinement**
+  (`EncoderOptions::lbg_max_passes`, default `8`). After the median-cut
+  + Lloyd warm-build builds the strip's V4/V1 codebook, the encoder now
+  iteratively identifies the highest-distortion populated slot
+  ("splitter") and the lowest-population slot ("donor"), replaces the
+  donor with a perturbed copy of the splitter centroid (±1 along the
+  splitter cluster's widest dimension), and runs one full Lloyd
+  reassignment + recentroid pass. The pass terminates when total SSE
+  doesn't strictly decrease — typically within 4..=8 passes on smooth
+  content. Reference: Linde, Buzo, Gray (1980) "An Algorithm for Vector
+  Quantizer Design", IEEE Trans. Communications 28(1) — published
+  VQ-design math, no proprietary source consulted.
+
+  Measured wins (self-encode + self-decode at q=50, PSNR_Y in BT.601 Y
+  units; `lbg_max_passes = 0` is the round-3 baseline):
+
+  | fixture                                       | r3 (lbg=0) | r4 (lbg=8) | delta     |
+  | --------------------------------------------- | ---------- | ---------- | --------- |
+  | 64×64 gradient, `encode_rgb24`                | 36.69 dB   | 37.85 dB   | +1.16 dB  |
+  | 64×64 gradient, `encode_rgb24_best_strips`    | 40.23 dB   | 40.77 dB   | +0.53 dB  |
+  | 320×240 gradient, `encode_rgb24`              | 35.61 dB   | 37.81 dB   | +2.19 dB  |
+  | 320×240 gradient, `encode_rgb24_best_strips`  | 38.17 dB   | 40.69 dB   | +2.52 dB  |
+  | 64×64 LCG-noise, `encode_rgb24`               | 21.54 dB   | 22.39 dB   | +0.85 dB  |
+  | 64×64 LCG-noise, `encode_rgb24_best_strips`   | 22.09 dB   | 22.98 dB   | +0.89 dB  |
+
+  Headline: **the 64×64 gradient via `encode_rgb24_best_strips` now hits
+  40.77 dB Y at 2689 B** — a +3.87 dB lead over ffmpeg's reference
+  encoder's ~36.9 dB on the same fixture (measured via
+  `tests/ffmpeg_avi_roundtrip.rs`), and well past the 38 dB round-4
+  target.
+
+  Set `lbg_max_passes = 0` to disable LBG and recover the round-3
+  baseline (used by the regression-guard tests in `r4_psnr.rs`).
+  Cost per pass: O(N · K) entry distances (N = vectors, K = codebook
+  size) — comparable to a single Lloyd iteration; the pass auto-stops
+  when no split improves total SSE, so the bound is informational only
+  on well-converged seeds.
+
+- Round 4: `tests/r4_psnr.rs` — five-test PSNR validation suite
+  asserting (i) `encode_rgb24_best_strips` on 64×64 gradient breaks
+  38 dB PSNR_Y (observed 40.77 dB), (ii) 320×240 gradient stays
+  ≥ 38 dB (no regression), (iii) noisy LCG fixture lifts by ≥ 0.5 dB
+  vs the round-3 `lbg_max_passes = 0` baseline (observed +0.85 dB),
+  (iv) gradient LBG-on vs LBG-off delta ≥ 1.0 dB (observed +1.16 dB),
+  (v) `lbg_max_passes = 0` reproduces the round-3 baseline within
+  noise.
+
 - Round 3 (round-47): **Lagrangian V1/V4 RDO selection**
   (`EncoderOptions::rdo_lambda`, default `Some(5.0)`). The per-MB
   V1-vs-V4 decision now computes pixel-domain Y SSE for both

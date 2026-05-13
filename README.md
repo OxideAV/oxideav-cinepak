@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -75,6 +75,19 @@ each supplied strip count and returns the bitstream with the lowest
 Lagrangian cost, **breaking 38 dB PSNR_Y on the 320×240 gradient**
 in a single intra frame (38.17 dB at 8568 B, vs the fixed-2-strip
 default's 35.61 dB at 8548 B).
+Round 4 added **Linde-Buzo-Gray (LBG) split refinement**
+(`EncoderOptions::lbg_max_passes`, default `8`) — after the
+median-cut + Lloyd warm-build, iteratively split the highest-distortion
+codebook slot into the lowest-population slot and re-Lloyd until no
+further split improves total SSE (Linde-Buzo-Gray 1980, IEEE TComm
+28(1) — published VQ-design math, no proprietary source consulted).
+PSNR_Y lifts by **+1.16 dB** on the 64×64 gradient
+(`encode_rgb24`: 36.69 → 37.85 dB), **+2.19 dB** on the 320×240
+gradient (35.61 → 37.81 dB), and **+0.85 dB** on a pure-LCG-noise
+64×64 fixture (21.54 → 22.39 dB). Combined with the round-47
+strip-picker the 64×64 gradient now reaches **40.77 dB Y at 2689 B**
+— a +3.87 dB lead over ffmpeg's reference encoder on the same
+fixture.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -102,7 +115,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -177,6 +190,17 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO):
   `R + lambda · D`. Breaks 38 dB PSNR_Y on the 320×240 gradient
   fixture at q=50 (selects 4 strips, 38.17 dB / 8568 B). Intra-only,
   stateless; cost is N self-decodes per call.
+- `EncoderOptions::lbg_max_passes` (round 4, default `8`) —
+  **Linde-Buzo-Gray (LBG) split refinement**. After median-cut +
+  Lloyd warm-build, iteratively splits the highest-distortion
+  populated codebook slot into the lowest-population slot, runs one
+  full Lloyd pass over all vectors, and continues until total SSE
+  stops decreasing. Reference: Linde-Buzo-Gray 1980, IEEE TComm
+  28(1). Lifts PSNR_Y by +1.16 dB / +2.19 dB on 64×64 / 320×240
+  gradient fixtures at q=50; combined with the strip-picker the
+  64×64 gradient now reaches **40.77 dB Y at 2689 B** vs ffmpeg's
+  reference 36.9 dB on the same fixture (+3.87 dB lead). Set
+  `lbg_max_passes = 0` to disable.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

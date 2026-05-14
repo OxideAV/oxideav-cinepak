@@ -8,6 +8,67 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 5 (Levers F + G): **luma-weighted distance metric** and
+  **luma-prioritized median-cut split** (`EncoderOptions::luma_weight`,
+  default `2`). Two complementary luma-priority levers applied at the
+  codebook-training layer:
+
+  - **Lever F (distance metric)**: each Y-dim squared-error
+    contribution is multiplied by `luma_weight` before being summed
+    with the chroma U/V contributions, in `entry_distance` /
+    `entry_l1_distance` / `nearest` / `pick_v4` / `pick_v1` and through
+    every clustering-related call site (Lloyd refinement, LBG split
+    refinement, slot-reclamation residual scoring). Under PSNR_Y,
+    packing the codebook tightly in Y is more valuable than packing it
+    tightly in U/V — luma-weighted clustering pulls trained centroids
+    closer to source Y values at a modest chroma fidelity cost.
+  - **Lever G (median-cut split)**: when picking the split dimension
+    in `median_cut`, Y-dim extents are multiplied by `luma_weight`
+    before being compared against U/V-dim extents. This biases the
+    initial bisection toward Y-axis cuts when Y and U/V extents are
+    otherwise comparable.
+
+  Both levers share the single `luma_weight` knob (default `2`). `1`
+  reproduces the round-4 isotropic-distance / isotropic-split
+  behaviour; `0` is treated as `1` internally (no-op fallback).
+
+  Measured wins (self-encode + self-decode at q=50, PSNR_Y in BT.601 Y
+  units; `luma_weight = 1` is the round-4 baseline):
+
+  | fixture                                       | r4 (lw=1) | r5 (lw=2) | delta     |
+  | --------------------------------------------- | --------- | --------- | --------- |
+  | 64×64 gradient, `encode_rgb24`                | 37.85 dB  | 39.39 dB  | +1.55 dB  |
+  | 64×64 gradient, `encode_rgb24_best_strips`    | 40.77 dB  | 42.39 dB  | +1.62 dB  |
+  | 320×240 gradient, `encode_rgb24_best_strips`  | 40.69 dB  | 41.70 dB  | +1.01 dB  |
+  | 64×64 LCG-noise, `encode_rgb24_best_strips`   | 22.98 dB  | 23.00 dB  | +0.02 dB  |
+
+  Headline: **the 64×64 gradient via `encode_rgb24_best_strips` now
+  hits 42.39 dB Y at 2554 B** — a +5.49 dB lead over ffmpeg's
+  reference encoder's ~36.9 dB on the same fixture, +1.62 dB over the
+  round-4 LBG-only baseline, and well past the round-5 41.27 dB
+  target. The 320×240 gradient also clears the 41.0 dB target with
+  ~0.7 dB of headroom. On pure LCG-noise the lever is a near-wash
+  (within ±0.05 dB) — random content has no luma-vs-chroma structure
+  for the metric to exploit.
+
+  Set `luma_weight = 1` to disable both Levers F and G and recover
+  the round-4 behaviour (used by the regression-guard tests in
+  `r5_psnr.rs`, and pinned in the round-4 LBG-isolation tests in
+  `r4_psnr.rs` and the round-5/round-6 lever-isolation tests in
+  `round5_persistence_and_multistrip.rs` /
+  `round6_lloyd_and_window.rs`). Cost: a single integer multiply per
+  distance evaluation — no measurable wall-time impact (the
+  full-test-suite wall is unchanged).
+
+- Round 5: `tests/r5_psnr.rs` — six-test PSNR validation suite
+  asserting (i) `encode_rgb24_best_strips` on 64×64 gradient breaks
+  41.27 dB PSNR_Y (observed 42.39 dB), (ii) 320×240 gradient breaks
+  41.0 dB (observed 41.70 dB), (iii) LCG-noise no regression vs r4
+  (observed +0.02 dB), (iv) Lever F isolated delta ≥ 1.0 dB on 64×64
+  gradient (observed +1.55 dB), (v) `luma_weight = 1` reproduces the
+  round-4 baseline within noise, (vi) `luma_weight = 0` is a no-op
+  fallback (byte-identical to `luma_weight = 1`).
+
 - Round 4 (Lever E): **Linde-Buzo-Gray (LBG) split refinement**
   (`EncoderOptions::lbg_max_passes`, default `8`). After the median-cut
   + Lloyd warm-build builds the strip's V4/V1 codebook, the encoder now

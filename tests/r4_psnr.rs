@@ -126,6 +126,16 @@ fn encode_decode_measure(rgb: &[u8], w: u32, h: u32, opts: EncoderOptions) -> (V
     (bytes, psnr)
 }
 
+/// Round-4 baseline isolation: pin `luma_weight = 1` so the
+/// round-5 luma-weighted distance lever doesn't mix with the
+/// `lbg_max_passes` baseline these tests characterise.
+fn r4_isolated_opts(quality: u8) -> EncoderOptions {
+    EncoderOptions {
+        luma_weight: 1,
+        ..EncoderOptions::from_quality(quality)
+    }
+}
+
 /// **Lever E target — 64×64 gradient ≥ 38 dB PSNR_Y.**
 ///
 /// Uses the per-frame strip-count picker (Lever A, round 3) on top of
@@ -195,7 +205,9 @@ fn lever_e_noisy_64x64_improves_by_half_db() {
     let rgb = synth_noisy_64x64();
     let w = 64u32;
     let h = 64u32;
-    let base = EncoderOptions::from_quality(50);
+    // Pin `luma_weight = 1` so the round-5 luma-weighted distance lever
+    // doesn't compound with the r4 LBG delta being measured here.
+    let base = r4_isolated_opts(50);
 
     let (bytes_r3, psnr_r3) = encode_decode_measure(
         &rgb,
@@ -242,7 +254,9 @@ fn lever_e_64x64_gradient_lbg_delta() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
-    let base = EncoderOptions::from_quality(50);
+    // Pin `luma_weight = 1` so the round-5 luma-weighted distance lever
+    // doesn't compound with the r4 LBG delta being measured here.
+    let base = r4_isolated_opts(50);
 
     let (bytes_r3, psnr_r3) = encode_decode_measure(
         &rgb,
@@ -289,13 +303,16 @@ fn lbg_disabled_matches_round3_baseline() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
+    // Pin `luma_weight = 1` so the round-5 luma-weighted distance lever
+    // doesn't compound with the r4 LBG baseline being characterised here.
     let opts = EncoderOptions {
         lbg_max_passes: 0,
-        ..EncoderOptions::from_quality(50)
+        ..r4_isolated_opts(50)
     };
     let (bytes, psnr) = encode_decode_measure(&rgb, w, h, opts);
     eprintln!(
-        "lbg=0 (r3 baseline) on 64x64 gradient at q=50: psnr_y={:.3} dB ({} B)",
+        "lbg=0 (r3 baseline, luma_weight=1) on 64x64 gradient at q=50: \
+         psnr_y={:.3} dB ({} B)",
         psnr,
         bytes.len()
     );
@@ -303,8 +320,9 @@ fn lbg_disabled_matches_round3_baseline() {
         psnr >= 36.5,
         "lbg=0 should reproduce r3 baseline (>= 36.5 dB); got {psnr:.3}"
     );
-    // And LBG-enabled must strictly improve on it.
-    let opts = EncoderOptions::from_quality(50);
+    // And LBG-enabled (at the same luma_weight=1 pin) must strictly
+    // improve on it.
+    let opts = r4_isolated_opts(50);
     let (_, psnr_lbg) = encode_decode_measure(&rgb, w, h, opts);
     assert!(
         psnr_lbg > psnr,

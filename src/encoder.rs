@@ -203,6 +203,29 @@ pub struct EncoderOptions {
     ///
     /// Default `8` (within-noise of optimal on natural content).
     pub lbg_max_passes: u8,
+    /// Round 5 (Lever F): **luma-weighted distance metric** used for
+    /// codebook training (clustering / Lloyd reassignment / LBG split
+    /// refinement) and per-MB nearest-neighbour selection. Each Y-dim
+    /// (`Y0..Y3`) squared-error contribution is multiplied by
+    /// `luma_weight` before being summed with the chroma `U/V`
+    /// contributions. PSNR_Y measures only the luma channel, so weighting
+    /// luma above chroma pulls the trained codebook closer to the source
+    /// Y values at a modest fidelity cost on chroma. Also scales each
+    /// Y-dim extent by `luma_weight` in `median_cut`'s split-dimension
+    /// selection (Lever G — see below), so the initial bisection
+    /// prefers Y-axis cuts when Y and U/V extents are otherwise
+    /// comparable.
+    ///
+    /// `1` reproduces the round-4 isotropic distance (Y and U/V weighted
+    /// equally). Higher values bias more aggressively toward luma fidelity:
+    /// `2` is the round-5 default (modest +0.5..+1.0 dB PSNR_Y on smooth
+    /// gradients, small chroma-PSNR cost); `4` extracts another fraction
+    /// of a dB but starts to visibly desaturate chroma transitions on
+    /// natural content. `0` falls back to `1` internally (no luma weight).
+    ///
+    /// In `Gray8` mode the parameter is a no-op (there are no chroma
+    /// dims to weight against). Default `2`.
+    pub luma_weight: u8,
 }
 
 impl Default for EncoderOptions {
@@ -223,6 +246,9 @@ impl Default for EncoderOptions {
             // unbounded-passes optimum on smooth-gradient and
             // textured-noise fixtures alike.
             lbg_max_passes: 8,
+            // Round 5 default: luma-weighted distance with Y dims at 2×
+            // the weight of U/V dims during codebook training.
+            luma_weight: 2,
         }
     }
 }
@@ -288,6 +314,10 @@ impl EncoderOptions {
             // Within-noise of the unbounded-passes optimum on
             // smooth-gradient and textured-noise fixtures alike.
             lbg_max_passes: 8,
+            // Round 5 default (Lever F): luma weight 2 — Y squared-error
+            // contributions count twice as much as U/V in the distance
+            // metric used for clustering and nearest-neighbour selection.
+            luma_weight: 2,
         }
     }
 }
@@ -1632,7 +1662,7 @@ fn reclaim_stale_slots_v4(
             samples.extend_from_slice(&sample_v4_block(pixels, width as usize, px, py, mode));
         }
     }
-    reclaim_with_samples(&samples, mode, n, seed, &stale_slots)
+    reclaim_with_samples(&samples, mode, n, seed, &stale_slots, opts.luma_weight)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1674,7 +1704,7 @@ fn reclaim_stale_slots_v1(
             samples.push(sample_v1_block(pixels, width as usize, px, py, mode));
         }
     }
-    reclaim_with_samples(&samples, mode, n, seed, &stale_slots)
+    reclaim_with_samples(&samples, mode, n, seed, &stale_slots, opts.luma_weight)
 }
 
 /// Common reclamation kernel: given non-skip `samples`, the codebook
@@ -1689,6 +1719,7 @@ fn reclaim_with_samples(
     n: usize,
     seed: &mut Codebook,
     stale_slots: &[u8],
+    luma_weight: u8,
 ) -> Vec<u8> {
     if samples.is_empty() || n == 0 {
         return Vec::new();
@@ -1699,7 +1730,7 @@ fn reclaim_with_samples(
     // reclaimed slots don't end up with the same centroid).
     let mut scored: Vec<(i64, usize)> = (0..samples.len())
         .map(|i| {
-            let (_, d) = nearest(&samples[i], seed, n, mode);
+            let (_, d) = nearest(&samples[i], seed, n, mode, luma_weight);
             (d, i)
         })
         .collect();
@@ -1711,9 +1742,9 @@ fn reclaim_with_samples(
             break;
         }
         let candidate = &samples[idx];
-        let too_close = chosen_indices
-            .iter()
-            .any(|&j| entry_l1_distance(candidate, &samples[j], mode) < min_separation);
+        let too_close = chosen_indices.iter().any(|&j| {
+            entry_l1_distance(candidate, &samples[j], mode, luma_weight) < min_separation
+        });
         if !too_close {
             chosen_indices.push(idx);
         }
@@ -1831,6 +1862,7 @@ fn build_codebooks_and_decisions(
         v4_seed,
         opts.lloyd_max_iter,
         opts.lloyd_eps,
+        opts.luma_weight,
     );
     let mut v1_codebook = median_cut_seeded(
         &v1_vectors,
@@ -1839,6 +1871,7 @@ fn build_codebooks_and_decisions(
         v1_seed,
         opts.lloyd_max_iter,
         opts.lloyd_eps,
+        opts.luma_weight,
     );
     // Round 4 Lever E: LBG split refinement (Linde-Buzo-Gray 1980).
     // After the median-cut + Lloyd warm-build, iteratively split the
@@ -1852,6 +1885,7 @@ fn build_codebooks_and_decisions(
             opts.v4_entries as usize,
             mode,
             opts.lbg_max_passes,
+            opts.luma_weight,
         );
         lbg_refine_codebook(
             &mut v1_codebook,
@@ -1859,6 +1893,7 @@ fn build_codebooks_and_decisions(
             opts.v1_entries as usize,
             mode,
             opts.lbg_max_passes,
+            opts.luma_weight,
         );
     }
 
@@ -1878,8 +1913,19 @@ fn build_codebooks_and_decisions(
             mbs.push(Mb::Skip);
             continue;
         }
-        let (v4_idx, v4_err) = pick_v4(&mb_v4[i], &v4_codebook, opts.v4_entries as usize);
-        let (v1_idx, v1_err) = pick_v1(&mb_v1[i], &v1_codebook, opts.v1_entries as usize, mode);
+        let (v4_idx, v4_err) = pick_v4(
+            &mb_v4[i],
+            &v4_codebook,
+            opts.v4_entries as usize,
+            opts.luma_weight,
+        );
+        let (v1_idx, v1_err) = pick_v1(
+            &mb_v1[i],
+            &v1_codebook,
+            opts.v1_entries as usize,
+            mode,
+            opts.luma_weight,
+        );
         let pick_v1_flag = if let Some(lambda) = opts.rdo_lambda {
             // Compute pixel-domain Y SSE for both candidate
             // reconstructions, then apply the Lagrangian
@@ -2568,10 +2614,11 @@ fn median_cut_seeded(
     seed: Option<&Codebook>,
     max_iter: u8,
     eps: u32,
+    luma_weight: u8,
 ) -> Codebook {
     if max_iter == 0 {
         // Lloyd disabled — cold-start median-cut (ignores seed).
-        return median_cut(vectors, n, mode);
+        return median_cut(vectors, n, mode, luma_weight);
     }
     if let Some(prev) = seed {
         if !vectors.is_empty() && n > 0 {
@@ -2585,7 +2632,7 @@ fn median_cut_seeded(
             for _iter in 0..max_iter {
                 let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
                 for v in vectors {
-                    let (slot, _) = nearest(v, &cb, n, mode);
+                    let (slot, _) = nearest(v, &cb, n, mode, luma_weight);
                     clusters[slot as usize].push(*v);
                 }
                 let mut max_drift: u32 = 0;
@@ -2593,8 +2640,12 @@ fn median_cut_seeded(
                 for (i, c) in clusters.iter().enumerate().take(n) {
                     if !c.is_empty() {
                         let new_centroid = centroid(c, mode);
-                        max_drift =
-                            max_drift.max(entry_l1_distance(&cb.entries[i], &new_centroid, mode));
+                        max_drift = max_drift.max(entry_l1_distance(
+                            &cb.entries[i],
+                            &new_centroid,
+                            mode,
+                            luma_weight,
+                        ));
                         next_cb.entries[i] = new_centroid;
                     }
                     // else: keep cb.entries[i] verbatim (no drift
@@ -2613,16 +2664,29 @@ fn median_cut_seeded(
             return prev.clone();
         }
     }
-    median_cut(vectors, n, mode)
+    median_cut(vectors, n, mode, luma_weight)
 }
 
 /// L1 (Manhattan) distance between two codebook entries summed across
 /// all dims; used for Lloyd early-stop convergence detection.
-fn entry_l1_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode) -> u32 {
-    let mut d = (i32::from(a.y0) - i32::from(b.y0)).unsigned_abs()
-        + (i32::from(a.y1) - i32::from(b.y1)).unsigned_abs()
-        + (i32::from(a.y2) - i32::from(b.y2)).unsigned_abs()
-        + (i32::from(a.y3) - i32::from(b.y3)).unsigned_abs();
+///
+/// Round 5 (Lever F): Y-dim contributions are weighted by
+/// `luma_weight`. A `luma_weight` of `1` reproduces the round-4
+/// isotropic metric; the default `2` weighs Y dims twice as much as
+/// U/V dims. Treats `0` as `1`. In `Gray8` mode `luma_weight` is a
+/// no-op (no chroma dims to compare against).
+fn entry_l1_distance(
+    a: &CodebookEntry,
+    b: &CodebookEntry,
+    mode: PixelMode,
+    luma_weight: u8,
+) -> u32 {
+    let w = luma_weight.max(1) as u32;
+    let mut d = w
+        * ((i32::from(a.y0) - i32::from(b.y0)).unsigned_abs()
+            + (i32::from(a.y1) - i32::from(b.y1)).unsigned_abs()
+            + (i32::from(a.y2) - i32::from(b.y2)).unsigned_abs()
+            + (i32::from(a.y3) - i32::from(b.y3)).unsigned_abs());
     if let PixelMode::Yuv12 = mode {
         d += (i32::from(a.u) - i32::from(b.u)).unsigned_abs()
             + (i32::from(a.v) - i32::from(b.v)).unsigned_abs();
@@ -2660,6 +2724,7 @@ fn lbg_refine_codebook(
     n: usize,
     mode: PixelMode,
     max_passes: u8,
+    luma_weight: u8,
 ) {
     if max_passes == 0 || n <= 1 || vectors.is_empty() {
         return;
@@ -2674,7 +2739,7 @@ fn lbg_refine_codebook(
         let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
         let mut total_sse_before: i64 = 0;
         for v in vectors {
-            let (slot, err) = nearest(v, cb, n, mode);
+            let (slot, err) = nearest(v, cb, n, mode, luma_weight);
             clusters[slot as usize].push(*v);
             total_sse_before = total_sse_before.saturating_add(err);
         }
@@ -2686,7 +2751,8 @@ fn lbg_refine_codebook(
         for (i, c) in clusters.iter().enumerate().take(n) {
             let centre = cb.entries[i];
             for v in c {
-                per_slot_sse[i] = per_slot_sse[i].saturating_add(entry_distance(v, &centre, mode));
+                per_slot_sse[i] =
+                    per_slot_sse[i].saturating_add(entry_distance(v, &centre, mode, luma_weight));
             }
         }
         // Pick the highest-SSE slot with ≥ 2 members ("splitter") and
@@ -2770,7 +2836,7 @@ fn lbg_refine_codebook(
         let mut new_clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
         let mut total_sse_after: i64 = 0;
         for v in vectors {
-            let (slot, err) = nearest(v, cb, n, mode);
+            let (slot, err) = nearest(v, cb, n, mode, luma_weight);
             new_clusters[slot as usize].push(*v);
             total_sse_after = total_sse_after.saturating_add(err);
         }
@@ -2786,7 +2852,7 @@ fn lbg_refine_codebook(
         // nearest-neighbours for MB classification.
         let mut total_sse_final: i64 = 0;
         for v in vectors {
-            let (_slot, err) = nearest(v, &next_cb, n, mode);
+            let (_slot, err) = nearest(v, &next_cb, n, mode, luma_weight);
             total_sse_final = total_sse_final.saturating_add(err);
         }
         if total_sse_final < total_sse_before {
@@ -2823,7 +2889,17 @@ fn perturb_dim(e: &mut CodebookEntry, dim: usize, delta: i32) {
 /// dimension of greatest range, each cut producing two sub-clusters.
 /// Each leaf cluster contributes one codebook entry — the centroid of
 /// its members.
-fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode) -> Codebook {
+///
+/// Round 5 (Lever G — **luma-prioritized split**): when comparing the
+/// per-dim extents to pick a split dimension, each Y-dim extent
+/// (indices 0..=3) is multiplied by `luma_weight` before being compared
+/// against the U/V-dim extents (indices 4..=5). This biases the
+/// initial bisection toward Y-axis cuts when Y and U/V extents are
+/// otherwise comparable — under PSNR_Y, packing the codebook tightly
+/// in Y is more valuable than packing it tightly in U/V. `luma_weight
+/// = 1` reproduces the round-4 isotropic split. `luma_weight = 0` is
+/// treated as `1` (no-op).
+fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode, luma_weight: u8) -> Codebook {
     let mut cb = Codebook::default();
     if vectors.is_empty() || n == 0 {
         return cb;
@@ -2833,11 +2909,16 @@ fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode) -> Codebook 
         PixelMode::Yuv12 => 6,
         PixelMode::Gray8 => 4,
     };
+    let w = luma_weight.max(1) as i32;
     let mut clusters: Vec<Vec<CodebookEntry>> = vec![vectors.to_vec()];
     while clusters.len() < n {
-        // Find cluster with largest extent along any dimension.
+        // Find cluster with largest weighted extent along any dimension.
+        // Y-dims (0..=3) get a `luma_weight` multiplier; U/V-dims
+        // (4..=5) stay at weight 1. We compare on the weighted score
+        // but still split on the un-weighted dim values themselves —
+        // the weight only affects which dim wins.
         let mut best_idx = None;
-        let mut best_extent = 0i32;
+        let mut best_score: i32 = 0;
         let mut best_dim = 0;
         for (ci, c) in clusters.iter().enumerate() {
             if c.len() < 2 {
@@ -2846,8 +2927,9 @@ fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode) -> Codebook 
             for d in 0..dims {
                 let (lo, hi) = extent(c, d);
                 let ext = hi - lo;
-                if ext > best_extent {
-                    best_extent = ext;
+                let weighted = if d < 4 { ext.saturating_mul(w) } else { ext };
+                if weighted > best_score {
+                    best_score = weighted;
                     best_idx = Some(ci);
                     best_dim = d;
                 }
@@ -2856,7 +2938,7 @@ fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode) -> Codebook 
         let Some(idx) = best_idx else {
             break;
         };
-        if best_extent == 0 {
+        if best_score == 0 {
             break;
         }
         let mut cluster = std::mem::take(&mut clusters[idx]);
@@ -2933,12 +3015,18 @@ fn centroid(c: &[CodebookEntry], mode: PixelMode) -> CodebookEntry {
 // Per-MB nearest-neighbour selection
 // ---------------------------------------------------------------------------
 
-fn entry_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode) -> i64 {
+/// Squared distance between two codebook entries. Round 5 (Lever F):
+/// each Y-dim squared-error contribution is multiplied by
+/// `luma_weight`. `luma_weight = 1` reproduces the round-4 isotropic
+/// metric; `0` is treated as `1` (no luma weight). In `Gray8` mode
+/// `luma_weight` is a no-op (no chroma dims to compare against).
+fn entry_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode, luma_weight: u8) -> i64 {
+    let w = luma_weight.max(1) as i64;
     let dy0 = i64::from(a.y0) - i64::from(b.y0);
     let dy1 = i64::from(a.y1) - i64::from(b.y1);
     let dy2 = i64::from(a.y2) - i64::from(b.y2);
     let dy3 = i64::from(a.y3) - i64::from(b.y3);
-    let mut d = dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3;
+    let mut d = w * (dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3);
     if let PixelMode::Yuv12 = mode {
         let du = i64::from(a.u) - i64::from(b.u);
         let dv = i64::from(a.v) - i64::from(b.v);
@@ -2947,11 +3035,17 @@ fn entry_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode) -> i64 
     d
 }
 
-fn nearest(target: &CodebookEntry, cb: &Codebook, n: usize, mode: PixelMode) -> (u8, i64) {
+fn nearest(
+    target: &CodebookEntry,
+    cb: &Codebook,
+    n: usize,
+    mode: PixelMode,
+    luma_weight: u8,
+) -> (u8, i64) {
     let mut best_idx = 0u8;
     let mut best_err = i64::MAX;
     for i in 0..n.min(256) {
-        let d = entry_distance(target, &cb.entries[i], mode);
+        let d = entry_distance(target, &cb.entries[i], mode, luma_weight);
         if d < best_err {
             best_err = d;
             best_idx = i as u8;
@@ -2960,19 +3054,30 @@ fn nearest(target: &CodebookEntry, cb: &Codebook, n: usize, mode: PixelMode) -> 
     (best_idx, best_err)
 }
 
-fn pick_v4(target: &[CodebookEntry; 4], cb: &Codebook, n: usize) -> ([u8; 4], i64) {
+fn pick_v4(
+    target: &[CodebookEntry; 4],
+    cb: &Codebook,
+    n: usize,
+    luma_weight: u8,
+) -> ([u8; 4], i64) {
     let mut idx = [0u8; 4];
     let mut err = 0i64;
     for sub in 0..4 {
-        let (i, e) = nearest(&target[sub], cb, n, PixelMode::Yuv12);
+        let (i, e) = nearest(&target[sub], cb, n, PixelMode::Yuv12, luma_weight);
         idx[sub] = i;
         err += e;
     }
     (idx, err)
 }
 
-fn pick_v1(target: &CodebookEntry, cb: &Codebook, n: usize, mode: PixelMode) -> (u8, i64) {
-    nearest(target, cb, n, mode)
+fn pick_v1(
+    target: &CodebookEntry,
+    cb: &Codebook,
+    n: usize,
+    mode: PixelMode,
+    luma_weight: u8,
+) -> (u8, i64) {
+    nearest(target, cb, n, mode, luma_weight)
 }
 
 /// Round-3 (round-47) Lagrangian V1/V4 RDO helper: compute pixel-domain

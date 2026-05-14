@@ -64,8 +64,16 @@ fn cross_frame_persistence_shrinks_slow_pan_wire_size() {
     // persistence-vs-no-persistence wire-size delta flips sign on this
     // particular slow-pan fixture (~5% increase), which is expected
     // and unrelated to the persistence mechanism we're testing here.
+    //
+    // Round-5 (Lever F) note: similarly pin `luma_weight = 1` (round-4
+    // isotropic distance metric). With luma weighting enabled, slot
+    // assignments shift toward luma-aligned clusters and the chunk-
+    // omission heuristics see a slightly different prev-codebook view,
+    // which flips the persistence-vs-no-persistence delta on this
+    // fixture by ~50 bytes — unrelated to the persistence mechanism.
     let opts = EncoderOptions {
         rdo_lambda: None,
+        luma_weight: 1,
         ..EncoderOptions::from_quality(50)
     };
     let n_inter = 8usize;

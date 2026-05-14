@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -88,6 +88,24 @@ gradient (35.61 → 37.81 dB), and **+0.85 dB** on a pure-LCG-noise
 strip-picker the 64×64 gradient now reaches **40.77 dB Y at 2689 B**
 — a +3.87 dB lead over ffmpeg's reference encoder on the same
 fixture.
+Round 5 added **luma-weighted distance metric + luma-prioritized
+median-cut split** (`EncoderOptions::luma_weight`, default `2`) —
+two complementary luma-priority levers (Levers F + G) applied at the
+codebook-training layer. Each Y-dim squared-error contribution is
+multiplied by `luma_weight` in the distance metric (affects
+nearest-neighbour selection, Lloyd refinement, LBG split refinement),
+and Y-dim extents are multiplied by `luma_weight` in `median_cut`'s
+split-dimension selection (biases the initial bisection toward Y-axis
+cuts). Under PSNR_Y, packing the codebook tightly in Y is more
+valuable than packing it tightly in U/V. PSNR_Y lifts by
+**+1.55 dB** on the 64×64 gradient (`encode_rgb24`: 37.85 →
+39.39 dB) and **+1.62 dB** combined with the strip-picker
+(40.77 → 42.39 dB); the 320×240 gradient via strip-picker lifts by
+**+1.01 dB** (40.69 → 41.70 dB). On pure LCG-noise the lever is a
+near-wash (within ±0.05 dB) — random content has no luma-vs-chroma
+structure to exploit. The headline 64×64 gradient now sits at
+**42.39 dB Y at 2554 B** — a +5.49 dB lead over ffmpeg's reference
+encoder.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -115,7 +133,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -201,6 +219,22 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG):
   64×64 gradient now reaches **40.77 dB Y at 2689 B** vs ffmpeg's
   reference 36.9 dB on the same fixture (+3.87 dB lead). Set
   `lbg_max_passes = 0` to disable.
+- `EncoderOptions::luma_weight` (round 5, default `2`) — **luma-
+  weighted distance metric + luma-prioritized median-cut split**
+  (Levers F + G). Each Y-dim squared-error contribution is multiplied
+  by `luma_weight` in the distance metric used for clustering, Lloyd
+  refinement, LBG split refinement, and per-MB nearest-neighbour
+  selection; the same weight scales Y-dim extents in `median_cut`'s
+  split-dimension selection. Under PSNR_Y, packing the codebook
+  tightly in Y is more valuable than packing it tightly in U/V.
+  Lifts PSNR_Y by +1.55 dB on 64×64 gradient via `encode_rgb24`
+  (37.85 → 39.39 dB) and +1.62 dB / +1.01 dB combined with the
+  strip-picker on 64×64 / 320×240 gradient (40.77 → 42.39 dB /
+  40.69 → 41.70 dB). The 64×64 gradient now sits at **42.39 dB Y at
+  2554 B** — a +5.49 dB lead over ffmpeg's reference encoder. On
+  pure LCG-noise the lever is a near-wash (no luma-vs-chroma
+  structure to exploit). Set `luma_weight = 1` to recover the round-4
+  isotropic behaviour; `0` is a no-op fallback.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

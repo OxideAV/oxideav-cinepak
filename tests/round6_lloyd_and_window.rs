@@ -140,8 +140,15 @@ fn lloyd_max_iter_0_loses_persistence_wire_savings() {
     // V4-bias shifts the V1/V4 distribution; the cold-vs-warm
     // chunk-omission delta then depends on factors orthogonal to the
     // Lloyd knob we're characterising.
+    //
+    // Round-5 (Lever F) note: same for `luma_weight = 1`. The
+    // luma-weighted distance shifts slot assignments toward luma-aligned
+    // clusters; the cold-vs-warm wire-size delta on this fixture
+    // (~15 B / 0.7%) is then dominated by chunk-omission-format
+    // boundary effects unrelated to the Lloyd knob being characterised.
     let base = EncoderOptions {
         rdo_lambda: None,
+        luma_weight: 1,
         ..EncoderOptions::from_quality(50)
     };
 

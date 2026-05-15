@@ -8,6 +8,61 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 6 (Levers H + I): **post-classification Lloyd polish (PCL)**
+  + **two-axis RD grid picker** at the encoder layer.
+
+  - **Lever H (PCL)**: `EncoderOptions::pcl_max_iter`, default `2`.
+    After the round-3 Lagrangian RDO step routes each non-skip MB to
+    V4 or V1, each *used* codebook slot is re-trained from only the
+    actually-selected member vectors and the per-MB classification is
+    re-run. The LBG warm-build (round 4) minimised distortion across
+    all non-skip vectors, but the RDO step routes a fraction of them
+    to V1 (cheaper wire footprint) — so the LBG centroids aren't the
+    means of each slot's actual selected member set. PCL closes that
+    gap. Slot identity is preserved (unused slots stay byte-identical
+    to the LBG output) so cross-frame persistence and selective-update
+    / chunk-omission wins on inter strips are unaffected. 2 iterations
+    capture essentially the full gain (the first pass usually
+    re-classifies a few V1 MBs to V4 once V4 slots tighten; the second
+    is convergence cleanup). Cost per iteration: O(N · K) — one
+    nearest-neighbour sweep per non-skip MB times K = codebook size,
+    comparable to a single LBG pass.
+
+  - **Lever I (RD grid picker)**: `encode_rgb24_best_rd_grid` +
+    `encode_rgb24_round6` convenience wrapper. Trial-encodes every
+    `(strip_count, rdo_lambda)` from a user-supplied 2-axis
+    cross-product and returns the bitstream minimising
+    `R/N + opts.rdo_lambda · D/N` (the same Lagrangian cost as the
+    round-3 picker). The round-3 picker only varies `strip_count` and
+    reuses `opts.rdo_lambda` for the per-MB RDO of each trial, so it
+    can't exploit the V4-saturation regime — on the 64×64 gradient at
+    `q=50` with `strip_count=4`, the V4 codebook fills exactly (64
+    sub-blocks across 64 entries → exact V4 representation), and
+    lowering the per-MB lambda routes more MBs to V4 to harvest the
+    residual error. `encode_rgb24_round6` sweeps `[1, 2, 4]` ×
+    `[Some(0.0), Some(2.5), opts.rdo_lambda]` for ≤ 9 trial encodes
+    per frame.
+
+  Measured wins (self-encode + self-decode at q=50, PSNR_Y in BT.601 Y
+  units):
+
+  | fixture                                                | r5             | r6             | delta              |
+  | ------------------------------------------------------ | -------------- | -------------- | ------------------ |
+  | 64×64 gradient, `encode_rgb24_round6` headline         | 42.39 dB/2554B | 43.44 dB/2704B | +1.05 dB / +5.9% B |
+  | 64×64 gradient, `encode_rgb24` strip=1 + PCL only      | 36.55 dB/1066B | 38.19 dB/1132B | +1.64 dB / +6.2% B |
+  | 320×240 gradient, `encode_rgb24_best_strips` + PCL     | 41.70 dB/9288B | 43.16 dB/10170B| +1.46 dB / +9.5% B |
+  | 64×64 LCG-noise, `encode_rgb24_round6`                 | 23.00 dB       | 23.04 dB       | +0.04 dB           |
+
+  Headline: **the 64×64 gradient via `encode_rgb24_round6` now hits
+  43.44 dB Y at 2704 B** — a +6.55 dB lead over ffmpeg's reference
+  encoder's ~36.9 dB on the same fixture, +1.05 dB over the round-5
+  baseline, and past the round-6 ≥ 0.5 dB target. On pure LCG-noise
+  PCL is a near-wash (random content has no luma/spatial structure
+  for the post-classification re-training to recover). Set
+  `pcl_max_iter = 0` to disable the polish; both
+  `encode_rgb24_best_strips` (round-3 picker) and
+  `encode_rgb24_best_rd_grid` (round-6 picker) honour it.
+
 - Round 5 (Levers F + G): **luma-weighted distance metric** and
   **luma-prioritized median-cut split** (`EncoderOptions::luma_weight`,
   default `2`). Two complementary luma-priority levers applied at the

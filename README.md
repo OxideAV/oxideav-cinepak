@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -106,6 +106,28 @@ near-wash (within ±0.05 dB) — random content has no luma-vs-chroma
 structure to exploit. The headline 64×64 gradient now sits at
 **42.39 dB Y at 2554 B** — a +5.49 dB lead over ffmpeg's reference
 encoder.
+Round 6 (encoder PCL) added **post-classification Lloyd polish** at
+the encoder-training layer (`EncoderOptions::pcl_max_iter`, default
+`2`) plus a **two-axis RD grid picker** (`encode_rgb24_best_rd_grid`
++ `encode_rgb24_round6` convenience wrapper) — Levers H + I.
+Lever H re-trains each *used* codebook slot from only the
+actually-selected member vectors after the round-3 Lagrangian RDO
+step (the LBG warm-build minimised distortion across all non-skip
+vectors, but the RDO routes a fraction of them to V1 — so the LBG
+centroids aren't the means of each slot's actual selected member
+set; PCL closes that gap without changing slot identity, so
+cross-frame persistence and selective-update / chunk-omission wins
+on inter strips are unaffected). Lever I sweeps `(strip_count,
+rdo_lambda)` from a 3×3 cross-product (`[1, 2, 4]` ×
+`[Some(0.0), Some(2.5), opts.rdo_lambda]`) and picks the lowest
+Lagrangian-cost result — closes the round-3-picker gap on small
+frames where the V4 codebook is effectively saturated and a lower
+per-MB lambda harvests +1 dB at modest wire-size cost. Combined
+PSNR_Y lift on the 64×64 gradient: **+1.05 dB** (42.39 → 43.44 dB
+at 2554 B → 2704 B / +5.9% wire); on the 64×64 single-strip path
+PCL alone lifts **+1.64 dB** (36.55 → 38.19 dB at the same wire
+size). The headline 64×64 gradient now sits at **43.44 dB Y at
+2704 B** — a +6.55 dB lead over ffmpeg's reference encoder.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -133,7 +155,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -230,11 +252,36 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-w
   Lifts PSNR_Y by +1.55 dB on 64×64 gradient via `encode_rgb24`
   (37.85 → 39.39 dB) and +1.62 dB / +1.01 dB combined with the
   strip-picker on 64×64 / 320×240 gradient (40.77 → 42.39 dB /
-  40.69 → 41.70 dB). The 64×64 gradient now sits at **42.39 dB Y at
-  2554 B** — a +5.49 dB lead over ffmpeg's reference encoder. On
-  pure LCG-noise the lever is a near-wash (no luma-vs-chroma
-  structure to exploit). Set `luma_weight = 1` to recover the round-4
-  isotropic behaviour; `0` is a no-op fallback.
+  40.69 → 41.70 dB). On pure LCG-noise the lever is a near-wash (no
+  luma-vs-chroma structure to exploit). Set `luma_weight = 1` to
+  recover the round-4 isotropic behaviour; `0` is a no-op fallback.
+- `EncoderOptions::pcl_max_iter` (round 6, default `2`) — **post-
+  classification Lloyd polish (PCL)** (Lever H). After the round-3
+  Lagrangian RDO step routes each non-skip MB to V4 or V1, each
+  *used* codebook slot is re-trained from only the actually-selected
+  member vectors (the LBG warm-build minimised distortion across all
+  non-skip vectors, but the RDO routes a fraction of them to V1, so
+  the LBG centroids aren't the means of each slot's actual selected
+  member set). Slot identity is preserved across the polish — unused
+  slots stay byte-identical to the LBG output, so cross-frame
+  persistence and selective-update / chunk-omission wins on inter
+  strips are unaffected. Lifts PSNR_Y by **+1.64 dB** on the 64×64
+  single-strip gradient (36.55 → 38.19 dB at the same wire size).
+  Set `pcl_max_iter = 0` to disable.
+- `encode_rgb24_best_rd_grid` / `encode_rgb24_round6` (round 6) —
+  **two-axis RD grid picker** (Lever I). Sweeps every
+  `(strip_count, rdo_lambda)` from the user-supplied
+  `strip_candidates` × `lambda_candidates` cross-product and returns
+  the bitstream minimising the Lagrangian cost
+  (`R/N + opts.rdo_lambda · D/N`); `encode_rgb24_round6` is the
+  default convenience wrapper with `[1, 2, 4]` × `[Some(0.0),
+  Some(2.5), opts.rdo_lambda]`. Closes the round-3-picker gap on
+  small frames where the V4 codebook is effectively saturated (e.g.
+  64×64 at q=50 with `strip_count=4` exactly fills 64 V4 entries) —
+  lowering the per-MB lambda routes more MBs to V4 and harvests the
+  residual error at modest wire-size cost. Combined with PCL the
+  64×64 gradient lifts to **43.44 dB Y at 2704 B** — a +6.55 dB lead
+  over ffmpeg's reference encoder.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

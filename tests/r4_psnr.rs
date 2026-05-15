@@ -128,10 +128,14 @@ fn encode_decode_measure(rgb: &[u8], w: u32, h: u32, opts: EncoderOptions) -> (V
 
 /// Round-4 baseline isolation: pin `luma_weight = 1` so the
 /// round-5 luma-weighted distance lever doesn't mix with the
-/// `lbg_max_passes` baseline these tests characterise.
+/// `lbg_max_passes` baseline these tests characterise. Also pins
+/// `pcl_max_iter = 0` (round-6 Lever H), since the post-classification
+/// Lloyd polish does its own re-training of the LBG output and would
+/// otherwise eat most of the LBG-only delta this test isolates.
 fn r4_isolated_opts(quality: u8) -> EncoderOptions {
     EncoderOptions {
         luma_weight: 1,
+        pcl_max_iter: 0,
         ..EncoderOptions::from_quality(quality)
     }
 }

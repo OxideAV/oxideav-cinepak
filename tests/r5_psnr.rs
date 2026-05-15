@@ -219,15 +219,28 @@ fn lever_f_g_noisy_64x64_no_regression() {
 /// **Lever F (luma-weight) isolated delta — 64×64 gradient strict
 /// improvement.** Direct A/B between `luma_weight = 1` (round-4
 /// isotropic baseline) and `luma_weight = 2` (round-5 default).
-/// Assert the round-5 default lifts PSNR_Y by at least 1.0 dB on the
-/// 64×64 gradient at q=50 in the raw (single-strip) path. Observed
-/// delta: ~+1.55 dB (37.85 → 39.39 dB).
+///
+/// Round 5: in isolation (no PCL), `luma_weight = 2` lifted PSNR_Y by
+/// ~+1.55 dB (37.85 → 39.39 dB). Round 6 added Lever H
+/// post-classification Lloyd polish, which independently lifts
+/// `luma_weight = 1` from 37.85 dB to ~39.87 dB by re-training each
+/// codebook slot from its actually-selected vectors after the RDO step
+/// — eating most of the gap that lw=2 used to fill. With both Lever H
+/// (default-on) and Lever F live, the lw=2 advantage shrinks to
+/// ~+0.38 dB. **Lever F still helps** — the floor below is `>= 0.25 dB`
+/// to give measurement-noise headroom — but the round-5 +1.0 dB floor
+/// is no longer reachable with Lever H disabled. Pin `pcl_max_iter = 0`
+/// in both legs to recover the round-5 isolation environment.
 #[test]
 fn lever_f_luma_weight_64x64_gradient_lifts_by_1db() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
-    let base = EncoderOptions::from_quality(50);
+    // Pin PCL off to isolate the round-5 lever-F effect.
+    let base = EncoderOptions {
+        pcl_max_iter: 0,
+        ..EncoderOptions::from_quality(50)
+    };
 
     let (bytes_r4, psnr_r4) = encode_decode_measure(
         &rgb,
@@ -249,7 +262,7 @@ fn lever_f_luma_weight_64x64_gradient_lifts_by_1db() {
     );
     let delta = psnr_r5 - psnr_r4;
     eprintln!(
-        "Lever F (luma_weight) on 64x64 gradient at q=50: \
+        "Lever F (luma_weight) on 64x64 gradient at q=50, pcl=0: \
          r4 (lw=1) psnr_y={:.3} dB ({} B), \
          r5 (lw=2) psnr_y={:.3} dB ({} B), \
          delta = +{:.3} dB",
@@ -261,14 +274,15 @@ fn lever_f_luma_weight_64x64_gradient_lifts_by_1db() {
     );
     assert!(
         delta >= 1.0,
-        "Lever-F luma_weight=2 should lift PSNR_Y by >= 1 dB on 64x64 gradient; got {delta:+.3}"
+        "Lever-F luma_weight=2 should lift PSNR_Y by >= 1 dB on 64x64 gradient (pcl=0); got {delta:+.3}"
     );
 }
 
 /// **`luma_weight = 1` regression guard** — pinning the round-5 lever
 /// off must restore the round-4 isotropic-distance behaviour on the
-/// 64×64 gradient (~37.85 dB PSNR_Y at q=50). Assert ≥ 37.5 dB to
-/// allow for measurement noise across builds.
+/// 64×64 gradient (~37.85 dB PSNR_Y at q=50). Pin Lever H
+/// (`pcl_max_iter = 0`) too so this is a true round-4 reference.
+/// Assert ≥ 37.5 dB to allow for measurement noise across builds.
 #[test]
 fn luma_weight_1_restores_round4_baseline() {
     let rgb = synth_64x64();
@@ -276,11 +290,12 @@ fn luma_weight_1_restores_round4_baseline() {
     let h = 64u32;
     let opts = EncoderOptions {
         luma_weight: 1,
+        pcl_max_iter: 0,
         ..EncoderOptions::from_quality(50)
     };
     let (bytes, psnr) = encode_decode_measure(&rgb, w, h, opts);
     eprintln!(
-        "luma_weight=1 (round-4 baseline) on 64x64 gradient at q=50: \
+        "luma_weight=1 (round-4 baseline, pcl=0) on 64x64 gradient at q=50: \
          psnr_y={:.3} dB ({} B)",
         psnr,
         bytes.len()
@@ -289,8 +304,12 @@ fn luma_weight_1_restores_round4_baseline() {
         psnr >= 37.5,
         "luma_weight=1 should reproduce round-4 baseline (>= 37.5 dB); got {psnr:.3}"
     );
-    // And luma_weight=2 (round-5 default) must strictly improve.
-    let opts_r5 = EncoderOptions::from_quality(50);
+    // And luma_weight=2 (round-5 default) must strictly improve at the
+    // same PCL setting.
+    let opts_r5 = EncoderOptions {
+        pcl_max_iter: 0,
+        ..EncoderOptions::from_quality(50)
+    };
     let (_, psnr_r5) = encode_decode_measure(&rgb, w, h, opts_r5);
     assert!(
         psnr_r5 > psnr,

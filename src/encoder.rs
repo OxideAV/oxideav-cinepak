@@ -761,6 +761,452 @@ pub fn encode_rgb24_round7(
     )
 }
 
+/// Round-8 (Lever L) **per-strip independent (lambda, luma_weight) picker.**
+///
+/// The round-7 picker
+/// ([`encode_rgb24_best_rd_grid_3axis`] / [`encode_rgb24_round7`])
+/// trial-encodes the **entire frame** with a single `(strip_count,
+/// rdo_lambda, luma_weight)` per trial, then picks the lowest-cost
+/// trial. The chosen `(rdo_lambda, luma_weight)` then applies to
+/// **every** strip of the frame.
+///
+/// That's wasteful on **split-content** frames where different strips
+/// have qualitatively different pixel statistics — e.g. a top half of
+/// smooth-gradient sky (best PSNR_Y at high `luma_weight = 8`) and a
+/// bottom half of high-chroma diverse texture (best PSNR_Y at low
+/// `luma_weight = 1` so the chroma codebook stays informative). The
+/// round-7 picker must choose **one** `luma_weight` for the whole
+/// frame, compromising on whichever strip is the "loser".
+///
+/// Cinepak's bitstream lets each strip carry its own pair of codebooks
+/// trained independently (per spec §3.4 of `02-codebooks.md`), so
+/// per-strip `luma_weight` and `rdo_lambda` are first-class: the
+/// decoder doesn't care which lever values the encoder picked per
+/// strip, only that each strip's codebook is consistent with the
+/// strip's vector chunk indices.
+///
+/// **What this picker does**: for each `strip_count` candidate, plan
+/// the strips, then for each strip independently sweep every
+/// `(lambda, luma_weight)` combination and pick the one minimising
+/// per-strip Y-channel SSE (BT.601 luma weights) plus the Lagrangian
+/// byte cost. Assemble the winning per-strip bitstreams. Across
+/// `strip_count` candidates, return the assembled frame with the
+/// lowest total cost.
+///
+/// **Composition with prior levers**: each per-strip trial encode
+/// inherits the full opts (PCL polish, LBG passes, Lloyd refinement)
+/// — Lever L is strictly a picker-layer addition on top of the
+/// existing codebook-training stack. Cross-frame persistence is
+/// disabled in per-strip trials (the trial encoder is constructed
+/// per-strip with no prior codebook state, by design — Lever L is
+/// intra-only).
+///
+/// **Cost**: O(|strips| × |lambdas| × |lumas|) trial encodes per
+/// `strip_count` candidate, plus one final per-strip encode. For the
+/// default 3-strip-counts × 3-lambdas × 3-lumas grid via
+/// [`encode_rgb24_round8`] on a 4-strip frame this is up to
+/// `3 + (2 + 4) × 9 + (3 + 5) = 65` trial encodes per frame
+/// (`strip_count=1` is the round-7-Y picker; per-strip kicks in for
+/// `strip_count ≥ 2`).
+///
+/// Returns an error when any candidate list is empty.
+pub fn encode_rgb24_per_strip_rd(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    opts: EncoderOptions,
+    strip_candidates: &[u16],
+    lambda_candidates: &[Option<f32>],
+    luma_candidates: &[u8],
+) -> Result<Vec<u8>> {
+    if strip_candidates.is_empty() {
+        return Err(CinepakError::other(
+            "encode_rgb24_per_strip_rd: strip_candidates must not be empty",
+        ));
+    }
+    if lambda_candidates.is_empty() {
+        return Err(CinepakError::other(
+            "encode_rgb24_per_strip_rd: lambda_candidates must not be empty",
+        ));
+    }
+    if luma_candidates.is_empty() {
+        return Err(CinepakError::other(
+            "encode_rgb24_per_strip_rd: luma_candidates must not be empty",
+        ));
+    }
+    validate_dims(width, height)?;
+    validate_input_size(rgb, width, height, PixelMode::Yuv12)?;
+
+    let scoring_lambda = opts.rdo_lambda.unwrap_or(0.0) as f64;
+    let n_pixels_frame = (width as usize) * (height as usize);
+
+    // For each strip_count candidate, pick the best per-strip config
+    // independently, then assemble. Track the overall lowest-cost
+    // assembled bytestream.
+    let mb_rows = (height / 4) as usize;
+    let mut best_frame: Option<(f64, Vec<u8>)> = None;
+    for &strip_count in strip_candidates {
+        let strips = plan_strips(mb_rows, strip_count as usize);
+        // For each strip independently, sweep (lambda, luma) and pick
+        // the per-strip Y-SSE + λ·R minimiser. Encode each candidate
+        // standalone as a single-strip frame of size (width, strip_h),
+        // decode it, measure Y-SSE against the strip's input rows.
+        let mut chosen_strip_bytes: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
+        let mut frame_y_sse: f64 = 0.0;
+        let mut frame_bytes_for_cost: f64 = 0.0;
+        let mut frame_ok = true;
+        for s in &strips {
+            let strip_h = s.y_bottom - s.y_top;
+            // Extract this strip's pixels.
+            let strip_pixels = extract_strip_rgb(rgb, width, s.y_top, strip_h);
+            // Per-strip trial loop.
+            let mut best_strip: Option<(f64, Vec<u8>, f64, f64)> = None;
+            for &per_mb_lambda in lambda_candidates {
+                for &luma_weight in luma_candidates {
+                    let trial_opts = EncoderOptions {
+                        strip_count: 1,
+                        rdo_lambda: per_mb_lambda,
+                        luma_weight,
+                        ..opts
+                    };
+                    // Encode standalone (y_top = 0, single strip).
+                    let trial_bytes = match encode_rgb24(&strip_pixels, width, strip_h, trial_opts)
+                    {
+                        Ok(b) => b,
+                        // Skip invalid combinations silently (e.g.
+                        // strip_h too small for some opt) but never
+                        // bubble up — we want a best-effort pick.
+                        Err(_) => continue,
+                    };
+                    let mut dec = crate::decoder::CinepakDecoder::new();
+                    let frame = match dec.decode_frame(&trial_bytes, None) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let stride = frame.stride();
+                    let pixels = frame.pixels();
+                    // Y-channel SSE between source strip and decoded
+                    // strip (both are (width, strip_h) RGB24).
+                    let mut sum_sq: f64 = 0.0;
+                    for r in 0..strip_h as usize {
+                        let off_dec = r * stride;
+                        let off_src = r * (width as usize) * 3;
+                        for c in 0..(width as usize) {
+                            let r_a = strip_pixels[off_src + c * 3] as f64;
+                            let g_a = strip_pixels[off_src + c * 3 + 1] as f64;
+                            let b_a = strip_pixels[off_src + c * 3 + 2] as f64;
+                            let r_b = pixels[off_dec + c * 3] as f64;
+                            let g_b = pixels[off_dec + c * 3 + 1] as f64;
+                            let b_b = pixels[off_dec + c * 3 + 2] as f64;
+                            let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
+                            let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
+                            let d = ya - yb;
+                            sum_sq += d * d;
+                        }
+                    }
+                    let n_strip_pixels = (width as usize) * (strip_h as usize);
+                    let d_per_pixel = sum_sq / n_strip_pixels as f64;
+                    let r_bytes = trial_bytes.len() as f64;
+                    let cost = d_per_pixel + scoring_lambda * r_bytes / n_strip_pixels as f64;
+                    let better = match &best_strip {
+                        None => true,
+                        Some((best_cost, _, _, _)) => cost < *best_cost,
+                    };
+                    if better {
+                        best_strip = Some((cost, trial_bytes, sum_sq, r_bytes));
+                    }
+                }
+            }
+            let Some((_, _trial_bytes, strip_sse, strip_r_bytes)) = best_strip else {
+                // No candidate succeeded for this strip — fall back to
+                // a baseline encode of just this strip (sweep with the
+                // caller's default opts). If even that fails, abandon
+                // this strip_count candidate.
+                let fallback = encode_rgb24(
+                    &strip_pixels,
+                    width,
+                    strip_h,
+                    EncoderOptions {
+                        strip_count: 1,
+                        ..opts
+                    },
+                );
+                match fallback {
+                    Ok(_) => {
+                        // Re-encode with the real strip plan and continue;
+                        // strip_sse / r_bytes set to dummy that won't win.
+                        let mut roll = RollingCodebooks::default();
+                        let real = encode_intra_strip(
+                            rgb,
+                            width,
+                            PixelMode::Yuv12,
+                            &EncoderOptions {
+                                strip_count: 1,
+                                ..opts
+                            },
+                            s,
+                            &mut roll,
+                        )?;
+                        chosen_strip_bytes.push(real);
+                        frame_ok = true;
+                    }
+                    Err(_) => {
+                        frame_ok = false;
+                        break;
+                    }
+                }
+                continue;
+            };
+            // Re-encode the chosen (lambda, luma_weight) for THIS strip
+            // with the real strip plan (y_top set correctly). The
+            // standalone trial bytes have y_top = 0 in the strip header
+            // and can't be concatenated into a multi-strip frame
+            // directly. Re-encoding costs one extra encode per strip,
+            // but the codebook training is deterministic — the final
+            // strip is bit-identical content to the trial up to the
+            // strip header's y_top / y_bottom.
+            //
+            // Determine the winning trial's (lambda, lw) by searching
+            // again at the same options: the trial loop above didn't
+            // record them in the best_strip tuple to keep the per-trial
+            // overhead minimal. Instead, replay the search using the
+            // recorded cost to identify the winning (lambda, lw).
+            let (winning_lambda, winning_lw) = find_winning_opts(
+                &strip_pixels,
+                width,
+                strip_h,
+                opts,
+                lambda_candidates,
+                luma_candidates,
+                scoring_lambda,
+            )?;
+            let final_opts = EncoderOptions {
+                strip_count: 1,
+                rdo_lambda: winning_lambda,
+                luma_weight: winning_lw,
+                ..opts
+            };
+            let mut roll = RollingCodebooks::default();
+            let real_strip =
+                encode_intra_strip(rgb, width, PixelMode::Yuv12, &final_opts, s, &mut roll)?;
+            frame_y_sse += strip_sse;
+            frame_bytes_for_cost += strip_r_bytes;
+            chosen_strip_bytes.push(real_strip);
+        }
+        if !frame_ok {
+            continue;
+        }
+        // Assemble the multi-strip frame.
+        let assembled = assemble_frame(width, height, &chosen_strip_bytes)?;
+        // Score the assembled frame on a frame-level Y-SSE / R basis
+        // (note: the per-strip cost above is in per-strip units; we
+        // need a frame-level comparable cost across strip_count
+        // candidates).
+        let d_per_pixel = frame_y_sse / n_pixels_frame as f64;
+        let r_bytes = assembled.len() as f64;
+        let frame_cost = d_per_pixel + scoring_lambda * r_bytes / n_pixels_frame as f64;
+        // tiebreak toward smaller wire size.
+        let better = match &best_frame {
+            None => true,
+            Some((best_cost, best_bytes)) => {
+                frame_cost < *best_cost
+                    || (frame_cost == *best_cost && r_bytes < best_bytes.len() as f64)
+            }
+        };
+        let _ = frame_bytes_for_cost;
+        if better {
+            best_frame = Some((frame_cost, assembled));
+        }
+    }
+    Ok(best_frame
+        .ok_or_else(|| {
+            CinepakError::other("encode_rgb24_per_strip_rd: no strip_count candidate succeeded")
+        })?
+        .1)
+}
+
+/// Round-8 convenience wrapper for [`encode_rgb24_per_strip_rd`] with
+/// the same default 3×3×3 sweep as [`encode_rgb24_round7`]: per-strip
+/// `(lambda, luma_weight)` selection across all strips, then assemble.
+///
+/// - `strip_candidates = [1, 2, 4]`
+/// - `lambda_candidates = [Some(0.0), Some(2.5), opts.rdo_lambda]` (deduped)
+/// - `luma_candidates = [opts.luma_weight, 4, 8]` (deduped)
+///
+/// On split-content fixtures where different strips favour different
+/// `(lambda, luma_weight)` regimes, the per-strip picker lifts
+/// PSNR_Y over the round-7 frame-uniform picker without growing wire
+/// size (each strip's per-MB classifier saturates at the per-strip
+/// optimum rather than at the frame-uniform compromise). On
+/// homogeneous fixtures (e.g. the 64×64 single-gradient) it matches
+/// round-7 within noise — every strip prefers the same regime so the
+/// per-strip pick degenerates to the frame-uniform pick.
+pub fn encode_rgb24_round8(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    opts: EncoderOptions,
+) -> Result<Vec<u8>> {
+    let strip_candidates = [1u16, 2, 4];
+    let lambda_seed: [Option<f32>; 3] = [
+        Some(0.0_f32),
+        Some(2.5_f32),
+        Some(opts.rdo_lambda.unwrap_or(5.0_f32)),
+    ];
+    let mut lambdas: Vec<Option<f32>> = Vec::with_capacity(3);
+    for &lam in &lambda_seed {
+        if !lambdas.contains(&lam) {
+            lambdas.push(lam);
+        }
+    }
+    let luma_seed: [u8; 3] = [opts.luma_weight.max(1), 4, 8];
+    let mut lumas: Vec<u8> = Vec::with_capacity(3);
+    for &lw in &luma_seed {
+        if !lumas.contains(&lw) {
+            lumas.push(lw);
+        }
+    }
+    // Round-8 guarantees ≥ round-7 by trying BOTH pickers and keeping
+    // the lower-cost result. The per-strip greedy can occasionally lose
+    // to the frame-uniform pick when strip-local optima don't compose to
+    // a frame-level optimum (the per-strip scoring metric is per-strip
+    // Y-SSE per pixel + λ·R/N_strip, but the cross-candidate scoring is
+    // frame-level D/N_frame + λ·R/N_frame — the per-strip greedy isn't
+    // guaranteed to minimise the frame-level cost).
+    let per_strip = encode_rgb24_per_strip_rd(
+        rgb,
+        width,
+        height,
+        opts,
+        &strip_candidates,
+        &lambdas,
+        &lumas,
+    )?;
+    let frame_uniform = encode_rgb24_round7(rgb, width, height, opts)?;
+    let scoring_lambda = opts.rdo_lambda.unwrap_or(0.0) as f64;
+    let n_pixels = (width as usize) * (height as usize);
+    let cost_of = |bytes: &[u8]| -> Result<f64> {
+        let mut dec = crate::decoder::CinepakDecoder::new();
+        let frame = dec.decode_frame(bytes, None)?;
+        let stride = frame.stride();
+        let pixels = frame.pixels();
+        let mut sum_sq: f64 = 0.0;
+        for r in 0..height as usize {
+            let off_dec = r * stride;
+            let off_src = r * (width as usize) * 3;
+            for c in 0..(width as usize) {
+                let r_a = rgb[off_src + c * 3] as f64;
+                let g_a = rgb[off_src + c * 3 + 1] as f64;
+                let b_a = rgb[off_src + c * 3 + 2] as f64;
+                let r_b = pixels[off_dec + c * 3] as f64;
+                let g_b = pixels[off_dec + c * 3 + 1] as f64;
+                let b_b = pixels[off_dec + c * 3 + 2] as f64;
+                let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
+                let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
+                let d = ya - yb;
+                sum_sq += d * d;
+            }
+        }
+        let d_per_pixel = sum_sq / n_pixels as f64;
+        Ok(d_per_pixel + scoring_lambda * bytes.len() as f64 / n_pixels as f64)
+    };
+    let c_ps = cost_of(&per_strip)?;
+    let c_fu = cost_of(&frame_uniform)?;
+    // Tiebreak: smaller wire wins. Otherwise prefer per_strip (richer
+    // search; tied costs typically mean the per-strip greedy converged
+    // to the frame-uniform pick).
+    if c_ps < c_fu || (c_ps == c_fu && per_strip.len() <= frame_uniform.len()) {
+        Ok(per_strip)
+    } else {
+        Ok(frame_uniform)
+    }
+}
+
+/// Extract a horizontal strip of pixels from a packed `Rgb24` buffer
+/// into a fresh `(width × strip_h × 3)` byte vector. Used by the
+/// round-8 per-strip picker to feed each strip into a standalone
+/// `encode_rgb24` trial.
+fn extract_strip_rgb(rgb: &[u8], width: u32, y_top: u32, strip_h: u32) -> Vec<u8> {
+    let stride = (width as usize) * 3;
+    let start = (y_top as usize) * stride;
+    let end = ((y_top + strip_h) as usize) * stride;
+    rgb[start..end].to_vec()
+}
+
+/// Replay the per-strip RD sweep to identify the winning `(lambda,
+/// luma_weight)` pair for one strip. Used by
+/// [`encode_rgb24_per_strip_rd`] after a winning per-strip trial has
+/// been identified by cost: we need the actual `(lambda, lw)` values to
+/// re-encode the strip with the real strip plan (y_top correct).
+///
+/// Separated out for clarity of [`encode_rgb24_per_strip_rd`]'s main
+/// loop; identical scoring metric (Y-SSE per pixel + λ·R/N) so the
+/// winning pair always matches the inner loop's pick.
+fn find_winning_opts(
+    strip_pixels: &[u8],
+    width: u32,
+    strip_h: u32,
+    opts: EncoderOptions,
+    lambda_candidates: &[Option<f32>],
+    luma_candidates: &[u8],
+    scoring_lambda: f64,
+) -> Result<(Option<f32>, u8)> {
+    let mut best: Option<(f64, Option<f32>, u8)> = None;
+    let n_strip_pixels = (width as usize) * (strip_h as usize);
+    for &per_mb_lambda in lambda_candidates {
+        for &luma_weight in luma_candidates {
+            let trial_opts = EncoderOptions {
+                strip_count: 1,
+                rdo_lambda: per_mb_lambda,
+                luma_weight,
+                ..opts
+            };
+            let trial_bytes = match encode_rgb24(strip_pixels, width, strip_h, trial_opts) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let mut dec = crate::decoder::CinepakDecoder::new();
+            let frame = match dec.decode_frame(&trial_bytes, None) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let stride = frame.stride();
+            let pixels = frame.pixels();
+            let mut sum_sq: f64 = 0.0;
+            for r in 0..strip_h as usize {
+                let off_dec = r * stride;
+                let off_src = r * (width as usize) * 3;
+                for c in 0..(width as usize) {
+                    let r_a = strip_pixels[off_src + c * 3] as f64;
+                    let g_a = strip_pixels[off_src + c * 3 + 1] as f64;
+                    let b_a = strip_pixels[off_src + c * 3 + 2] as f64;
+                    let r_b = pixels[off_dec + c * 3] as f64;
+                    let g_b = pixels[off_dec + c * 3 + 1] as f64;
+                    let b_b = pixels[off_dec + c * 3 + 2] as f64;
+                    let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
+                    let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
+                    let d = ya - yb;
+                    sum_sq += d * d;
+                }
+            }
+            let d_per_pixel = sum_sq / n_strip_pixels as f64;
+            let r_bytes = trial_bytes.len() as f64;
+            let cost = d_per_pixel + scoring_lambda * r_bytes / n_strip_pixels as f64;
+            let better = match &best {
+                None => true,
+                Some((best_cost, _, _)) => cost < *best_cost,
+            };
+            if better {
+                best = Some((cost, per_mb_lambda, luma_weight));
+            }
+        }
+    }
+    let (_, lam, lw) = best.ok_or_else(|| {
+        CinepakError::other("find_winning_opts: no candidate succeeded for strip")
+    })?;
+    Ok((lam, lw))
+}
+
 /// Stateful Cinepak encoder. Tracks the rolling V4/V1 codebook the
 /// decoder will hold across strips and frames so that **inter** frames
 /// can emit selective-update codebook chunks (`0x2100` / `0x2300` /

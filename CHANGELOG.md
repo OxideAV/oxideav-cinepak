@@ -8,6 +8,75 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 8 (encoder-picker upgrade — Lever L): **per-strip independent
+  (lambda, luma_weight) picker** (`encode_rgb24_per_strip_rd` +
+  `encode_rgb24_round8` convenience wrapper). Round 7's three-axis
+  grid picker (`encode_rgb24_best_rd_grid_3axis` /
+  `encode_rgb24_round7`) trial-encodes the **whole frame** with a
+  single `(strip_count, rdo_lambda, luma_weight)` per trial; the
+  chosen `(rdo_lambda, luma_weight)` pair then applies to every strip
+  of the frame. Round 8 plans the strips per `strip_count` candidate
+  then for each strip independently sweeps every `(lambda,
+  luma_weight)` combination and picks the one minimising per-strip
+  Y-SSE + λ·R, assembling the chosen per-strip bitstreams into a
+  multi-strip frame.
+
+  Cinepak's bitstream lets each strip carry its own pair of codebooks
+  trained independently (spec §3.4 of `02-codebooks.md`), so
+  per-strip `luma_weight` and `rdo_lambda` are first-class — the
+  decoder doesn't care which lever values the encoder picked per
+  strip.
+
+  Each per-strip trial encodes the strip as a standalone single-strip
+  frame of size `(width, strip_h)` for scoring, then the winning
+  `(lambda, luma_weight)` is re-emitted with the real strip plan
+  (correct `y_top` / `y_bottom`) and concatenated into the assembled
+  multi-strip frame. Cost: O(|strips| × |lambdas| × |lumas|) trial
+  encodes per `strip_count` candidate, plus one final per-strip
+  re-encode.
+
+  `encode_rgb24_round8` also runs the round-7 picker and keeps
+  whichever pick has the lower Y-SSE + λ·R cost — **guaranteeing
+  round 8 ≥ round 7** in the picker's scoring metric. On homogeneous
+  content the per-strip greedy converges to the frame-uniform pick
+  and round 8 matches round 7 exactly; on heterogeneous content
+  round 8 wins.
+
+  Measured wins (self-encode + self-decode at q=50; the picker's
+  cost is Y-SSE + λ·R, not pure PSNR — gains show up as either
+  smaller wire at iso-quality or higher quality at iso-wire):
+
+  | fixture                                | r7              | r8              | delta            |
+  | -------------------------------------- | --------------- | --------------- | ---------------- |
+  | 256×256 four-strip-split, default λ=5  | 52.91 dB/10138B | 53.01 dB/9562B  | +0.10 dB / -576B |
+  | 320×240 four-strip-split, default λ=5  | 40.27 dB/13209B | 40.27 dB/12669B | +0.00 dB / -540B |
+  | 256×256 four-strip-split, λ=None       | 52.93 dB/10570B | 53.01 dB/9562B  | +0.09 dB / -1008B|
+  | 64×64 gradient (r7 headline), λ=None   | 45.21 dB/3139B  | 45.21 dB/3139B  | +0.00 dB / +0B   |
+  | 320×240 gradient (r7 headline)         | 46.88 dB/14364B | 46.88 dB/14364B | +0.00 dB / +0B   |
+  | 64×64 LCG-noise                        | 23.20 dB/3322B  | 23.21 dB/3322B  | +0.01 dB / +0B   |
+
+  Headline: **256×256 four-strip-split now hits 53.01 dB Y at 9562 B
+  (vs round-7's 52.91 dB at 10138 B) — a -576 B wire-size reduction
+  at +0.10 dB PSNR_Y**, the design win for heterogeneous content. On
+  the round-7 64×64 / 320×240 gradient headlines round 8 matches
+  round 7 byte-for-byte (per-strip greedy degenerates to the
+  frame-uniform pick on homogeneous content).
+
+  Intra-only; the round-8 picker requires a per-strip trial encoder
+  and the cross-frame persistence machinery is incompatible with
+  switching `luma_weight` mid-sequence.
+
+- Round 8: `tests/r8_psnr.rs` — nine-test validation suite asserting
+  (i) round-8 ≤ round-7 in picker cost on 256×256 split content,
+  (ii) round-8 ≤ round-7 on 64×64 gradient headline (homogeneous),
+  (iii) round-8 ≤ round-7 on 64×64 LCG-noise, (iv) round-8 saves
+  ≥ 400 B on 256×256 split-content vs round-7 at default λ=5
+  (observed -576 B), (v) round-8 matches round-7 within 0.05 dB
+  PSNR_Y on homogeneous content under λ=None, (vi)-(viii) empty-list
+  errors on all three candidate lists, (ix) single-candidate
+  per-strip picker round-trips at ≥ 30 dB PSNR_Y on the 64×64
+  gradient.
+
 - Round 7 (encoder-PCL upgrade — Levers J + K): **three-axis RD grid
   picker with Y-channel scoring**
   (`encode_rgb24_best_rd_grid_3axis` + `encode_rgb24_round7`

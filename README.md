@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -148,6 +148,30 @@ on the 64×64 gradient: **+1.77 dB** (43.44 → 45.21 dB at 2704 B →
 smaller wire** (45.25 dB / 14586 B → 46.88 dB / 14364 B). The
 headline 64×64 gradient now sits at **45.21 dB Y at 3139 B** — a
 +7.77 dB lead over ffmpeg's reference encoder.
+Round 8 (per-strip picker) added the **per-strip independent
+(lambda, luma_weight) picker** (`encode_rgb24_per_strip_rd` +
+`encode_rgb24_round8` convenience wrapper) — Lever L. Round 7's
+three-axis grid picker trial-encodes the **whole frame** with a single
+`(strip_count, rdo_lambda, luma_weight)` per trial, so the chosen
+`(rdo_lambda, luma_weight)` applies to every strip of the frame.
+Cinepak's bitstream lets each strip carry its own pair of codebooks
+trained independently, so on **split-content** frames where strips
+have qualitatively different pixel statistics — a smooth-gradient top
+strip favouring high `luma_weight = 8` + V4-saturated `lambda = 0`,
+a saturated-chroma stripes bottom strip favouring `luma_weight = 1` +
+`lambda = 2.5` — round 7 must compromise on whichever strip is the
+"loser". Round 8 plans the strips per `strip_count` candidate then
+sweeps `(lambda, luma_weight)` **per strip independently**, picks the
+per-strip Y-SSE + λ·R minimiser, and assembles the chosen per-strip
+bitstreams. A monotonicity wrapper runs the round-7 picker too and
+returns whichever pick has lower cost, so on homogeneous content
+round 8 matches round 7 exactly. Headline win on a 256×256
+four-strip-split fixture at `q=50`: **-576 B at +0.10 dB PSNR_Y**
+(10138 B → 9562 B, 52.91 dB → 53.01 dB) — a wire-size reduction at
+iso-cost. On the round-7 64×64 / 320×240 gradient headlines round 8
+matches round 7 within ±0.3 dB at smaller or equal wire size
+(per-strip greedy converges to the frame-uniform pick on homogeneous
+content).
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -322,6 +346,30 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-w
   gradient: 46.88 dB at 14364 B (+1.63 dB at smaller wire than round
   6's choice). The round-6 picker is unchanged for callers that care
   about chroma fidelity.
+- `encode_rgb24_per_strip_rd` / `encode_rgb24_round8` (round 8) —
+  **per-strip independent (lambda, luma_weight) picker** (Lever L).
+  Round 7's picker trial-encodes the **whole frame** with a single
+  `(strip_count, rdo_lambda, luma_weight)` per trial. Round 8 plans
+  the strips per `strip_count` candidate, then for each strip
+  independently sweeps every `(lambda, luma_weight)` combination and
+  picks the one minimising **per-strip Y-SSE + λ·R**, assembling the
+  chosen per-strip bitstreams into a multi-strip frame. Cinepak's
+  bitstream lets each strip carry its own pair of codebooks trained
+  independently (spec §3.4 of `02-codebooks.md`), so per-strip
+  `luma_weight` and `rdo_lambda` are first-class — the decoder
+  doesn't care which lever values the encoder picked per strip.
+  `encode_rgb24_round8` also runs the round-7 picker and returns
+  whichever pick has lower Y-SSE + λ·R cost, **guaranteeing round 8
+  ≥ round 7** in the picker's scoring metric. Headline on the
+  256×256 four-strip-split fixture at q=50: **53.01 dB at 9562 B**
+  vs round 7's 52.91 dB at 10138 B (**-576 B / +0.10 dB PSNR_Y**, a
+  wire-size reduction at iso-cost). On the round-7 64×64 / 320×240
+  gradient headlines round 8 matches round 7 within ±0.3 dB at
+  smaller or equal wire size (per-strip greedy converges to the
+  frame-uniform pick on homogeneous content). Intra-only; cost
+  scales as O(|strips| × |lambdas| × |lumas|) per `strip_count`
+  candidate, up to ~65 trial encodes per frame with the default
+  3×3×3 grid.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

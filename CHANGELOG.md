@@ -8,6 +8,69 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7 (encoder-PCL upgrade — Levers J + K): **three-axis RD grid
+  picker with Y-channel scoring**
+  (`encode_rgb24_best_rd_grid_3axis` + `encode_rgb24_round7`
+  convenience wrapper). Two complementary picker-layer levers on top of
+  round 6.
+
+  - **Lever J (`luma_weight` axis)**: the round-6
+    `encode_rgb24_best_rd_grid` picker only varies `(strip_count,
+    rdo_lambda)` and freezes `luma_weight` at `opts.luma_weight`
+    (default `2`). Different fixtures favour different `luma_weight`
+    values: the 64×64 gradient at `q=50` likes `luma_weight = 4`
+    (+1.14 dB PSNR_Y over `lw=2`), the 320×240 gradient likes
+    `luma_weight = 16` at the same wire footprint. The third axis lets
+    the picker pivot per-content per-frame instead of requiring the
+    caller to guess.
+
+  - **Lever K (Y-channel scoring distortion)**: round 6's picker scores
+    by RGB SSE per pixel-channel, but the project's headline quality
+    metric is PSNR_Y (BT.601 Y-channel MSE). Higher `luma_weight`
+    improves Y at the cost of chroma — RGB-SSE scoring actively
+    penalises the `luma_weight` values that boost PSNR_Y the most,
+    defeating Lever J. Y-channel scoring aligns the picker's
+    optimisation target with the headline metric. (RGB-scoring pickers
+    `encode_rgb24_best_strips` / `encode_rgb24_best_rd_grid` are
+    unchanged for callers that care about chroma fidelity.)
+
+  Convenience wrapper `encode_rgb24_round7(opts)` sweeps
+  `[1, 2, 4]` × `[Some(0.0), Some(2.5), opts.rdo_lambda]` ×
+  `[opts.luma_weight, 4, 8]` (deduped) for ≤ 27 trial encodes per
+  frame.
+
+  Measured wins (self-encode + self-decode at q=50, PSNR_Y in BT.601 Y
+  units):
+
+  | fixture                                                | r6             | r7             | delta              |
+  | ------------------------------------------------------ | -------------- | -------------- | ------------------ |
+  | 64×64 gradient, `encode_rgb24_round7` headline         | 43.44 dB/2704B | 45.21 dB/3139B | +1.77 dB / +16% B  |
+  | 320×240 gradient, `encode_rgb24_round7`                | 45.25 dB/14586B| 46.88 dB/14364B| +1.63 dB / -1.5% B |
+  | 64×64 LCG-noise, `encode_rgb24_round7`                 | 23.04 dB       | 23.20 dB       | +0.16 dB           |
+
+  Headline: **the 64×64 gradient via `encode_rgb24_round7` now hits
+  45.21 dB Y at 3139 B** — a +7.77 dB lead over ffmpeg's reference
+  encoder's ~36.9 dB on the same fixture, +1.77 dB over the round-6
+  baseline, and well past the round-7 ≥ 0.5 dB target. On LCG noise
+  the lever is a near-wash (random content has no luma-vs-chroma
+  structure for the picker to exploit). Both
+  `encode_rgb24_best_rd_grid_3axis` and `encode_rgb24_round7` honour
+  the existing per-MB knobs (`pcl_max_iter`, `lbg_max_passes`,
+  `rdo_lambda` baseline, etc.); the picker only varies the three axes
+  declared in the trial grid.
+
+- Round 7: `tests/r7_psnr.rs` — seven-test PSNR validation suite
+  asserting (i) `encode_rgb24_round7` on 64×64 gradient breaks
+  43.94 dB PSNR_Y (= round-6 baseline + 0.5 dB target; observed
+  45.21 dB), (ii) round-7 picker lifts ≥ 0.5 dB over `encode_rgb24_round6`
+  on the same fixture (observed +1.77 dB), (iii) Lever-J isolated:
+  `luma_candidates = [2, 4]` lifts ≥ 0.8 dB over `[2]`-only (observed
+  +1.14 dB), (iv) Lever-K isolated: Y-scoring picker on 320×240
+  gradient achieves ≥ r6 PSNR_Y with strictly smaller wire, (v) noisy
+  LCG no-regression (≥ 22.5 dB), (vi) empty-list errors on all three
+  candidate lists, (vii) wrapper honours `opts.luma_weight` in
+  candidate list.
+
 - Round 6 (Levers H + I): **post-classification Lloyd polish (PCL)**
   + **two-axis RD grid picker** at the encoder layer.
 

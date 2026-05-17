@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -128,6 +128,26 @@ at 2554 B → 2704 B / +5.9% wire); on the 64×64 single-strip path
 PCL alone lifts **+1.64 dB** (36.55 → 38.19 dB at the same wire
 size). The headline 64×64 gradient now sits at **43.44 dB Y at
 2704 B** — a +6.55 dB lead over ffmpeg's reference encoder.
+Round 7 (encoder-PCL upgrade) added a **three-axis RD grid picker
+with Y-channel scoring** (`encode_rgb24_best_rd_grid_3axis` +
+`encode_rgb24_round7` convenience wrapper) — Levers J + K. Lever J
+adds `luma_weight` as a third axis to the round-6 picker (round 6
+only varied `(strip_count, rdo_lambda)`, freezing `luma_weight` at
+`opts.luma_weight`); different fixtures favour different
+`luma_weight` values (64×64 gradient likes `lw=4` / +1.14 dB;
+320×240 gradient likes `lw=16` at smaller wire size). Lever K
+switches the picker's scoring distortion from RGB SSE per
+pixel-channel to **Y-channel SSE per pixel** (BT.601 luma),
+aligning the picker's optimisation target with the project's
+headline PSNR_Y metric — otherwise Y-improving `luma_weight`
+values are actively penalised by RGB-SSE scoring (defeating
+Lever J). The round-6 picker (`encode_rgb24_round6`) is unchanged
+for callers that care about chroma fidelity. Combined PSNR_Y lift
+on the 64×64 gradient: **+1.77 dB** (43.44 → 45.21 dB at 2704 B →
+3139 B / +16% wire); on the 320×240 gradient: **+1.63 dB at
+smaller wire** (45.25 dB / 14586 B → 46.88 dB / 14364 B). The
+headline 64×64 gradient now sits at **45.21 dB Y at 3139 B** — a
++7.77 dB lead over ffmpeg's reference encoder.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -155,7 +175,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -282,6 +302,26 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-w
   residual error at modest wire-size cost. Combined with PCL the
   64×64 gradient lifts to **43.44 dB Y at 2704 B** — a +6.55 dB lead
   over ffmpeg's reference encoder.
+- `encode_rgb24_best_rd_grid_3axis` / `encode_rgb24_round7` (round 7) —
+  **three-axis RD grid picker with Y-channel scoring** (Levers J + K).
+  Sweeps every `(strip_count, rdo_lambda, luma_weight)` from the
+  user-supplied `strip_candidates` × `lambda_candidates` ×
+  `luma_candidates` cross-product, returning the bitstream that
+  minimises **BT.601 Y-channel SSE per pixel** plus the Lagrangian
+  byte cost (`D_Y/N + opts.rdo_lambda · R/N`). Lever J adds the third
+  axis so the picker can pivot per-content (64×64 gradient likes
+  `lw=4`, 320×240 gradient likes `lw=16`); Lever K aligns the picker's
+  scoring distortion with the project's headline PSNR_Y metric (the
+  round-6 picker's RGB-SSE scoring actively penalises the Y-improving
+  `luma_weight` values, defeating Lever J). `encode_rgb24_round7` is
+  the default convenience wrapper with `[1, 2, 4]` × `[Some(0.0),
+  Some(2.5), opts.rdo_lambda]` × `[opts.luma_weight, 4, 8]` (deduped)
+  for ≤ 27 trial encodes per frame. On the 64×64 gradient at q=50:
+  **45.21 dB Y at 3139 B** — a +7.77 dB lead over ffmpeg's reference
+  encoder, +1.77 dB over `encode_rgb24_round6`. On the 320×240
+  gradient: 46.88 dB at 14364 B (+1.63 dB at smaller wire than round
+  6's choice). The round-6 picker is unchanged for callers that care
+  about chroma fidelity.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

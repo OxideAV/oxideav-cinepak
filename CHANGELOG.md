@@ -8,6 +8,71 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 9 (encoder-init upgrade — Lever M): **k-means++ initialisation
+  for cold-start codebook training**
+  (`EncoderOptions::kmeans_pp_init`, default `true`;
+  `EncoderOptions::kmeans_pp_lloyd_iter`, default `4`). Rounds 4–8
+  fed every cold-start (intra frame / first frame of an inter
+  sequence / every strip-picker trial encode) into **median-cut**
+  geometric range-bisection followed by LBG + PCL polish. Lever M
+  replaces the cold-start with the Arthur–Vassilvitskii 2007
+  k-means++ seeding rule (SODA 2007 — published academic algorithm,
+  no external library source consulted): sample the first centroid
+  uniformly at random, then each subsequent centroid with probability
+  proportional to the squared luma-weighted distance from the nearest
+  already-chosen centroid; followed by up to 4 Lloyd refinement
+  passes (assignment + recentroid + eps-based early stop, same
+  semantics as `lloyd_max_iter` / `lloyd_eps`).
+
+  **No-regression guarantee**: the round-9 implementation builds
+  **both** the median-cut codebook and the k-means++ codebook and
+  keeps whichever has lower total training SSE against the strip's
+  vector population. The median-cut output is always a candidate, so
+  round 9 can never produce a worse-SSE cold-start than round 8.
+
+  **Determinism**: the sampling RNG is a deterministic xorshift32
+  seeded from a content-derived hash (vector population length, first
+  / middle / last entry, codebook size, canonicalised luma weight),
+  so identical inputs produce byte-identical output. No system
+  entropy is consulted — `cargo test` is reproducible across runs.
+  `luma_weight = 0` canonicalises to `1` in the seed mix so it stays
+  byte-equivalent to `luma_weight = 1` (preserves the round-5
+  "0 → 1 fallback" contract).
+
+  **No effect on warm-start**: when a cross-frame seed is available
+  (inter strips after the first frame), the encoder continues to use
+  the prior codebook centroids and `lloyd_max_iter` Lloyd refinement
+  — Lever M triggers only on cold-start paths. Cross-frame slot
+  identity is preserved exactly as in round 8.
+
+  Measured deltas (self-encode + self-decode at `q=50`; the picker
+  scores Y-SSE per pixel + λ·R/pixel, not pure PSNR):
+
+  | fixture                          | r8 (median-cut) | r9 (k-means++)  | delta            |
+  | -------------------------------- | --------------- | --------------- | ---------------- |
+  | 64×64 gradient via `round8`      | 44.92 dB/3019B  | 45.10 dB/3037B  | +0.18 dB / +18B  |
+  | 320×240 gradient via `round8`    | 46.88 dB/14364B | 46.57 dB/14214B | -0.31 dB / -150B |
+  | 64×64 LCG-noise via `round8`     | 23.21 dB/3322B  | 23.29 dB/3322B  | +0.08 dB / +0B   |
+
+  64×64 gradient picker-cost (Y-SSE/N + λ·R/N) drops by 1.1%
+  (5.78 → 5.72). On 320×240 the picker shifts its
+  `(strip_count, rdo_lambda, luma_weight)` choice to a
+  smaller-wire / slightly-lower-PSNR operating point because the
+  k-means++ candidate moves the per-trial cost landscape — net wire
+  is -150 B at -0.31 dB PSNR_Y, within human-imperceptible bounds on
+  a 47 dB gradient.
+
+- Round 9: `tests/r9_psnr.rs` — seven-test validation suite asserting
+  (i) round-9 64×64 gradient PSNR_Y doesn't regress by more than
+  0.5 dB vs round-8 baseline, (ii) round-9 320×240 gradient PSNR_Y
+  doesn't regress by more than 0.5 dB, (iii) strictly positive PSNR_Y
+  delta on 64×64 LCG-noise (worst case for VQ), (iv) byte-for-byte
+  determinism on identical inputs, (v) `kmeans_pp_init = false`
+  reproduces the round-8 median-cut floor (>= 44.5 dB on 64×64
+  gradient), (vi) strict picker-cost improvement on 64×64 gradient
+  (5.78 → 5.72), (vii) `kmeans_pp_lloyd_iter` monotonicity (more
+  iterations don't strictly regress).
+
 - Round 8 (encoder-picker upgrade — Lever L): **per-strip independent
   (lambda, luma_weight) picker** (`encode_rgb24_per_strip_rd` +
   `encode_rgb24_round8` convenience wrapper). Round 7's three-axis

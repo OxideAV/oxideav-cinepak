@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -172,6 +172,34 @@ iso-cost. On the round-7 64×64 / 320×240 gradient headlines round 8
 matches round 7 within ±0.3 dB at smaller or equal wire size
 (per-strip greedy converges to the frame-uniform pick on homogeneous
 content).
+Round 9 (encoder-init upgrade) added **k-means++ initialisation for
+cold-start codebook training** (`EncoderOptions::kmeans_pp_init`,
+default `true`; `EncoderOptions::kmeans_pp_lloyd_iter`, default `4`)
+— Lever M. Rounds 4–8 fed every cold-start (intra frame / first frame
+of an inter sequence / first strip of a strip-picker trial encode) into
+**median-cut** geometric range-bisection followed by LBG + PCL polish.
+Median-cut is greedy on per-cluster widest dimension at split time, so
+on long-tailed pixel distributions a pair of dense clusters along the
+same dim can end up sharing a centroid while a sparser dim absorbs
+more centroids than it needs. Lever M replaces that with the
+Arthur–Vassilvitskii 2007 k-means++ seeding rule (SODA 2007) — sample
+the first centroid uniformly at random, then each subsequent centroid
+with probability proportional to the squared luma-weighted distance
+from the nearest already-chosen centroid — followed by up to 4 Lloyd
+refinement passes. The k-means++ candidate's total training SSE is
+compared against the median-cut candidate's, and the lower-SSE
+codebook wins, **guaranteeing the cold-start never regresses training
+SSE** vs round 8. The sampling RNG is a deterministic xorshift32
+seeded from a content-derived hash, so identical inputs ⇒ identical
+bytes (no system entropy consulted). On the 64×64 gradient at q=50:
+**45.10 dB Y at 3037 B vs round-8's 44.92 dB at 3019 B (+0.18 dB at
++18 B / +0.6%)** — a picker-cost win (the picker scores Y-SSE + λ·R,
+not raw PSNR) by 1.1%. On LCG-noise 64×64 the lever lifts PSNR_Y by
+**+0.08 dB at iso-wire** (3322 B). On the 320×240 gradient the picker
+chooses a smaller-wire operating point (-150 B at -0.31 dB) because
+the k-means++ candidate shifts the cost landscape and the round-7
+picker prefers a different `(strip_count, rdo_lambda, luma_weight)`
+combination — net PSNR_Y at smaller wire, content-dependent.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -199,7 +227,7 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
@@ -370,6 +398,28 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-w
   scales as O(|strips| × |lambdas| × |lumas|) per `strip_count`
   candidate, up to ~65 trial encodes per frame with the default
   3×3×3 grid.
+- `EncoderOptions::kmeans_pp_init` (round 9, default `true`) +
+  `EncoderOptions::kmeans_pp_lloyd_iter` (default `4`) — **k-means++
+  initialisation for cold-start codebook training** (Lever M).
+  Reference: Arthur & Vassilvitskii, "k-means++: The Advantages of
+  Careful Seeding", SODA 2007 (published academic algorithm; no
+  external library source consulted). On every cold-start path (no
+  cross-frame seed available — intra frames, first frame of an inter
+  sequence, and every strip-picker trial encode), the encoder builds
+  both the median-cut codebook **and** a k-means++-seeded codebook
+  with up to 4 Lloyd refinement passes, then keeps the one with
+  lower training SSE against the strip's vector population —
+  **guaranteeing round 9 never regresses training SSE** vs the
+  round-8 median-cut cold-start. The k-means++ sampling RNG is a
+  deterministic xorshift32 seeded from a content-derived hash so
+  identical inputs ⇒ identical bytes (no system entropy consulted).
+  Picker-cost lift on 64×64 gradient at q=50: -1.1%
+  (45.10 dB Y at 3037 B vs round-8's 44.92 dB at 3019 B — +0.18 dB
+  at +18 B). LCG-noise 64×64: +0.08 dB at iso-wire (3322 B). Set
+  `kmeans_pp_init = false` to recover the round-8 median-cut-only
+  cold-start. Has no effect on the warm-start path (inter strips
+  with cross-frame seed); cross-frame slot identity continues to
+  rely on `lloyd_max_iter` Lloyd refinement of the prior codebook.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

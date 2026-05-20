@@ -131,11 +131,17 @@ fn encode_decode_measure(rgb: &[u8], w: u32, h: u32, opts: EncoderOptions) -> (V
 /// `lbg_max_passes` baseline these tests characterise. Also pins
 /// `pcl_max_iter = 0` (round-6 Lever H), since the post-classification
 /// Lloyd polish does its own re-training of the LBG output and would
-/// otherwise eat most of the LBG-only delta this test isolates.
+/// otherwise eat most of the LBG-only delta this test isolates. Pins
+/// `kmeans_pp_init = false` (round-9 Lever M) for the same reason:
+/// k-means++ initialisation gives the cold-start codebook a much
+/// stronger starting point, which compresses the LBG-only delta. These
+/// tests measure the **round-4** LBG lever's contribution, so we pin
+/// the cold-start to the original median-cut baseline.
 fn r4_isolated_opts(quality: u8) -> EncoderOptions {
     EncoderOptions {
         luma_weight: 1,
         pcl_max_iter: 0,
+        kmeans_pp_init: false,
         ..EncoderOptions::from_quality(quality)
     }
 }

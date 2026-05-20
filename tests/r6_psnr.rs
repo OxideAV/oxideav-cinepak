@@ -299,8 +299,13 @@ fn pcl_0_restores_round5_picker_baseline() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
+    // Pin `kmeans_pp_init = false` (round-9 Lever M) alongside
+    // `pcl_max_iter = 0` so this regression guard exactly characterises
+    // the **round-5** baseline: every later cold-start-init lever is
+    // disabled too.
     let opts = EncoderOptions {
         pcl_max_iter: 0,
+        kmeans_pp_init: false,
         ..EncoderOptions::from_quality(50)
     };
     let bytes = encode_rgb24_best_strips(&rgb, w, h, opts, &[1, 2, 4]).unwrap();

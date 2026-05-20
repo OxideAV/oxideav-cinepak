@@ -262,6 +262,66 @@ pub struct EncoderOptions {
     ///
     /// Default `2`.
     pub pcl_max_iter: u8,
+    /// Round 9 (Lever M): **k-means++ initialisation** for cold-start
+    /// codebook training. When `true` and no cross-frame seed is
+    /// available for the strip (intra frame / first frame / `None`
+    /// seed), the warm-build replaces median-cut's geometric
+    /// range-bisection with the k-means++ seeding rule (Arthur &
+    /// Vassilvitskii 2007, SODA): pick the first centroid uniformly at
+    /// random from the vector population, then for each subsequent
+    /// centroid sample from the remaining vectors with probability
+    /// proportional to the squared luma-weighted distance from the
+    /// nearest already-chosen centroid. After the K centroids are
+    /// chosen, [`Self::kmeans_pp_lloyd_iter`] Lloyd refinement passes
+    /// (assignment + recentroid) polish them.
+    ///
+    /// **Why this can win**: median-cut's bisection is greedy on the
+    /// per-cluster widest dimension at the time of the split, so a
+    /// pair of dense clusters along the *same* dim can end up sharing
+    /// a centroid while a sparser dim absorbs more centroids than it
+    /// needs. k-means++ samples each new centroid from the actual
+    /// residual-distance distribution of the data, which provably
+    /// achieves an O(log K)-approximation to the optimal total-SSE
+    /// initialisation in expectation. On Cinepak content, the
+    /// 2×2-sub-block vectors are heavily clustered around mid-luma /
+    /// mid-chroma points, and the long tail of high-luma / saturated
+    /// outliers needs proportional centroid coverage rather than the
+    /// median-cut's "everything between the highest two values gets
+    /// one centroid" rule.
+    ///
+    /// **Determinism**: the sampling RNG is a xorshift32 seeded
+    /// deterministically from the vector population's content
+    /// (`hash(len, first, last, mid)` mixed with the requested codebook
+    /// size + luma weight). Identical inputs ⇒ identical codebooks ⇒
+    /// identical wire bytes ⇒ identical decode. No system entropy is
+    /// ever consulted.
+    ///
+    /// **No effect on seeded path**: when a cross-frame seed is
+    /// available (inter strips after the first frame), the warm-start
+    /// continues to use the prior codebook centroids — k-means++
+    /// triggers only on cold-start cases. Slot-identity preservation
+    /// across frames is therefore unaffected.
+    ///
+    /// `false` reproduces the round-8 median-cut cold-start behaviour
+    /// exactly. Default `true`.
+    pub kmeans_pp_init: bool,
+    /// Round 9 (Lever M): number of Lloyd refinement passes applied
+    /// after the k-means++ seed selection (see
+    /// [`Self::kmeans_pp_init`]). Same semantics as
+    /// [`Self::lloyd_max_iter`]: each pass reassigns vectors to the
+    /// nearest current centroid then recomputes each centroid as the
+    /// mean of its assigned cluster, with early stop when the largest
+    /// per-slot Manhattan drift falls to `≤ lloyd_eps`. `0` keeps the
+    /// raw k-means++ seed without any Lloyd polish (rarely useful);
+    /// `1..=4` captures most of the gain in practice. The pass cap is
+    /// independent of `lloyd_max_iter` because the cold-start path
+    /// benefits from a few more iterations than the warm-start path
+    /// (the warm-start centroids are already close to the optimum;
+    /// k-means++ seeds may need 2..=4 reassignments to converge).
+    ///
+    /// Default `4`. Ignored when `kmeans_pp_init = false` or when the
+    /// strip has a cross-frame seed.
+    pub kmeans_pp_lloyd_iter: u8,
 }
 
 impl Default for EncoderOptions {
@@ -288,6 +348,10 @@ impl Default for EncoderOptions {
             // Round 6 default (Lever H): 2 iterations of post-classification
             // Lloyd polish after the LBG warm-build + RDO classification.
             pcl_max_iter: 2,
+            // Round 9 (Lever M): k-means++ cold-start initialisation
+            // with 4 Lloyd refinement passes.
+            kmeans_pp_init: true,
+            kmeans_pp_lloyd_iter: 4,
         }
     }
 }
@@ -360,6 +424,10 @@ impl EncoderOptions {
             // Round 6 default (Lever H): 2 iterations of post-classification
             // Lloyd polish.
             pcl_max_iter: 2,
+            // Round 9 (Lever M): k-means++ cold-start initialisation
+            // with 4 Lloyd refinement passes.
+            kmeans_pp_init: true,
+            kmeans_pp_lloyd_iter: 4,
         }
     }
 }
@@ -2661,6 +2729,8 @@ fn build_codebooks_and_decisions(
         opts.lloyd_max_iter,
         opts.lloyd_eps,
         opts.luma_weight,
+        opts.kmeans_pp_init,
+        opts.kmeans_pp_lloyd_iter,
     );
     let mut v1_codebook = median_cut_seeded(
         &v1_vectors,
@@ -2670,6 +2740,8 @@ fn build_codebooks_and_decisions(
         opts.lloyd_max_iter,
         opts.lloyd_eps,
         opts.luma_weight,
+        opts.kmeans_pp_init,
+        opts.kmeans_pp_lloyd_iter,
     );
     // Round 4 Lever E: LBG split refinement (Linde-Buzo-Gray 1980).
     // After the median-cut + Lloyd warm-build, iteratively split the
@@ -3509,6 +3581,7 @@ fn mb_mse_against_prev(
 /// nearest *current-iteration* centroid (which started as the seed),
 /// so slots that began as seed-i remain "the seed-i lineage" and the
 /// chunk-omission / selective-update wins downstream are unaffected.
+#[allow(clippy::too_many_arguments)]
 fn median_cut_seeded(
     vectors: &[CodebookEntry],
     n: usize,
@@ -3517,6 +3590,8 @@ fn median_cut_seeded(
     max_iter: u8,
     eps: u32,
     luma_weight: u8,
+    kmeans_pp_init: bool,
+    kmeans_pp_lloyd_iter: u8,
 ) -> Codebook {
     if max_iter == 0 {
         // Lloyd disabled — cold-start median-cut (ignores seed).
@@ -3566,7 +3641,259 @@ fn median_cut_seeded(
             return prev.clone();
         }
     }
+    // Round 9 (Lever M): cold-start path. When k-means++ initialisation
+    // is enabled, build BOTH the median-cut codebook and the
+    // k-means++ + Lloyd codebook, then keep whichever has lower total
+    // SSE against the vector population. The k-means++ candidate
+    // (Arthur-Vassilvitskii 2007 sampling rule) is provably O(log K)
+    // in expectation but is randomised — without the comparison step
+    // a single unlucky seed pick can produce a worse codebook than
+    // the deterministic median-cut. By always comparing against the
+    // median-cut baseline we guarantee round 9 never regresses
+    // training SSE vs the round-8 cold-start.
+    if kmeans_pp_init && n >= 2 && !vectors.is_empty() {
+        let mc_cb = median_cut(vectors, n, mode, luma_weight);
+        let pp_cb = kmeans_pp_init_cold(vectors, n, mode, luma_weight, kmeans_pp_lloyd_iter, eps);
+        let mc_sse = codebook_total_sse(&mc_cb, vectors, n, mode, luma_weight);
+        let pp_sse = codebook_total_sse(&pp_cb, vectors, n, mode, luma_weight);
+        if pp_sse < mc_sse {
+            return pp_cb;
+        }
+        return mc_cb;
+    }
     median_cut(vectors, n, mode, luma_weight)
+}
+
+/// Round 9 helper — total SSE of `vectors` against their nearest
+/// codebook centroid. Used by the cold-start hybrid pick (Lever M)
+/// to decide whether k-means++ improved on median-cut for this
+/// specific vector population.
+fn codebook_total_sse(
+    cb: &Codebook,
+    vectors: &[CodebookEntry],
+    n: usize,
+    mode: PixelMode,
+    luma_weight: u8,
+) -> i64 {
+    let mut total: i64 = 0;
+    for v in vectors {
+        let (_slot, err) = nearest(v, cb, n, mode, luma_weight);
+        total = total.saturating_add(err);
+    }
+    total
+}
+
+/// Round 9 (Lever M) — k-means++ initialisation followed by Lloyd
+/// refinement. Reference: Arthur & Vassilvitskii, "k-means++: The
+/// Advantages of Careful Seeding", SODA 2007 (published academic
+/// algorithm; no external library source consulted).
+///
+/// Algorithm (cold start, no seed): sample the first centroid
+/// uniformly at random from `vectors`; for each subsequent centroid,
+/// compute `D(v) = min_j d²(v, c_j)` (the min squared luma-weighted
+/// distance from `v` to any already-chosen centroid), then sample `v`
+/// with probability `D(v) / Σ_w D(w)` and add it to the centroid set.
+/// After all K centroids are chosen, run up to `lloyd_iter` Lloyd
+/// refinement passes (reassign to nearest current centroid, recompute
+/// centroids as cluster means, early stop when max per-slot drift ≤
+/// `lloyd_eps`).
+///
+/// Determinism: the sampling RNG is a deterministic xorshift32
+/// seeded from a content-derived hash, so identical inputs produce
+/// identical codebooks across runs. This matters for reproducible
+/// encoding (bit-exact wire output is part of the test contract).
+fn kmeans_pp_init_cold(
+    vectors: &[CodebookEntry],
+    n: usize,
+    mode: PixelMode,
+    luma_weight: u8,
+    lloyd_iter: u8,
+    lloyd_eps: u32,
+) -> Codebook {
+    let mut cb = Codebook::default();
+    if vectors.is_empty() || n == 0 {
+        return cb;
+    }
+    let n = n.min(256);
+    let mut rng = ContentSeededRng::new(vectors, n, luma_weight);
+
+    // Step 1: pick the first centroid uniformly at random.
+    let first_idx = rng.next_index(vectors.len());
+    cb.entries[0] = vectors[first_idx];
+    let mut chosen: usize = 1;
+    if n == 1 {
+        return cb;
+    }
+
+    // `d2[i]` = min squared luma-weighted distance from `vectors[i]`
+    // to any centroid chosen so far. We use the existing
+    // `entry_distance` helper (already squared in `Yuv12` mode and L2
+    // in `Gray8`). Maintain incrementally: when a new centroid `c`
+    // joins the set, update each `d2[i]` to `min(d2[i], d(vectors[i],
+    // c))`.
+    let mut d2: Vec<i64> = vectors
+        .iter()
+        .map(|v| entry_distance(v, &cb.entries[0], mode, luma_weight))
+        .collect();
+
+    while chosen < n {
+        // Step 2: cumulative distribution of D².
+        let mut sum: i64 = 0;
+        for &d in &d2 {
+            sum = sum.saturating_add(d);
+        }
+        if sum <= 0 {
+            // All remaining vectors are already exact-match to some
+            // chosen centroid. Fill remaining slots with the first
+            // centroid (degenerate but never read by the encoder since
+            // these slots attract no vectors).
+            for i in chosen..n {
+                cb.entries[i] = cb.entries[0];
+            }
+            break;
+        }
+        // Sample `r ∈ [0, sum)` from the deterministic RNG.
+        let r = rng.next_range_i64(sum);
+        let mut acc: i64 = 0;
+        let mut pick_idx: usize = vectors.len() - 1;
+        for (i, &d) in d2.iter().enumerate() {
+            acc = acc.saturating_add(d);
+            if acc > r {
+                pick_idx = i;
+                break;
+            }
+        }
+        cb.entries[chosen] = vectors[pick_idx];
+        // Update d² incrementally against the new centroid.
+        for (i, v) in vectors.iter().enumerate() {
+            let d = entry_distance(v, &cb.entries[chosen], mode, luma_weight);
+            if d < d2[i] {
+                d2[i] = d;
+            }
+        }
+        chosen += 1;
+    }
+
+    // Step 3: Lloyd refinement.
+    if lloyd_iter > 0 {
+        for _iter in 0..lloyd_iter {
+            let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
+            for v in vectors {
+                let (slot, _) = nearest(v, &cb, n, mode, luma_weight);
+                clusters[slot as usize].push(*v);
+            }
+            let mut max_drift: u32 = 0;
+            let mut next_cb = cb.clone();
+            for (i, c) in clusters.iter().enumerate().take(n) {
+                if !c.is_empty() {
+                    let new_centroid = centroid(c, mode);
+                    max_drift = max_drift.max(entry_l1_distance(
+                        &cb.entries[i],
+                        &new_centroid,
+                        mode,
+                        luma_weight,
+                    ));
+                    next_cb.entries[i] = new_centroid;
+                }
+            }
+            cb = next_cb;
+            if max_drift <= lloyd_eps {
+                break;
+            }
+        }
+    }
+    cb
+}
+
+/// Deterministic xorshift32 PRNG seeded from a hash of the input
+/// vector population. Used by `kmeans_pp_init_cold` so identical
+/// inputs ⇒ identical codebooks ⇒ identical encoded bytes (the
+/// project's tests assume reproducible encoding).
+struct ContentSeededRng {
+    state: u32,
+}
+
+impl ContentSeededRng {
+    fn new(vectors: &[CodebookEntry], n: usize, luma_weight: u8) -> Self {
+        // Mix length, n, luma_weight, and a small subset of the vector
+        // population (first, middle, last) into a 32-bit seed. We pick
+        // a non-zero default so xorshift32 doesn't lock at 0.
+        //
+        // Canonicalise `luma_weight = 0` to `1` here to match the
+        // "0 → 1 fallback" pattern in `entry_distance` / `extent` —
+        // otherwise the RNG seed would differ between the two
+        // logically-equivalent inputs, breaking the "luma_weight = 0
+        // and 1 produce byte-identical output" contract.
+        let canonical_lw = luma_weight.max(1);
+        let mut s: u32 = 0x9E37_79B9;
+        s = Self::mix(s, vectors.len() as u32);
+        s = Self::mix(s, n as u32);
+        s = Self::mix(s, u32::from(canonical_lw));
+        if !vectors.is_empty() {
+            let first = Self::entry_to_u32(&vectors[0]);
+            let mid = Self::entry_to_u32(&vectors[vectors.len() / 2]);
+            let last = Self::entry_to_u32(&vectors[vectors.len() - 1]);
+            s = Self::mix(s, first);
+            s = Self::mix(s, mid);
+            s = Self::mix(s, last);
+        }
+        if s == 0 {
+            s = 0xDEAD_BEEF;
+        }
+        ContentSeededRng { state: s }
+    }
+
+    fn mix(s: u32, v: u32) -> u32 {
+        // 32-bit splitmix-style mix.
+        let mut x = s.wrapping_add(v);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x85EB_CA6B);
+        x ^= x >> 13;
+        x = x.wrapping_mul(0xC2B2_AE35);
+        x ^= x >> 16;
+        x
+    }
+
+    fn entry_to_u32(e: &CodebookEntry) -> u32 {
+        // Pack first 4 bytes of the entry. Sufficient for hashing.
+        u32::from_le_bytes([e.y0, e.y1, e.y2, e.y3])
+    }
+
+    /// Standard xorshift32 step.
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        x
+    }
+
+    /// Sample uniformly from `0..len`. `len` must be ≥ 1.
+    fn next_index(&mut self, len: usize) -> usize {
+        if len <= 1 {
+            return 0;
+        }
+        // Modulo bias is acceptable for our use: cluster initialisation
+        // is statistical, and the deterministic seed already removes
+        // any guarantee of perfect uniformity over independent runs.
+        (self.next_u32() as usize) % len
+    }
+
+    /// Sample uniformly from `0..bound`. `bound` must be > 0.
+    fn next_range_i64(&mut self, bound: i64) -> i64 {
+        if bound <= 1 {
+            return 0;
+        }
+        // Use 64 bits of entropy for the modulo to limit bias on large
+        // bounds (codebook-distance sums can run into the i64 range on
+        // big strips).
+        let hi = u64::from(self.next_u32()) << 32;
+        let lo = u64::from(self.next_u32());
+        let r = (hi | lo) as i64;
+        let r = r.rem_euclid(bound);
+        r.max(0)
+    }
 }
 
 /// L1 (Manhattan) distance between two codebook entries summed across

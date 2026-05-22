@@ -9,7 +9,7 @@
 //! identity).
 
 use crate::codebook::{
-    apply_codebook_chunk, Codebook, CodebookChunkKind, PixelMode, UpdateStyle, WhichCodebook,
+    apply_codebook_chunk_with, Codebook, CodebookChunkKind, PixelMode, UpdateStyle, WhichCodebook,
     CHUNK_HEADER_SIZE,
 };
 use crate::error::{CinepakError, Result};
@@ -19,6 +19,74 @@ use crate::header::{
 use crate::image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 use crate::vector::{decode_vector_chunk, Mb};
 use crate::yuv::yuv_to_rgb;
+
+/// Wire-level deviation profile for a Cinepak frame.
+///
+/// Standard Cinepak (FFmpeg `cvid`, QuickTime `cvid`, AVI `cvid`) has
+/// a 10-byte frame header followed immediately by the first strip
+/// header, and codebook chunks always declare a payload size that is a
+/// clean multiple of the entry stride.
+///
+/// The Sega Saturn variant carried inside Sega FILM (`.cpk`) files
+/// deviates in three documented ways (`Sega_FILM.wiki` lines
+/// 125–143):
+///
+/// 1. The frame header is padded with 2 extra bytes after the standard
+///    10 bytes — total prefix is **12 bytes** before the first strip.
+///    The Lemmings 3DO variant pads with 6 extra bytes instead
+///    (`Sega_FILM.wiki` line 189) for **16 bytes** of prefix.
+/// 2. The `frame_length` field in the frame header is **8 bytes short
+///    of the real frame length**. The authoritative frame size comes
+///    from the FILM `STAB` sample record's `sample_length`, not from
+///    the codec header.
+/// 3. Codebook chunks may declare a payload size that is **not** a
+///    clean multiple of the 6-byte / 4-byte entry stride; the decoder
+///    is expected to truncate the entry count to
+///    `floor(payload_len / entry_size)` and skip the trailing
+///    remainder bytes before parsing the next chunk in the strip.
+///
+/// `DeviantConfig::saturn()` is the most common variant; the
+/// constructor name preserves the historical association with
+/// `'cvid'` data in Sega Saturn `.cpk` files even though early Sega CD
+/// titles also use these deviations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviantConfig {
+    /// Number of extra bytes between the standard 10-byte frame
+    /// header and the first strip header (2 for Saturn / Sega CD,
+    /// 6 for Lemmings 3DO).
+    pub extra_header_bytes: u8,
+    /// Number of bytes by which the codec-header `frame_length`
+    /// field undercounts the real frame size. Saturn variant is 8.
+    pub frame_length_short_by: u8,
+    /// `true` if codebook chunks may carry trailing pad bytes that
+    /// the decoder must skip (i.e. non-divisible payload sizes are
+    /// legal). Saturn variant is `true`.
+    pub tolerate_codebook_pad: bool,
+}
+
+impl DeviantConfig {
+    /// Saturn / Sega CD `'cvid'` deviant variant. 12-byte total prefix
+    /// (10-byte standard header + 2 extra bytes), `frame_length`
+    /// short by 8, codebook chunks may have trailing pad.
+    pub const fn saturn() -> Self {
+        Self {
+            extra_header_bytes: 2,
+            frame_length_short_by: 8,
+            tolerate_codebook_pad: true,
+        }
+    }
+
+    /// Lemmings 3DO deviant variant. 16-byte total prefix (10-byte
+    /// standard header + 6 extra bytes), `frame_length` short by 8,
+    /// codebook chunks may have trailing pad.
+    pub const fn lemmings_3do() -> Self {
+        Self {
+            extra_header_bytes: 6,
+            frame_length_short_by: 8,
+            tolerate_codebook_pad: true,
+        }
+    }
+}
 
 /// Stateful Cinepak decoder. Holds the V4 / V1 codebook pair from the
 /// previous strip (for inheritance across strips and frames) and the
@@ -50,19 +118,61 @@ impl CinepakDecoder {
     /// `frame_length` field must equal `bytes.len()` (or be smaller —
     /// the slice may carry container padding past the frame).
     pub fn decode_frame(&mut self, bytes: &[u8], pts: Option<i64>) -> Result<CinepakFrame> {
+        self.decode_frame_inner(bytes, pts, None)
+    }
+
+    /// Decode a Sega Saturn / Sega CD / Lemmings 3DO **deviant**
+    /// Cinepak frame from `bytes` per [`DeviantConfig`]. The caller is
+    /// responsible for slicing exactly one frame's worth of bytes out
+    /// of the FILM container — the codec header's `frame_length` is
+    /// short by `cfg.frame_length_short_by`, so the slice's length is
+    /// authoritative.
+    ///
+    /// Wire-format reference:
+    /// `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 125–143
+    /// (Saturn `'cvid'` deviation) and line 189 (Lemmings 3DO 6-byte
+    /// prefix). All three deviations — extra header bytes, short
+    /// `frame_length`, codebook trailing pad — are handled here.
+    pub fn decode_deviant_frame(
+        &mut self,
+        bytes: &[u8],
+        pts: Option<i64>,
+        cfg: DeviantConfig,
+    ) -> Result<CinepakFrame> {
+        self.decode_frame_inner(bytes, pts, Some(cfg))
+    }
+
+    fn decode_frame_inner(
+        &mut self,
+        bytes: &[u8],
+        pts: Option<i64>,
+        deviant: Option<DeviantConfig>,
+    ) -> Result<CinepakFrame> {
         let header = FrameHeader::parse(bytes)?;
-        let frame_len = header.frame_length as usize;
-        if frame_len > bytes.len() {
-            return Err(CinepakError::invalid(format!(
-                "frame_length {} exceeds buffer size {}",
-                frame_len,
-                bytes.len()
-            )));
-        }
+        let strip_prefix_bytes =
+            FRAME_HEADER_SIZE + deviant.map(|d| d.extra_header_bytes as usize).unwrap_or(0);
+        let frame_len = match deviant {
+            // Saturn deviant: header `frame_length` is short by
+            // `frame_length_short_by` bytes, and the FILM container
+            // sample length is authoritative — i.e. `bytes.len()`.
+            // We accept the slice as-is.
+            Some(_) => bytes.len(),
+            None => {
+                let fl = header.frame_length as usize;
+                if fl > bytes.len() {
+                    return Err(CinepakError::invalid(format!(
+                        "frame_length {} exceeds buffer size {}",
+                        fl,
+                        bytes.len()
+                    )));
+                }
+                fl
+            }
+        };
         let frame_bytes = &bytes[..frame_len];
 
         // Walk strips.
-        let mut cursor = FRAME_HEADER_SIZE;
+        let mut cursor = strip_prefix_bytes;
         let mut prev_y_bottom = 0u32;
         // Detected pixel mode (set by the first codebook chunk we see).
         let mut frame_mode: Option<PixelMode> = None;
@@ -135,6 +245,7 @@ impl CinepakDecoder {
                 &mut v1,
                 strip_hdr_mb_count(&strip_hdr, sx1 - sx0),
                 strip_hdr.raw.is_intra(),
+                deviant.map(|d| d.tolerate_codebook_pad).unwrap_or(false),
             )?;
 
             // Pixel-mode unification across strips of the same frame.
@@ -217,6 +328,7 @@ fn decode_strip_chunks(
     v1: &mut Codebook,
     mb_count: usize,
     is_intra: bool,
+    tolerate_codebook_pad: bool,
 ) -> Result<(Vec<Mb>, PixelMode)> {
     let mut p = 0usize;
     let mut mode: Option<PixelMode> = None;
@@ -257,7 +369,7 @@ fn decode_strip_chunks(
                 WhichCodebook::V4 => &mut *v4,
                 WhichCodebook::V1 => &mut *v1,
             };
-            apply_codebook_chunk(kind, chunk_payload, cb)?;
+            apply_codebook_chunk_with(kind, chunk_payload, cb, tolerate_codebook_pad)?;
         } else if matches!(chunk_id, 0x3000 | 0x3100 | 0x3200) {
             if mbs.is_some() {
                 return Err(CinepakError::invalid(

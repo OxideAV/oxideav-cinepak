@@ -194,9 +194,30 @@ pub fn apply_codebook_chunk(
     payload: &[u8],
     cb: &mut Codebook,
 ) -> Result<()> {
+    apply_codebook_chunk_with(kind, payload, cb, false)
+}
+
+/// Codebook chunk decode with a `tolerate_trailing` knob for the Sega
+/// Saturn deviant CVID variant.
+///
+/// In Sega Saturn FILM files (per `Sega_FILM.wiki` line 143), a 0x2000
+/// chunk may declare a payload size that is **not** a clean multiple of
+/// the 6-byte entry stride — e.g. an 0x5FC-byte payload that decodes to
+/// 255 entries plus 2 padding bytes the decoder must skip before
+/// continuing with the next chunk. When `tolerate_trailing` is `true`,
+/// full-replacement payloads are truncated to `floor(len / entry_size)`
+/// entries and the remainder is silently discarded. Standard streams
+/// (the default for `apply_codebook_chunk`) are stricter and reject any
+/// remainder.
+pub fn apply_codebook_chunk_with(
+    kind: CodebookChunkKind,
+    payload: &[u8],
+    cb: &mut Codebook,
+    tolerate_trailing: bool,
+) -> Result<()> {
     let entry_size = kind.mode.entry_size();
     match kind.style {
-        UpdateStyle::Full => apply_full(kind, entry_size, payload, cb),
+        UpdateStyle::Full => apply_full(kind, entry_size, payload, cb, tolerate_trailing),
         UpdateStyle::Selective => apply_selective(kind, entry_size, payload, cb),
     }
 }
@@ -238,13 +259,17 @@ fn apply_full(
     entry_size: usize,
     payload: &[u8],
     cb: &mut Codebook,
+    tolerate_trailing: bool,
 ) -> Result<()> {
-    if payload.len() % entry_size != 0 {
+    if payload.len() % entry_size != 0 && !tolerate_trailing {
         return Err(CinepakError::invalid(format!(
             "full-replace codebook payload size {} not a multiple of entry size {entry_size}",
             payload.len()
         )));
     }
+    // In the Saturn deviant variant, the payload may include 1..entry_size
+    // trailing bytes that the decoder is expected to truncate. We pick
+    // the floor and discard the remainder.
     let n = payload.len() / entry_size;
     if n > 256 {
         return Err(CinepakError::invalid(format!(
@@ -535,6 +560,67 @@ mod tests {
         }
         // Untouched entries.
         assert_eq!(out.entries[1], CodebookEntry::default());
+    }
+
+    /// Sega Saturn deviant 0x2000 chunk: 0x5FC-byte payload that
+    /// contains 255 6-byte vectors + 2 trailing pad bytes. Reference:
+    /// `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` line 143
+    /// ("the solution in this case is to unpack 255 6-byte vectors and
+    /// then skip 2 bytes"). Standard `apply_codebook_chunk` must reject
+    /// the malformed length; `apply_codebook_chunk_with(..., true)`
+    /// must accept it and decode exactly 255 entries.
+    #[test]
+    fn deviant_full_chunk_tolerates_trailing_pad() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        // Build 255 distinct entries + 2 trailing bytes.
+        let mut payload = Vec::with_capacity(255 * 6 + 2);
+        for i in 0..255u16 {
+            // Make each entry recognisable by index.
+            let y = (i & 0xff) as u8;
+            payload.extend_from_slice(&[
+                y,
+                y.wrapping_add(1),
+                y.wrapping_add(2),
+                y.wrapping_add(3),
+                0,
+                0,
+            ]);
+        }
+        payload.extend_from_slice(&[0xAB, 0xCD]); // garbage pad
+        assert_eq!(payload.len(), 0x5FC);
+
+        // Standard path rejects.
+        let mut cb_strict = Codebook::default();
+        assert!(apply_codebook_chunk(kind, &payload, &mut cb_strict).is_err());
+
+        // Deviant path accepts, decodes 255 entries.
+        let mut cb = Codebook::default();
+        apply_codebook_chunk_with(kind, &payload, &mut cb, true).unwrap();
+        assert_eq!(cb.entries[0], CodebookEntry::from_yuv(0, 1, 2, 3, 0, 0));
+        assert_eq!(
+            cb.entries[254],
+            CodebookEntry::from_yuv(254, 255, 0, 1, 0, 0)
+        );
+        // Slot 255 must be untouched (still default).
+        assert_eq!(cb.entries[255], CodebookEntry::default());
+    }
+
+    /// Tolerating-trailing on a clean payload must still decode the
+    /// usual count and leave no garbage.
+    #[test]
+    fn deviant_tolerate_trailing_no_op_when_clean() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        let mut payload = Vec::new();
+        for i in 0..16u8 {
+            payload.extend_from_slice(&[i, i, i, i, 0, 0]);
+        }
+        let mut cb = Codebook::default();
+        apply_codebook_chunk_with(kind, &payload, &mut cb, true).unwrap();
+        assert_eq!(cb.entries[0], CodebookEntry::from_yuv(0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            cb.entries[15],
+            CodebookEntry::from_yuv(15, 15, 15, 15, 0, 0)
+        );
     }
 
     #[test]

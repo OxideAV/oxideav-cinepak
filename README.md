@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -200,6 +200,31 @@ chooses a smaller-wire operating point (-150 B at -0.31 dB) because
 the k-means++ candidate shifts the cost landscape and the round-7
 picker prefers a different `(strip_count, rdo_lambda, luma_weight)`
 combination — net PSNR_Y at smaller wire, content-dependent.
+
+Round 93 (decoder Sega Saturn deviant variant) added
+**`CinepakDecoder::decode_deviant_frame` + `DeviantConfig`** — closes
+the long-standing "Saturn deviant codec-frame slicing is deferred
+until a genuine Saturn fixture is acquired" gap from round 2. The
+deviant variant is documented in
+`docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 125–143
+(Saturn `'cvid'`) and line 189 (Lemmings 3DO 6-byte prefix); it
+diverges from standard Cinepak in three ways — 2 extra bytes after
+the 10-byte frame header (or 6 for Lemmings 3DO), `frame_length`
+field 8 bytes short of the real frame body, and codebook chunks may
+declare an 0x5FC-byte payload of 255 vectors + 2 trailing pad bytes
+instead of the standard 0x600-byte payload of 256 vectors. The
+deviant decode is gated behind an explicit
+`CinepakDecoder::decode_deviant_frame(bytes, pts,
+DeviantConfig::saturn())` entry point so standard AVI / QuickTime
+`'cvid'` traffic continues to use the strict `decode_frame` path
+byte-for-byte. Also added `FilmDemuxer::variant() -> CinepakVariant`
+— a header-driven classifier that picks the right `DeviantConfig`
+based on the FILM header version field (`'1.0X'` ASCII ⇒
+`DeviantSaturn`, NULL ⇒ `DeviantLemmings3do`, `'sega'` / `'Seg4'` ⇒
+`OutOfScope`). 10 new tests cover all three deviations
+simultaneously, multi-strip deviant decoding, the
+classifier table, and a regression check that standard decode is
+unchanged.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -432,8 +457,30 @@ Container side (round 2):
 - `probe_film` — lightweight `'FILM'` signature check.
 - `SampleRecord::is_keyframe` / `is_audio` / `timestamp_ticks` —
   decode `sample_info_1` per spec §2.4.
-- Deviant Saturn variant (§2.6) is documented but not yet handled
-  beyond signature recognition (no Saturn fixture in corpus).
+- `FilmDemuxer::variant() -> CinepakVariant` (round 93) —
+  header-driven classifier that picks the right `DeviantConfig`
+  based on FILM header version + FDSC FOURCC per
+  `Sega_FILM.wiki` lines 200–224. Returns
+  `DeviantSaturn` for ASCII `1.0X` versions, `DeviantLemmings3do`
+  for NULL versions, `OutOfScope` for `'sega'` / `'Seg4'`
+  Cinepak-for-Sega.
+
+Decoder side, deviant Saturn variant (round 93):
+
+- `CinepakDecoder::decode_deviant_frame(bytes, pts,
+  DeviantConfig::saturn())` — Sega Saturn / Sega CD `'cvid'`
+  deviant decode. Standard `decode_frame` path is unaffected. The
+  deviant variant handles all three documented divergences from
+  `Sega_FILM.wiki` lines 125–143: 2 extra header bytes (or 6 for
+  Lemmings 3DO via `DeviantConfig::lemmings_3do()`), `frame_length`
+  short by 8, and codebook chunks may declare a payload size that
+  isn't a clean multiple of the entry stride (`floor(len /
+  entry_size)` entries are decoded, remainder is skipped).
+- `codebook::apply_codebook_chunk_with(kind, payload, cb,
+  tolerate_trailing)` — lower-level codebook decode with the
+  trailing-pad knob. The strict default (`apply_codebook_chunk`)
+  still rejects non-divisible payload sizes; setting
+  `tolerate_trailing = true` truncates and discards the remainder.
 
 ## Output pixel formats
 

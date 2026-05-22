@@ -8,6 +8,72 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 93 (decoder Sega Saturn deviant variant): **deviant Cinepak
+  decode entry point**
+  (`CinepakDecoder::decode_deviant_frame` + `DeviantConfig::saturn` /
+  `DeviantConfig::lemmings_3do`). Closes the long-standing "Saturn
+  deviant codec-frame slicing is deferred until a genuine Saturn
+  fixture is acquired" gap in `src/film.rs` (the demuxer recognised
+  Saturn `.cpk` headers, but the codec frame body in those files
+  failed the standard Cinepak decoder's three structural invariants).
+
+  The deviant variant — documented in
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 125–143
+  (Saturn `'cvid'`) and line 189 (Lemmings 3DO 6-byte prefix) —
+  diverges from standard Cinepak in three ways:
+
+  1. **Frame-header padding**: 2 extra bytes after the standard
+     10-byte frame header (Saturn / Sega CD) or 6 extra bytes
+     (Lemmings 3DO), for a 12-byte / 16-byte total prefix before the
+     first strip header.
+  2. **Short `frame_length`**: the codec header's `frame_length`
+     field is 8 bytes shy of the real frame body length. The
+     authoritative length comes from the FILM container's `STAB`
+     sample-record `sample_length`, not from the codec header.
+  3. **Codebook trailing pad**: a `0x2000` codebook chunk may declare
+     an 0x5FC-byte payload that contains 255 6-byte vectors + 2
+     trailing pad bytes, instead of the standard 0x600-byte payload
+     of 256 vectors. The decoder must truncate to
+     `floor(payload_len / entry_size)` entries and skip the
+     remainder.
+
+  Implementation:
+  * `DeviantConfig` struct (`extra_header_bytes`, `frame_length_short_by`,
+    `tolerate_codebook_pad`) with `saturn()` / `lemmings_3do()`
+    constructors.
+  * `CinepakDecoder::decode_deviant_frame(bytes, pts, cfg)` —
+    parallels `decode_frame` and shares a private inner that takes
+    `Option<DeviantConfig>`. Standard path is unchanged byte-for-byte.
+  * `codebook::apply_codebook_chunk_with(kind, payload, cb,
+    tolerate_trailing)` — the strict default
+    (`apply_codebook_chunk`) still rejects non-divisible payload
+    sizes; the new `_with` variant truncates and discards remainder
+    bytes when `tolerate_trailing` is `true`.
+  * `film::CinepakVariant` enum + `FilmDemuxer::variant()` —
+    header-driven classifier that reads `Sega_FILM.wiki`'s decision
+    rules (lines 200–224): `'cvid'` + ASCII version ⇒ Saturn
+    deviant, `'cvid'` + NULL version ⇒ Lemmings 3DO deviant,
+    `'sega'` / `'Seg4'` ⇒ out of scope, anything else ⇒
+    out of scope.
+
+  Tests: `tests/deviant_saturn.rs` (8 new tests). Synthesises a
+  deviant Cinepak frame exhibiting all three deviations
+  simultaneously and verifies (a) the standard decoder rejects it,
+  (b) the deviant decoder decodes it to the expected 4×4 Rgb24
+  output, (c) Lemmings 3DO config rejects a 2-extra-byte frame and
+  vice versa, (d) `FilmDemuxer::variant()` correctly classifies
+  Saturn vs Lemmings 3DO vs out-of-scope FILM headers, (e) a
+  multi-strip deviant frame decodes coherently with the deviation
+  applied per-strip codebook chunk. Plus 2 new codebook-layer unit
+  tests (`deviant_full_chunk_tolerates_trailing_pad` /
+  `deviant_tolerate_trailing_no_op_when_clean`) covering the
+  truncation rule in isolation.
+
+  No external library source consulted at any phase. All wire-format
+  facts trace to `docs/video/cinepak/reference/wiki/Sega_FILM.wiki`
+  (multimedia.cx mirror, CC-BY-SA) per the
+  `docs/IMPLEMENTOR_ROUND.md` clean-room rule.
+
 - Round 9 (encoder-init upgrade — Lever M): **k-means++ initialisation
   for cold-start codebook training**
   (`EncoderOptions::kmeans_pp_init`, default `true`;

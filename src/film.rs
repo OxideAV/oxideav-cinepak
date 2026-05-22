@@ -104,6 +104,32 @@ pub struct Fdsc {
     pub audio_sample_rate: u16,
 }
 
+/// Which Cinepak wire-format variant a FILM container's video samples
+/// use. Determined from the FILM header version + FDSC chunk layout
+/// per `Sega_FILM.wiki` lines 125–224.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CinepakVariant {
+    /// Standard Cinepak (`'cvid'` FOURCC, ASCII version field
+    /// `'1.0X'` or `'1.0Y'`). Decode with
+    /// [`crate::CinepakDecoder::decode_frame`].
+    Standard,
+    /// Sega Saturn / Sega CD `'cvid'` deviant variant. 12-byte
+    /// frame-header prefix, `frame_length` short by 8, codebook
+    /// chunks may have trailing pad. Decode with
+    /// [`crate::CinepakDecoder::decode_deviant_frame`] +
+    /// [`crate::DeviantConfig::saturn`].
+    DeviantSaturn,
+    /// Lemmings 3DO `'cvid'` deviant variant. 16-byte frame-header
+    /// prefix (6 extra bytes after the standard 10), otherwise the
+    /// same as `DeviantSaturn`. Detected by NULL version field +
+    /// `'cvid'` FOURCC per `Sega_FILM.wiki` line 189.
+    DeviantLemmings3do,
+    /// `'sega'` / `'Seg4'` Cinepak-for-Sega variant — distinct
+    /// codec, out of scope for this crate per spec §2.3 of
+    /// `00-scope.md`.
+    OutOfScope,
+}
+
 impl Fdsc {
     /// Parse an `FDSC` chunk starting at `bytes[0..]`. Returns the
     /// parsed `Fdsc` plus the chunk's `chunk_length` field (which is
@@ -320,6 +346,47 @@ impl FilmDemuxer {
             .iter()
             .enumerate()
             .filter(|(_, s)| !s.is_audio())
+    }
+
+    /// Classify the Cinepak wire-format variant in use by this FILM
+    /// file, per `Sega_FILM.wiki` "Strategy For Detecting FILM File
+    /// Types" (lines 200–224). The classification is purely
+    /// header-driven; the actual sample bytes are not inspected.
+    ///
+    /// Decision rules (in order):
+    ///
+    /// 1. FOURCC `'sega'` or `'Seg4'` → [`CinepakVariant::OutOfScope`]
+    ///    (Cinepak-for-Sega is a different codec).
+    /// 2. FOURCC `'cvid'` + ASCII version `'1.0X'` or higher → all
+    ///    Saturn `.cpk` files (per wiki line 211, "load as standard
+    ///    FILM file, be sure to feed CVID data through Cinepak
+    ///    decoder that can handle it") → [`CinepakVariant::DeviantSaturn`].
+    /// 3. FOURCC `'cvid'` + NULL version field → Lemmings 3DO
+    ///    (per wiki line 189) → [`CinepakVariant::DeviantLemmings3do`].
+    /// 4. Anything else with `'cvid'` falls back to standard.
+    ///
+    /// Note: there is no standard non-Saturn FILM container in the
+    /// wild — every `.cpk` file with a `'cvid'` codec uses some flavour
+    /// of the deviant Saturn variant per `Sega_FILM.wiki` lines
+    /// 125–127 ("The Cinepak data inside of a FILM file can not be
+    /// decoded with a general purpose Cinepak decoding algorithm").
+    /// Use [`crate::CinepakDecoder::decode_frame`] only when the
+    /// frames come from an AVI / QuickTime container, not from FILM.
+    pub fn variant(&self) -> CinepakVariant {
+        match &self.fdsc.video_codec {
+            b"sega" | b"Seg4" => CinepakVariant::OutOfScope,
+            b"cvid" => {
+                // NULL version = Lemmings 3DO per wiki line 189.
+                if self.film_header.version == [0u8, 0, 0, 0] {
+                    CinepakVariant::DeviantLemmings3do
+                } else {
+                    // ASCII '1.0X' or any other version = standard
+                    // Saturn deviant per wiki line 211.
+                    CinepakVariant::DeviantSaturn
+                }
+            }
+            _ => CinepakVariant::OutOfScope,
+        }
     }
 }
 

@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -225,6 +225,28 @@ based on the FILM header version field (`'1.0X'` ASCII ⇒
 simultaneously, multi-strip deviant decoding, the
 classifier table, and a regression check that standard decode is
 unchanged.
+Round 96 (encoder bitrate-target rate control) added
+**`CinepakEncoder::with_target_bitrate(bits_per_second, fps)`** (and a
+direct-byte `with_target_frame_bytes` form) — a stateful per-frame
+byte-budget mode that drives the existing three-axis
+`(strip_count, rdo_lambda, luma_weight)` RD grid toward a
+constant-bitrate per-frame budget (`bits/8/fps`), analogous to the ICER
+`with_byte_budget` pattern. The picker commits the highest-quality grid
+candidate that fits the budget (lowest BT.601 Y-SSE with bytes ≤ cap)
+and, when even the smallest candidate overshoots, emits that floor and
+flags the overshoot via `RateStats` (`last_rate_stats()`) — never
+erroring on rate. Unlike the round-5/6/7 `TwoPassRateControl`
+(throwaway-encoder prefix replay), this rides the encoder's own
+carry-over, so inter frames stay budgeted and skip / selectively-update
+against the committed previous reconstruction. Rate control is encoder
+policy, not a bitstream feature, so the budget-allocation heuristic is
+derived from first principles (no external encoder source) and decoded
+output stays conformant Cinepak. On a 128×96 gradient (q=85,
+unconstrained 6418 B) budgets of 6418 / 4813 / 3209 B land at 95.8 % /
+82.1 % / 99.2 % of budget, all under cap. 7 new tests cover budget
+adherence across an intra+inter sequence, shrink-vs-unconstrained,
+impossible-budget overshoot, size monotonicity, reset/clear semantics,
+and fractional/degenerate fps arithmetic.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -310,6 +332,29 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   `tolerance_pct_min` and `tolerance_pct_max` per the
   `variance_scale_pct` cutoff. Equal-bound input matches the
   round-6 fixed-tolerance behaviour exactly.
+- `CinepakEncoder::with_target_bitrate(bits_per_second, fps)` /
+  `with_target_frame_bytes(n)` (round 96) — **single-encoder
+  bitrate-target rate control** (analogous to the ICER
+  `with_byte_budget` pattern). Derives a constant-bitrate per-frame
+  budget (`bits/8/fps`; fps clamped ≥ 1.0; fractional rates like
+  23.976 supported) and drives the existing three-axis
+  `(strip_count, rdo_lambda, luma_weight)` RD grid toward it per
+  frame: commits the **highest-quality candidate that fits**
+  (lowest BT.601 Y-SSE with bytes ≤ budget), else the smallest
+  candidate with the overshoot flagged. Unlike `TwoPassRateControl`
+  (which re-encodes the whole prefix via a throwaway encoder per
+  frame), this rides the stateful encoder's own carry-over —
+  inter frames stay budgeted and skip/selective-update against the
+  committed previous reconstruction. Per-frame adherence via
+  `last_rate_stats() -> Option<RateStats>` (`target_bytes`,
+  `actual_bytes`, `byte_delta`, `within_budget`, `trials`).
+  `reset()` preserves the budget; `clear_target_bitrate()` returns
+  to quality-controlled mode. Measured on a 128×96 gradient
+  (q=85, unconstrained 6418 B): budgets of 6418 / 4813 / 3209 B
+  land at 95.8 % / 82.1 % / 99.2 % of budget, all under cap; budgets
+  below the grid's ~2833 B smallest-frame floor emit that floor and
+  report overshoot. Rate control is encoder policy, not a bitstream
+  feature — output stays conformant Cinepak.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

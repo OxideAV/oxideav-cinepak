@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 96 (encoder bitrate-target rate control): **per-frame byte-budget
+  mode on `CinepakEncoder`**
+  (`CinepakEncoder::with_target_bitrate(bits_per_second, fps)` +
+  `with_target_frame_bytes(n)`, in-place `set_*` forms,
+  `target_frame_bytes()` / `clear_target_bitrate()` accessors, and the
+  `RateStats` telemetry struct queried via `last_rate_stats()`).
+
+  The encoder was ~98 % quality-controlled (the `q`-knob via
+  `EncoderOptions::from_quality`). The new mode derives a constant-bitrate
+  per-frame budget (`bits_per_second / 8 / fps`, fps clamped to ≥ 1.0,
+  fractional rates like 23.976 supported) and drives the existing
+  three-axis `(strip_count, rdo_lambda, luma_weight)` RD grid — the same
+  3×3×3 deduplicated cross-product `encode_rgb24_round7` sweeps — toward
+  that budget per frame, analogous to the ICER `with_byte_budget`
+  contract.
+
+  Selection rule (per frame): trial-encode every grid candidate against
+  a snapshot of the encoder's carry-over state, then **commit the
+  candidate with the lowest BT.601 Y-channel SSE whose encoded size is
+  `≤ budget`** (highest-quality fit). When no candidate fits — the budget
+  is below the grid's smallest-frame floor — the **smallest** candidate
+  is committed and the overshoot is reported via a positive
+  `RateStats::byte_delta` with `within_budget == false`. The API never
+  errors on rate overshoot.
+
+  Inter frames are budgeted too: each trial decode reuses a clone of the
+  pre-frame decoder state so `0x3100` skip / selective-update macroblocks
+  resolve against the correct previous reconstruction, and the committed
+  candidate's rolling-codebook / prev-frame state is what advances
+  `self`. `reset()` now preserves the configured budget (and the
+  cross-frame-persistence flag) so a rate-control encoder can be reused
+  across independent sequences. `clear_target_bitrate()` returns to
+  quality-controlled mode.
+
+  Rate control is an **encoder-policy** choice, not a bitstream feature,
+  so the budget-allocation heuristic is derived from first principles per
+  the round's docs-gap rule (no external encoder source); decoded output
+  remains conformant Cinepak. Measured on a 128×96 gradient (base q=85,
+  unconstrained 6418 B): budgets of 6418 / 4813 / 3209 B land at 6148 /
+  3952 / 3184 B (95.8 % / 82.1 % / 99.2 % of budget, all under cap);
+  budgets below the ~2833 B grid floor emit the 2833 B smallest candidate
+  and flag overshoot. Covered by `tests/rate_control_bitrate.rs` (7
+  tests: generous-budget adherence across an intra+3-inter sequence,
+  moderate-budget shrink vs unconstrained, impossible-budget overshoot
+  reporting, size monotonicity across tightening budgets, reset/clear
+  semantics, fractional-fps and degenerate-fps arithmetic). `CinepakDecoder`
+  and the internal `RollingCodebooks` gained `#[derive(Clone)]` to support
+  the trial-and-restore snapshot.
+
 - Round 93 (decoder Sega Saturn deviant variant): **deviant Cinepak
   decode entry point**
   (`CinepakDecoder::decode_deviant_frame` + `DeviantConfig::saturn` /

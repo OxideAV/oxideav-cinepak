@@ -1322,6 +1322,16 @@ pub struct CinepakEncoder {
     /// `encode_intra` / `encode_inter` call. Reset at the start of
     /// each frame.
     last_stats: FrameStats,
+    /// Round-96 bitrate-target rate control: per-frame byte budget. When
+    /// `Some(n)`, [`Self::encode_intra`] / [`Self::encode_inter`] drive
+    /// the three-axis `(strip_count, rdo_lambda, luma_weight)` RD grid
+    /// toward `≤ n` bytes per frame instead of using the fixed `opts`
+    /// the caller passes. `None` reproduces the legacy quality-controlled
+    /// behaviour (the caller's `opts` are used verbatim, single trial).
+    target_frame_bytes: Option<usize>,
+    /// Round-96 telemetry: outcome of the most recent budget-driven
+    /// frame. `None` when the encoder is not in target-bitrate mode.
+    last_rate_stats: Option<RateStats>,
 }
 
 /// Round-7 per-frame telemetry, queried via
@@ -1345,6 +1355,31 @@ pub struct FrameStats {
     pub forced_full_chunks: usize,
 }
 
+/// Round-96 per-frame rate-control telemetry, queried via
+/// [`CinepakEncoder::last_rate_stats`] after a budget-driven
+/// [`CinepakEncoder::encode_intra`] / [`CinepakEncoder::encode_inter`]
+/// call. `None` (via the accessor) when the encoder is not in
+/// target-bitrate mode.
+#[derive(Clone, Copy, Debug)]
+pub struct RateStats {
+    /// The per-frame byte budget in effect for the most recent frame
+    /// (`bits_per_second / 8 / fps`, or the directly-set byte budget).
+    pub target_bytes: usize,
+    /// The encoded size of the frame the picker committed to.
+    pub actual_bytes: usize,
+    /// `actual_bytes as i64 - target_bytes as i64`. Negative ⇒ under
+    /// budget (the common case — the picker takes the highest-quality
+    /// grid point that still fits). Positive ⇒ overshoot: even the
+    /// smallest grid candidate exceeded the budget, so the smallest was
+    /// emitted and the budget could not be honoured.
+    pub byte_delta: i64,
+    /// `true` when the committed frame fits the budget
+    /// (`actual_bytes ≤ target_bytes`).
+    pub within_budget: bool,
+    /// Number of grid candidates trial-encoded for this frame.
+    pub trials: usize,
+}
+
 impl Default for CinepakEncoder {
     fn default() -> Self {
         Self {
@@ -1353,6 +1388,8 @@ impl Default for CinepakEncoder {
             decoder: crate::decoder::CinepakDecoder::new(),
             cross_frame_persistence: true,
             last_stats: FrameStats::default(),
+            target_frame_bytes: None,
+            last_rate_stats: None,
         }
     }
 }
@@ -1364,13 +1401,19 @@ impl CinepakEncoder {
         Self::default()
     }
 
-    /// Reset all state. The encoder behaves as if it had never seen a
+    /// Reset all per-frame carry-over state (rolling codebooks, prev
+    /// frame, telemetry). The encoder behaves as if it had never seen a
     /// frame — the next call must be [`Self::encode_intra`]. Preserves
-    /// the cross-frame persistence flag.
+    /// the cross-frame persistence flag **and** the target-bitrate /
+    /// per-frame byte budget configuration, so a configured rate-control
+    /// encoder can be re-used across independent sequences without
+    /// re-applying [`Self::with_target_bitrate`].
     pub fn reset(&mut self) {
         let cf = self.cross_frame_persistence;
+        let tgt = self.target_frame_bytes;
         *self = Self::default();
         self.cross_frame_persistence = cf;
+        self.target_frame_bytes = tgt;
     }
 
     /// Toggle round-5 cross-frame codebook persistence (warm-starting
@@ -1386,6 +1429,110 @@ impl CinepakEncoder {
     /// Whether cross-frame codebook persistence is currently enabled.
     pub fn cross_frame_codebook_persistence(&self) -> bool {
         self.cross_frame_persistence
+    }
+
+    /// Round-96 bitrate-target rate control (builder form).
+    ///
+    /// Switches the encoder into **target-bitrate mode**: each subsequent
+    /// [`Self::encode_intra`] / [`Self::encode_inter`] call drives the
+    /// three-axis `(strip_count, rdo_lambda, luma_weight)` RD grid picker
+    /// toward a **per-frame byte budget** of
+    /// `bits_per_second / 8 / fps` bytes, instead of using the caller's
+    /// `EncoderOptions` verbatim.
+    ///
+    /// The per-frame budget is the constant-bitrate slice of one frame's
+    /// worth of the target stream rate. For a 256 kbit/s stream at 15
+    /// fps the budget is `256_000 / 8 / 15 ≈ 2133` bytes per frame.
+    ///
+    /// ## How the budget steers the grid
+    ///
+    /// For each frame the encoder sweeps the same 3×3×3 (deduplicated)
+    /// grid as [`encode_rgb24_round7`] — `strip_count ∈ {1, 2, 4}`,
+    /// `rdo_lambda ∈ {0.0, 2.5, opts.rdo_lambda}`, `luma_weight ∈
+    /// {opts.luma_weight, 4, 8}` — but the **selection rule changes**:
+    /// rather than minimising the Lagrangian `D + λ·R`, the picker keeps
+    /// the candidate with the **lowest Y-channel SSE whose encoded size
+    /// is `≤ budget`** (best quality that fits). When *no* candidate
+    /// fits (even the smallest grid point overshoots) it commits the
+    /// **smallest** candidate and reports a positive
+    /// [`RateStats::byte_delta`] — the API never errors on overshoot,
+    /// mirroring the ICER `with_byte_budget` contract.
+    ///
+    /// Because the grid only spans a finite quality range, very small
+    /// budgets on large frames can be unsatisfiable; the smallest grid
+    /// point (highest `rdo_lambda`, most V1 macroblocks) is the floor.
+    /// Inspect [`Self::last_rate_stats`] after each frame to confirm
+    /// adherence.
+    ///
+    /// The grid candidates inherit the rest of the caller's `opts`
+    /// (LBG passes, Lloyd refinement, PCL polish, k-means++ seeding,
+    /// skip threshold) and the encoder's cross-frame persistence + prev
+    /// frame state, so inter frames still skip and selectively-update
+    /// against the committed previous frame.
+    ///
+    /// `fps` is clamped to `≥ 1.0`; `bits_per_second` of `0` yields a
+    /// budget of `0` (every frame overshoots, smallest grid point
+    /// always chosen). Pass `f64` fps to support fractional rates like
+    /// 23.976.
+    ///
+    /// Call with the resulting budget recoverable via
+    /// [`Self::target_frame_bytes`]. Use [`Self::clear_target_bitrate`]
+    /// (or construct a fresh encoder) to return to quality-controlled
+    /// mode.
+    #[must_use]
+    pub fn with_target_bitrate(mut self, bits_per_second: u64, fps: f64) -> Self {
+        self.set_target_bitrate(bits_per_second, fps);
+        self
+    }
+
+    /// In-place form of [`Self::with_target_bitrate`].
+    pub fn set_target_bitrate(&mut self, bits_per_second: u64, fps: f64) {
+        let fps = if fps.is_finite() { fps.max(1.0) } else { 1.0 };
+        // bytes/frame = (bits/s) / 8 / (frames/s). Round to nearest.
+        let bytes = ((bits_per_second as f64) / 8.0 / fps).round();
+        let bytes = if bytes.is_finite() && bytes >= 0.0 {
+            bytes as usize
+        } else {
+            0
+        };
+        self.target_frame_bytes = Some(bytes);
+    }
+
+    /// Round-96 builder: set the per-frame byte budget directly (instead
+    /// of deriving it from a bitrate + fps pair). Equivalent to
+    /// [`Self::with_target_bitrate`] but the caller supplies the
+    /// bytes-per-frame figure. Useful when the budget comes from a
+    /// container's per-frame allowance rather than a constant bitrate.
+    #[must_use]
+    pub fn with_target_frame_bytes(mut self, bytes_per_frame: usize) -> Self {
+        self.target_frame_bytes = Some(bytes_per_frame);
+        self
+    }
+
+    /// In-place form of [`Self::with_target_frame_bytes`].
+    pub fn set_target_frame_bytes(&mut self, bytes_per_frame: usize) {
+        self.target_frame_bytes = Some(bytes_per_frame);
+    }
+
+    /// The per-frame byte budget currently in effect, or `None` when the
+    /// encoder is in quality-controlled mode.
+    pub fn target_frame_bytes(&self) -> Option<usize> {
+        self.target_frame_bytes
+    }
+
+    /// Disable target-bitrate mode; subsequent frames use the caller's
+    /// `EncoderOptions` verbatim (legacy quality-controlled behaviour).
+    pub fn clear_target_bitrate(&mut self) {
+        self.target_frame_bytes = None;
+        self.last_rate_stats = None;
+    }
+
+    /// Round-96 telemetry: outcome of the most recent budget-driven
+    /// frame, or `None` when the encoder is not in target-bitrate mode
+    /// (or no frame has been encoded yet in that mode). See
+    /// [`RateStats`] for the per-field semantics.
+    pub fn last_rate_stats(&self) -> Option<RateStats> {
+        self.last_rate_stats
     }
 
     /// Round-7 telemetry: per-frame counters accumulated during the
@@ -1404,6 +1551,14 @@ impl CinepakEncoder {
     /// rolling codebook state (intra strips always emit full-replace
     /// codebook chunks anyway, but this also clears any stale
     /// selective-update reference).
+    ///
+    /// When the encoder is in **target-bitrate mode** (configured via
+    /// [`Self::with_target_bitrate`] / [`Self::with_target_frame_bytes`])
+    /// the `opts` argument is treated as a *base*: the three-axis RD grid
+    /// is swept around it and the highest-quality candidate that fits the
+    /// per-frame byte budget is committed. See
+    /// [`Self::with_target_bitrate`] for the selection rule, and
+    /// [`Self::last_rate_stats`] for the per-frame adherence telemetry.
     pub fn encode_intra(
         &mut self,
         rgb: &[u8],
@@ -1414,7 +1569,23 @@ impl CinepakEncoder {
         validate_dims(width, height)?;
         validate_opts(&opts)?;
         validate_input_size(rgb, width, height, PixelMode::Yuv12)?;
+        if self.target_frame_bytes.is_some() {
+            return self.encode_budget_frame(rgb, width, height, opts, true);
+        }
+        self.encode_intra_one(rgb, width, height, opts)
+    }
 
+    /// Quality-controlled intra encode worker: commits the frame coded
+    /// with exactly `opts` to `self`'s rolling/prev state and returns the
+    /// bytes. This is the legacy [`Self::encode_intra`] body; the
+    /// budget-driven path calls it once per grid trial.
+    fn encode_intra_one(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
         let mb_rows = (height / 4) as usize;
         let strips = plan_strips(mb_rows, opts.strip_count as usize);
         let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
@@ -1444,6 +1615,11 @@ impl CinepakEncoder {
     ///
     /// Returns an error if no prior frame has been emitted (the first
     /// call must be [`Self::encode_intra`]).
+    ///
+    /// When the encoder is in **target-bitrate mode** the three-axis RD
+    /// grid is swept around `opts` per frame and the highest-quality
+    /// candidate that fits the per-frame byte budget is committed; see
+    /// [`Self::with_target_bitrate`].
     pub fn encode_inter(
         &mut self,
         rgb: &[u8],
@@ -1464,7 +1640,24 @@ impl CinepakEncoder {
                 prev.width, prev.height
             )));
         }
+        if self.target_frame_bytes.is_some() {
+            return self.encode_budget_frame(rgb, width, height, opts, false);
+        }
+        self.encode_inter_one(rgb, width, height, opts)
+    }
 
+    /// Quality-controlled inter encode worker: commits the frame coded
+    /// with exactly `opts` to `self`'s rolling/prev state and returns the
+    /// bytes. This is the legacy [`Self::encode_inter`] body; the
+    /// budget-driven path calls it once per grid trial. The caller has
+    /// already validated dims/opts and confirmed a prev frame exists.
+    fn encode_inter_one(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
         let mb_rows = (height / 4) as usize;
         let strips = plan_strips(mb_rows, opts.strip_count as usize);
         let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
@@ -1516,6 +1709,233 @@ impl CinepakEncoder {
         self.prev_frame = Some(f);
         Ok(bytes)
     }
+
+    /// Snapshot the per-frame carry-over state (rolling codebooks, prev
+    /// frame, internal decoder, telemetry) so a budget grid sweep can
+    /// trial-encode each candidate from the *same* starting point and
+    /// restore between trials. Excludes the rate-control configuration
+    /// (budget / persistence flag), which the sweep never mutates.
+    fn snapshot_state(&self) -> EncoderSnapshot {
+        EncoderSnapshot {
+            rolling: self.rolling.clone(),
+            prev_frame: self.prev_frame.clone(),
+            decoder: self.decoder.clone(),
+            last_stats: self.last_stats,
+        }
+    }
+
+    /// Restore a [`Self::snapshot_state`] result.
+    fn restore_state(&mut self, snap: EncoderSnapshot) {
+        self.rolling = snap.rolling;
+        self.prev_frame = snap.prev_frame;
+        self.decoder = snap.decoder;
+        self.last_stats = snap.last_stats;
+    }
+
+    /// Round-96 budget-driven frame encode. Sweeps the three-axis
+    /// `(strip_count, rdo_lambda, luma_weight)` RD grid around `base`,
+    /// trial-encodes each candidate against a snapshot of the encoder's
+    /// current carry-over state, and commits the highest-quality
+    /// candidate (lowest Y-channel SSE) whose encoded size fits the
+    /// per-frame byte budget. When no candidate fits, commits the
+    /// smallest candidate and reports the overshoot via
+    /// [`RateStats::byte_delta`] — never errors on overshoot.
+    ///
+    /// `intra` selects the intra (`true`) or inter (`false`) worker for
+    /// each trial. Both validations have already run in the public entry.
+    fn encode_budget_frame(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        base: EncoderOptions,
+        intra: bool,
+    ) -> Result<Vec<u8>> {
+        let budget = self.target_frame_bytes.unwrap_or(usize::MAX);
+        let candidates = budget_grid_candidates(base);
+        // Snapshot once; every trial restores back to this point so the
+        // grid candidates are scored from identical state.
+        let snap = self.snapshot_state();
+
+        // Track, in a single pass:
+        //   - best_fit: lowest Y-SSE candidate whose bytes ≤ budget.
+        //   - smallest: smallest-byte candidate overall (overshoot floor).
+        let mut best_fit: Option<(f64, usize, EncoderOptions)> = None;
+        let mut smallest: Option<(usize, EncoderOptions)> = None;
+        let mut trials = 0usize;
+
+        for opts in &candidates {
+            self.restore_state(snap.clone());
+            let bytes = if intra {
+                self.encode_intra_one(rgb, width, height, *opts)
+            } else {
+                self.encode_inter_one(rgb, width, height, *opts)
+            };
+            let bytes = match bytes {
+                Ok(b) => b,
+                // A candidate combination may be invalid for this frame
+                // (e.g. strip_count clamps the same as another); skip it
+                // rather than abort the whole frame.
+                Err(_) => continue,
+            };
+            trials += 1;
+            let len = bytes.len();
+            // Smallest tracker (used only when nothing fits).
+            let take_small = match &smallest {
+                None => true,
+                Some((s_len, _)) => len < *s_len,
+            };
+            if take_small {
+                smallest = Some((len, *opts));
+            }
+            // Best-fit tracker: only candidates within budget compete on
+            // quality (Y-SSE). Tiebreak toward smaller wire size.
+            if len <= budget {
+                // Decode the candidate against a clone of the
+                // pre-frame decoder state (held in the snapshot) so an
+                // inter frame's skip / selective-update MBs resolve
+                // against the correct previous reconstruction — a fresh
+                // decoder would reject `0x3100` skips with no prev frame.
+                let mut trial_dec = snap.decoder.clone();
+                let y_sse = decode_y_sse(&mut trial_dec, &bytes, rgb, width, height)?;
+                let take = match &best_fit {
+                    None => true,
+                    Some((b_sse, b_len, _)) => y_sse < *b_sse || (y_sse == *b_sse && len < *b_len),
+                };
+                if take {
+                    best_fit = Some((y_sse, len, *opts));
+                }
+            }
+        }
+
+        // Pick the winner: best fit if any candidate fit, else smallest.
+        let (winning_opts, within_budget) = match (&best_fit, &smallest) {
+            (Some((_, _, o)), _) => (*o, true),
+            (None, Some((_, o))) => (*o, false),
+            (None, None) => {
+                // Defensive: no candidate succeeded at all. Restore and
+                // fall back to the base opts via the plain worker so the
+                // caller still gets a frame (or a real error from it).
+                self.restore_state(snap);
+                return if intra {
+                    self.encode_intra_one(rgb, width, height, base)
+                } else {
+                    self.encode_inter_one(rgb, width, height, base)
+                };
+            }
+        };
+
+        // Commit: replay the winning candidate from the snapshot so
+        // self's carry-over state matches the emitted bytes exactly.
+        self.restore_state(snap);
+        let bytes = if intra {
+            self.encode_intra_one(rgb, width, height, winning_opts)?
+        } else {
+            self.encode_inter_one(rgb, width, height, winning_opts)?
+        };
+        let actual = bytes.len();
+        self.last_rate_stats = Some(RateStats {
+            target_bytes: budget,
+            actual_bytes: actual,
+            byte_delta: actual as i64 - budget as i64,
+            within_budget,
+            trials,
+        });
+        Ok(bytes)
+    }
+}
+
+/// Decode `bytes` through `dec` (which must hold the correct pre-frame
+/// carry-over state for an inter frame) and return the BT.601 Y-channel
+/// SSE between the decoded frame and the source `rgb`. Used by the
+/// round-96 budget grid sweep to rank candidates that fit the byte
+/// budget by quality.
+fn decode_y_sse(
+    dec: &mut crate::decoder::CinepakDecoder,
+    bytes: &[u8],
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<f64> {
+    let frame = dec.decode_frame(bytes, None)?;
+    let stride = frame.stride();
+    let pixels = frame.pixels();
+    let mut sum_sq: f64 = 0.0;
+    for r in 0..height as usize {
+        let off_dec = r * stride;
+        let off_src = r * (width as usize) * 3;
+        for c in 0..(width as usize) {
+            let r_a = rgb[off_src + c * 3] as f64;
+            let g_a = rgb[off_src + c * 3 + 1] as f64;
+            let b_a = rgb[off_src + c * 3 + 2] as f64;
+            let r_b = pixels[off_dec + c * 3] as f64;
+            let g_b = pixels[off_dec + c * 3 + 1] as f64;
+            let b_b = pixels[off_dec + c * 3 + 2] as f64;
+            let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
+            let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
+            let d = ya - yb;
+            sum_sq += d * d;
+        }
+    }
+    Ok(sum_sq)
+}
+
+/// Snapshot of a [`CinepakEncoder`]'s per-frame carry-over state for the
+/// round-96 budget grid sweep (trial-and-restore). Does not capture the
+/// rate-control configuration (budget / persistence) — only the state a
+/// trial encode mutates.
+#[derive(Clone)]
+struct EncoderSnapshot {
+    rolling: RollingCodebooks,
+    prev_frame: Option<CinepakFrame>,
+    decoder: crate::decoder::CinepakDecoder,
+    last_stats: FrameStats,
+}
+
+/// Build the round-96 budget grid candidate list around `base`: the
+/// same deduplicated 3×3×3 `(strip_count, rdo_lambda, luma_weight)`
+/// cross-product the round-7 picker sweeps, expressed as concrete
+/// [`EncoderOptions`] (the rest of the fields inherited from `base`).
+///
+/// Candidates are ordered cheapest-first within each strip count so the
+/// smallest-byte floor (the overshoot fallback) tends to appear early —
+/// high `rdo_lambda` (more V1 macroblocks) and low strip count produce
+/// the smallest frames.
+fn budget_grid_candidates(base: EncoderOptions) -> Vec<EncoderOptions> {
+    let strip_candidates = [1u16, 2, 4];
+    let lambda_seed: [Option<f32>; 3] = [
+        Some(base.rdo_lambda.unwrap_or(5.0_f32)),
+        Some(2.5_f32),
+        Some(0.0_f32),
+    ];
+    let mut lambdas: Vec<Option<f32>> = Vec::with_capacity(3);
+    for &lam in &lambda_seed {
+        if !lambdas.contains(&lam) {
+            lambdas.push(lam);
+        }
+    }
+    let luma_seed: [u8; 3] = [base.luma_weight.max(1), 4, 8];
+    let mut lumas: Vec<u8> = Vec::with_capacity(3);
+    for &lw in &luma_seed {
+        if !lumas.contains(&lw) {
+            lumas.push(lw);
+        }
+    }
+    let mut out: Vec<EncoderOptions> =
+        Vec::with_capacity(strip_candidates.len() * lambdas.len() * lumas.len());
+    for &strip_count in &strip_candidates {
+        for &rdo_lambda in &lambdas {
+            for &luma_weight in &lumas {
+                out.push(EncoderOptions {
+                    strip_count,
+                    rdo_lambda,
+                    luma_weight,
+                    ..base
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Encode an 8-bit grayscale intra frame from packed `Gray8` input

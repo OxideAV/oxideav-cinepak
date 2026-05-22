@@ -92,7 +92,7 @@ impl DeviantConfig {
 /// previous strip (for inheritance across strips and frames) and the
 /// previous frame's reconstructed pixel buffer (for `0x3100` skip
 /// macroblocks).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CinepakDecoder {
     /// V4 codebook from the previous strip (any frame).
     prev_v4: Option<Codebook>,

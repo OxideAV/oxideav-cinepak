@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -247,6 +247,31 @@ unconstrained 6418 B) budgets of 6418 / 4813 / 3209 B land at 95.8 % /
 adherence across an intra+inter sequence, shrink-vs-unconstrained,
 impossible-budget overshoot, size monotonicity, reset/clear semantics,
 and fractional/degenerate fps arithmetic.
+Round 101 (grayscale RD-grid picker) added
+**`encode_gray8_best_rd_grid` + `encode_gray8_round7`** (Lever N) — the
+grayscale analog of the 12-bit-YUV frame-level RD-grid picker the colour
+path picked up in rounds 47 / 6 / 7. `encode_gray8` only ever emitted a
+single frame at the caller's `opts.strip_count` / `opts.rdo_lambda`,
+while the colour path could trial-encode several `(strip_count,
+rdo_lambda, luma_weight)` operating points and keep the lowest-cost one.
+The new picker trial-encodes every `(strip_count, rdo_lambda)`
+combination (default `[1, 2, 4]` × `[Some(0.0), Some(2.5),
+opts.rdo_lambda]`, deduped — ≤ 9 trials), self-decodes each, and keeps
+the bitstream minimising **direct-luma SSE per pixel** plus the
+Lagrangian byte cost (`opts.rdo_lambda · R/N`). On grayscale the 8-bit
+luminance *is* the Y channel, so no BT.601 weighting is needed; there is
+deliberately **no `luma_weight` axis** because for `Gray8` codebook
+entries `entry_distance` scales all four Y dims by `luma_weight` — a
+uniform positive scale that leaves every nearest-neighbour / clustering
+decision invariant. On the 64×64 grayscale gradient at q=50 the picker
+lifts PSNR from the fixed default's **45.01 dB to 49.56 dB (+4.55 dB,
++108 B)** by selecting a higher strip count whose per-band V4 codebooks
+localise the luminance ramp; on the 320×240 gradient **+5.16 dB** (44.84
+→ 50.00 dB, larger wire as the picker chose 4 strips); on LCG-noise
+**+0.88 dB**; on a 128×96 gradient the default was already optimal (no
+change). 7 new tests cover conformance, the headline gain, no-regression
+vs the fixed default across three sizes, noise handling, empty-candidate
+rejection, and pure-distortion (`rdo_lambda = None`) ranking.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
@@ -490,6 +515,24 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   cold-start. Has no effect on the warm-start path (inter strips
   with cross-frame seed); cross-frame slot identity continues to
   rely on `lloyd_max_iter` Lloyd refinement of the prior codebook.
+- `encode_gray8_best_rd_grid` / `encode_gray8_round7` (round 101) —
+  **grayscale RD-grid frame-level picker** (Lever N), the `Gray8`
+  analog of `encode_rgb24_best_rd_grid` / `encode_rgb24_round7`.
+  `encode_gray8` always emitted a single frame at the caller's
+  `opts.strip_count` / `opts.rdo_lambda`; this picker trial-encodes
+  every `(strip_count, rdo_lambda)` from `strip_candidates ×
+  lambda_candidates` (default `[1, 2, 4]` × `[Some(0.0), Some(2.5),
+  opts.rdo_lambda]`, deduped — ≤ 9 trials), self-decodes each, and
+  keeps the bitstream minimising **direct-luma SSE per pixel** plus
+  the Lagrangian byte cost (`opts.rdo_lambda · R/N`). No `luma_weight`
+  axis: for `Gray8` entries the distance metric scales all four Y dims
+  by `luma_weight`, a uniform positive scale that leaves every
+  nearest-neighbour / clustering decision invariant — sweeping it would
+  only waste trials. On the 64×64 grayscale gradient at q=50: **45.01
+  → 49.56 dB (+4.55 dB, +108 B)**; 320×240 gradient +5.16 dB (44.84 →
+  50.00 dB, larger wire); LCG-noise +0.88 dB; 128×96 gradient unchanged
+  (default already optimal). Intra-only, stateless. `rdo_lambda = None`
+  gives pure-distortion (smallest-error) ranking.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

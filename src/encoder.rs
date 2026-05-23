@@ -1944,6 +1944,142 @@ pub fn encode_gray8(gray: &[u8], width: u32, height: u32, opts: EncoderOptions) 
     encode_intra_frame(gray, width, height, PixelMode::Gray8, opts)
 }
 
+/// Round-101 grayscale RD-grid picker (Lever N).
+///
+/// The grayscale encoder ([`encode_gray8`]) emits a single frame at the
+/// caller's `opts.strip_count` / `opts.rdo_lambda` — it never got the
+/// frame-level **RD-grid picker** the 12-bit-YUV path picked up in
+/// rounds 47 / 6 / 7 ([`encode_rgb24_best_strips`] /
+/// [`encode_rgb24_best_rd_grid`] / [`encode_rgb24_best_rd_grid_3axis`]).
+/// On grayscale content the optimal strip count and per-MB
+/// Lagrangian `rdo_lambda` are just as content-dependent as on colour
+/// content (a smooth gradient wants more strips so each band's V4
+/// codebook localises; flat content wants a single strip + high lambda
+/// to route most MBs to the 1-byte V1 index). This picker closes that
+/// gap.
+///
+/// It trial-encodes the input at every `(strip_count, rdo_lambda)`
+/// combination from the `strip_candidates` × `lambda_candidates`
+/// cross-product, self-decodes each candidate, and returns the
+/// bitstream minimising the Lagrangian cost `D + scoring_lambda · R/N`,
+/// where `D` is the **direct-luma SSE per pixel** (grayscale decode is
+/// the reconstructed Y plane, so no BT.601 weighting is needed — the
+/// 8-bit luminance *is* the Y channel) and `scoring_lambda =
+/// opts.rdo_lambda.unwrap_or(0.0)`. Ties break toward the smaller wire
+/// size.
+///
+/// There is **no `luma_weight` axis** (the round-7 colour picker's
+/// third axis): for `Gray8` codebook entries `entry_distance` sums only
+/// the four Y dimensions scaled by `luma_weight`, so the weight is a
+/// uniform positive scale of the whole metric — it leaves every
+/// nearest-neighbour / clustering decision invariant. Sweeping it would
+/// only waste trial encodes on byte-identical results.
+///
+/// Returns an error if either candidate list is empty. Cost is
+/// `|strip_candidates| × |lambda_candidates|` self-decoding trial
+/// encodes; intra-only and stateless.
+pub fn encode_gray8_best_rd_grid(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    opts: EncoderOptions,
+    strip_candidates: &[u16],
+    lambda_candidates: &[Option<f32>],
+) -> Result<Vec<u8>> {
+    if strip_candidates.is_empty() {
+        return Err(CinepakError::other(
+            "encode_gray8_best_rd_grid: strip_candidates must not be empty",
+        ));
+    }
+    if lambda_candidates.is_empty() {
+        return Err(CinepakError::other(
+            "encode_gray8_best_rd_grid: lambda_candidates must not be empty",
+        ));
+    }
+    // Scoring lambda comes from `opts.rdo_lambda` (Lagrangian cost
+    // ranking is independent of the per-MB RDO lambda chosen for the
+    // trial encode). `None` falls back to pure-distortion ranking.
+    let scoring_lambda = opts.rdo_lambda.unwrap_or(0.0) as f64;
+    let n_pixels = (width as usize) * (height as usize);
+    let mut best: Option<(f64, Vec<u8>)> = None;
+    for &strip_count in strip_candidates {
+        for &per_mb_lambda in lambda_candidates {
+            let trial_opts = EncoderOptions {
+                strip_count,
+                rdo_lambda: per_mb_lambda,
+                ..opts
+            };
+            let bytes = encode_gray8(gray, width, height, trial_opts)?;
+            let mut dec = crate::decoder::CinepakDecoder::new();
+            let frame = dec.decode_frame(&bytes, None)?;
+            if frame.pixel_format != CinepakPixelFormat::Gray8 {
+                return Err(CinepakError::other(
+                    "encode_gray8_best_rd_grid: trial decode was not Gray8",
+                ));
+            }
+            let stride = frame.stride();
+            let pixels = frame.pixels();
+            // Direct-luma SSE per pixel — the Gray8 plane is the Y
+            // channel, one byte per pixel.
+            let mut sum_sq: f64 = 0.0;
+            for r in 0..height as usize {
+                let off_dec = r * stride;
+                let off_src = r * (width as usize);
+                for c in 0..(width as usize) {
+                    let d = pixels[off_dec + c] as f64 - gray[off_src + c] as f64;
+                    sum_sq += d * d;
+                }
+            }
+            let d_per_pixel = sum_sq / n_pixels as f64;
+            let r_bytes = bytes.len() as f64;
+            let cost = d_per_pixel + scoring_lambda * r_bytes / n_pixels as f64;
+            let better = match &best {
+                None => true,
+                Some((best_cost, best_bytes)) => {
+                    cost < *best_cost || (cost == *best_cost && r_bytes < best_bytes.len() as f64)
+                }
+            };
+            if better {
+                best = Some((cost, bytes));
+            }
+        }
+    }
+    Ok(best
+        .expect("at least one (strips, lambda) trial processed")
+        .1)
+}
+
+/// Round-101 convenience wrapper for [`encode_gray8_best_rd_grid`] with
+/// the default `[1, 2, 4]` × `[Some(0.0), Some(2.5), opts.rdo_lambda]`
+/// (deduped) grid — ≤ 9 trial encodes per frame. The grayscale analog
+/// of [`encode_rgb24_round7`] (minus the no-op `luma_weight` axis).
+///
+/// Picks the encoding minimising direct-luma SSE per pixel plus the
+/// Lagrangian byte cost (`opts.rdo_lambda · R/N`), aligning the picker's
+/// optimisation target with PSNR (which on grayscale *is* PSNR_Y). Set
+/// `opts.rdo_lambda = None` for pure-distortion (smallest-error) ranking
+/// regardless of wire size.
+pub fn encode_gray8_round7(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    opts: EncoderOptions,
+) -> Result<Vec<u8>> {
+    let strip_candidates = [1u16, 2, 4];
+    let lambda_seed: [Option<f32>; 3] = [
+        Some(0.0_f32),
+        Some(2.5_f32),
+        Some(opts.rdo_lambda.unwrap_or(5.0_f32)),
+    ];
+    let mut lambdas: Vec<Option<f32>> = Vec::with_capacity(3);
+    for &lam in &lambda_seed {
+        if !lambdas.contains(&lam) {
+            lambdas.push(lam);
+        }
+    }
+    encode_gray8_best_rd_grid(gray, width, height, opts, &strip_candidates, &lambdas)
+}
+
 /// Two-pass rate control wrapping a [`CinepakEncoder`] (round 5).
 ///
 /// Pass 1 ([`Self::stats_pass`]): drives the encoder at a fixed

@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 101 (grayscale RD-grid picker): **`encode_gray8_best_rd_grid`
+  + `encode_gray8_round7`** (Lever N) — the `Gray8` analog of the
+  12-bit-YUV frame-level RD-grid picker from rounds 47 / 6 / 7. The
+  grayscale encoder previously only emitted a single frame at the
+  caller's `opts.strip_count` / `opts.rdo_lambda`; the new picker
+  trial-encodes every `(strip_count, rdo_lambda)` combination (default
+  `[1, 2, 4]` × `[Some(0.0), Some(2.5), opts.rdo_lambda]`, deduped —
+  ≤ 9 trials), self-decodes each, and keeps the bitstream minimising
+  direct-luma SSE per pixel plus the Lagrangian byte cost
+  (`opts.rdo_lambda · R/N`). On grayscale the 8-bit luminance is the Y
+  channel, so distortion is measured directly with no BT.601 weighting;
+  there is deliberately no `luma_weight` axis because for `Gray8`
+  codebook entries the distance metric scales all four Y dims by
+  `luma_weight` (a uniform positive scale that leaves every
+  nearest-neighbour / clustering decision invariant). Measured at q=50:
+  64×64 gradient **45.01 → 49.56 dB (+4.55 dB, +108 B)**; 320×240
+  gradient +5.16 dB (44.84 → 50.00 dB, larger wire); LCG-noise +0.88 dB;
+  128×96 gradient unchanged (default already optimal). Intra-only and
+  stateless; `rdo_lambda = None` gives pure-distortion ranking. 7 new
+  tests in `tests/r101_gray_picker.rs`.
+
 - Round 96 (encoder bitrate-target rate control): **per-frame byte-budget
   mode on `CinepakEncoder`**
   (`CinepakEncoder::with_target_bitrate(bits_per_second, fps)` +

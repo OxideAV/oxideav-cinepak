@@ -239,6 +239,17 @@ impl CinepakDecoder {
             let mut v4 = self.prev_v4.clone().unwrap_or_default();
             let mut v1 = self.prev_v1.clone().unwrap_or_default();
 
+            // Mode hint for chunk-omission strips: prefer the mode of the
+            // codebook the decoder already holds (set by a prior strip of
+            // this frame, falling back to the previous frame's format).
+            let prev_mode_hint = match frame_mode {
+                Some(m) => Some(m),
+                None => self.prev_frame.as_ref().map(|p| match p.pixel_format {
+                    CinepakPixelFormat::Gray8 => PixelMode::Gray8,
+                    CinepakPixelFormat::Rgb24 => PixelMode::Yuv12,
+                }),
+            };
+
             let (mbs, strip_mode) = decode_strip_chunks(
                 strip_payload,
                 &mut v4,
@@ -246,6 +257,7 @@ impl CinepakDecoder {
                 strip_hdr_mb_count(&strip_hdr, sx1 - sx0),
                 strip_hdr.raw.is_intra(),
                 deviant.map(|d| d.tolerate_codebook_pad).unwrap_or(false),
+                prev_mode_hint,
             )?;
 
             // Pixel-mode unification across strips of the same frame.
@@ -322,6 +334,16 @@ fn strip_hdr_mb_count(s: &StripHeader, width: u32) -> usize {
 /// they appear and dispatching the (single) vector chunk to the
 /// vector-chunk decoder. Returns the decoded macroblock list together
 /// with the strip's pixel mode.
+///
+/// `prev_mode_hint` carries the pixel mode of the previous frame (when
+/// one exists), so a strip that omits all codebook chunks — legal on an
+/// inter strip that inherits the prior strip's / frame's codebook (spec
+/// §3.4 of `02-codebooks.md`) — resolves to the mode the inherited
+/// codebook was trained in, rather than blindly defaulting to `Yuv12`.
+/// Without the hint, a fully chunk-omitted grayscale inter frame (all
+/// SKIP macroblocks) would be misclassified as colour and rendered to
+/// `Rgb24`. The hint is only consulted when no codebook chunk in this
+/// strip pins a mode.
 fn decode_strip_chunks(
     payload: &[u8],
     v4: &mut Codebook,
@@ -329,6 +351,7 @@ fn decode_strip_chunks(
     mb_count: usize,
     is_intra: bool,
     tolerate_codebook_pad: bool,
+    prev_mode_hint: Option<PixelMode>,
 ) -> Result<(Vec<Mb>, PixelMode)> {
     let mut p = 0usize;
     let mut mode: Option<PixelMode> = None;
@@ -394,16 +417,17 @@ fn decode_strip_chunks(
 
     let mbs = mbs.ok_or_else(|| CinepakError::invalid("strip carries no vector chunk"))?;
     // If no codebook chunks appeared (legal when both codebooks are
-    // inherited), default to the YUV mode — but if any V1 macroblock
-    // index is referenced we have nothing to validate against here, so
-    // we accept the default and rely on the rendered output staying
-    // sensible (zero-init codebook → black). Spec §3.4 of 02 lays this
-    // out: header-only / omitted codebook chunks reuse the previous
-    // strip's codebook of the same flavour. If we have no previous
-    // codebook (intra strip with no chunks) the entries are undefined
-    // per spec, and rendering uses zero-init which produces black
-    // content.
-    let mode = mode.unwrap_or(PixelMode::Yuv12);
+    // inherited — spec §3.4 of 02: header-only / omitted codebook chunks
+    // reuse the previous strip's / frame's codebook of the same flavour),
+    // the strip's pixel mode isn't pinned by anything in this strip. Fall
+    // back to the previous frame's mode (when known), because an inherited
+    // codebook carries the mode it was trained in. This is what lets a
+    // fully chunk-omitted grayscale inter frame (all SKIP macroblocks)
+    // stay `Gray8` instead of being misclassified as colour. With no
+    // previous-frame hint (the first frame, or a frame with no inheritable
+    // codebook) we keep the historical `Yuv12` default; rendering uses the
+    // zero-init / inherited codebook either way.
+    let mode = mode.or(prev_mode_hint).unwrap_or(PixelMode::Yuv12);
     Ok((mbs, mode))
 }
 

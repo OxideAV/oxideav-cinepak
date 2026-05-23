@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -247,6 +247,32 @@ unconstrained 6418 B) budgets of 6418 / 4813 / 3209 B land at 95.8 % /
 adherence across an intra+inter sequence, shrink-vs-unconstrained,
 impossible-budget overshoot, size monotonicity, reset/clear semantics,
 and fractional/degenerate fps arithmetic.
+Round 104 (inter-frame grayscale encode path) added the **stateful
+grayscale inter-frame encoder** (`CinepakEncoder::encode_intra_gray8`
++ `encode_inter_gray8`) and the **stateless `encode_gray8_inter`** free
+function — the `Gray8` analogs of the `Rgb24` inter-frame pipeline.
+Rounds 2..101 grew the colour encoder a full stateful inter pipeline
+with rolling V4/V1 codebook persistence, selective-update, and
+chunk-omission across frames, while the grayscale path stayed
+intra-only (`encode_gray8` + the round-101 picker re-emitted every
+codebook from scratch every frame). The per-strip encoder was already
+mode-generic — round 104 just threads `PixelMode` through the
+`CinepakEncoder` workers and adds the public entry points (with prev-
+frame format validation so a grayscale inter call after a colour intra
+is rejected with a clear error). Headline on a 32×32 four-quadrant
+grayscale fixture (q=50, intra + five identical inter frames):
+**88.0 % wire savings** on the inter-frame tail (250 B stateful vs
+2090 B stateless full-replace), with the last inter frame entirely
+SKIP — same chunk-omission inheritance win the colour path landed in
+round 4 now applies to grayscale content. The decoder also picked up a
+**chunk-omission mode-hint fallback in `decode_strip_chunks`** so a
+fully chunk-omitted grayscale inter frame (no codebook chunks, all SKIP
+MBs) stays `Gray8` instead of being misclassified as `Rgb24` — without
+the hint the historical `Yuv12` default would have rendered grayscale
+content as colour. Standard frames (with codebook chunks pinning the
+mode) are unaffected. Target-bitrate mode (round 96) is `Yuv12`-scored
+and does not apply to the grayscale path; the grayscale entry points
+use the caller's `opts` verbatim.
 Round 101 (grayscale RD-grid picker) added
 **`encode_gray8_best_rd_grid` + `encode_gray8_round7`** (Lever N) — the
 grayscale analog of the 12-bit-YUV frame-level RD-grid picker the colour
@@ -299,12 +325,29 @@ Decode side, end-to-end:
 - Skip macroblocks copy 4×4 blocks from the previous frame's
   reconstructed buffer.
 
-Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init):
+Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r104-grayscale-inter-frame):
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder with
   configurable codebook entry counts (default 64 V4 + 64 V1, matching
   FFmpeg's `-q:v 10` "default quality" point per spec §4 of
   `05-container-carriage.md`).
+- `encode_gray8_inter` (round 104) — stateless `Gray8` inter-frame
+  encoder, the analog of `encode_rgb24_inter`. Same SKIP-MB / per-pixel
+  luma-MSE decision rule as the colour path; always emits full-replace
+  codebook chunks. Requires a `Gray8` `prev` reconstruction.
+- `CinepakEncoder::encode_intra_gray8` / `encode_inter_gray8`
+  (round 104) — the **stateful** grayscale analogs of `encode_intra` /
+  `encode_inter`. Carry rolling grayscale codebooks across frames with
+  the round-5 cross-frame persistence + round-7 stale-slot reclamation
+  machinery (mode-generic at the per-strip layer); emit `0x3100` SKIP /
+  selective-update / chunk-omission wire patterns. Validate that the
+  prior frame is `Gray8` — `encode_inter_gray8` after a colour intra is
+  rejected with a clear error. On a 32×32 four-quadrant static fixture
+  at q=50 over 5 inter frames: **88.0 % wire savings** (250 B stateful
+  vs 2090 B stateless) with the last inter frame entirely SKIP.
+  Target-bitrate mode (round 96) is `Yuv12`-scored and does not apply
+  to the grayscale path; the grayscale entry points use the caller's
+  `opts` verbatim.
 - `encode_rgb24_inter` — inter-frame encoder. Compares each macroblock
   against the same-position 4×4 block in the previous reconstructed
   frame; macroblocks whose per-pixel MSE is below `skip_threshold` are

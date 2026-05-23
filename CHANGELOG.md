@@ -8,6 +8,91 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 104 (inter-frame grayscale encode path): **stateful and stateless
+  grayscale inter-frame encoders**
+  (`CinepakEncoder::encode_intra_gray8` + `encode_inter_gray8` carrying
+  rolling grayscale codebooks across frames, plus the stateless
+  free-function `encode_gray8_inter` analog of `encode_rgb24_inter`).
+
+  Rounds 2..101 grew the colour (`Rgb24` / 12-bit YUV) encoder a full
+  stateful inter pipeline — `CinepakEncoder::encode_intra` /
+  `encode_inter` carry a rolling V4/V1 codebook across frames and emit
+  `0x3100` SKIP / selective-update / chunk-omission wire patterns — and a
+  stateless `encode_rgb24_inter` helper. The grayscale path
+  (`encode_gray8` + the round-101 picker) stayed **intra-only**: there
+  was no way to carry rolling grayscale codebooks across frames, so a
+  grayscale sequence had to re-emit every codebook from scratch every
+  frame regardless of how static the content was.
+
+  The per-strip encoder (`encode_intra_strip` / `encode_inter_strip` /
+  `encode_inter_strip_with_stats`) was already mode-generic — it takes a
+  `PixelMode` and produces the right `0x24xx`/`0x26xx` (grayscale) or
+  `0x20xx`/`0x22xx` (12-bit YUV) chunk variants. Round 104 threads
+  `PixelMode` through the `CinepakEncoder` intra/inter workers and
+  exposes:
+
+  - `CinepakEncoder::encode_intra_gray8(input, w, h, opts)` — Gray8
+    intra. Resets rolling state and emits full-replace grayscale
+    codebook chunks. The reconstructed frame held internally for the
+    next call's SKIP-MB selection is a `Gray8` frame, so subsequent
+    `encode_inter_gray8` calls resolve SKIP against the grayscale
+    reconstruction.
+  - `CinepakEncoder::encode_inter_gray8(input, w, h, opts)` — Gray8
+    inter. Carries the rolling grayscale codebook forward with the
+    round-5 cross-frame persistence + round-7 stale-slot reclamation
+    machinery (mode-generic at the per-strip layer). Returns an error
+    if no prior frame has been emitted, or if the prior frame was a
+    colour frame (the SKIP comparison and codebook entry layout would
+    mismatch).
+  - `encode_gray8_inter(input, prev, w, h, opts)` — stateless Gray8
+    inter against a Gray8 `prev` reconstruction. Always emits
+    full-replace codebook chunks; use the `CinepakEncoder` pair for
+    selective-update / chunk-omission wire savings.
+
+  Target-bitrate mode (round 96) is `Yuv12`-scored (BT.601 Y-SSE on the
+  RGB picker grid) and does not apply to the grayscale path; the
+  grayscale entry points use the caller's `opts` verbatim regardless of
+  any configured byte budget.
+
+  Headline win (32×32 four-quadrant grayscale fixture, q=50, intra +
+  five identical inter frames):
+
+  | path                                            | inter wire | last-frame SKIPs |
+  | ----------------------------------------------- | ---------- | ---------------- |
+  | stateless `encode_gray8_inter` (full-replace)   | 2090 B     | 64 / 64          |
+  | stateful `encode_inter_gray8` (selective+omit)  | **250 B**  | 64 / 64          |
+
+  **88.0 % wire savings** on the inter-frame tail vs the stateless
+  full-replace path, with the last inter frame entirely SKIP — the same
+  chunk-omission inheritance win the colour path landed in round 4
+  (91.6 % savings on the analogous RGB fixture) now applies to grayscale
+  content too.
+
+- Round 104 (decoder fix exposed by grayscale inter): **mode-hint
+  fallback in `decode_strip_chunks`**. A grayscale inter frame whose
+  strips fully omit their codebook chunks (legal per spec §3.4 of
+  `02-codebooks.md` when the inherited codebook + all-SKIP MBs already
+  represent the output correctly) used to be misclassified as colour
+  because `decode_strip_chunks` defaulted to `Yuv12` when no chunk pinned
+  the mode. The decoder now threads `prev_mode_hint: Option<PixelMode>`
+  derived from `self.prev_frame.pixel_format` (and from the in-frame
+  `frame_mode` once a prior strip has pinned one), and falls back to the
+  hint before the `Yuv12` default. A fully chunk-omitted grayscale inter
+  frame now correctly stays `Gray8`. Standard frames with codebook
+  chunks are unaffected (the in-strip chunk pins the mode and the hint
+  is unused).
+
+- Round 104 tests: `tests/r104_gray_inter.rs` — six tests covering
+  (i) round-trip of an intra+inter grayscale sequence at ≥ 30 dB PSNR,
+  (ii) the **88 % wire-saving headline** vs the stateless path on a
+  static fixture with the last inter frame entirely SKIP, (iii) the
+  stateless `encode_gray8_inter` decoding cleanly under motion at
+  ≥ 28 dB PSNR (observed 45.26 dB on a luma-shifted gradient),
+  (iv) `encode_inter_gray8` rejecting calls before any intra, after
+  `reset()`, and after a colour intra, (v) the colour stateful path
+  unchanged by the mode-threading refactor, (vi) `encode_gray8_inter`
+  rejecting a colour `prev` and dimension mismatches.
+
 - Round 101 (grayscale RD-grid picker): **`encode_gray8_best_rd_grid`
   + `encode_gray8_round7`** (Lever N) — the `Gray8` analog of the
   12-bit-YUV frame-level RD-grid picker from rounds 47 / 6 / 7. The

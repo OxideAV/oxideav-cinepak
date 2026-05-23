@@ -1572,18 +1572,22 @@ impl CinepakEncoder {
         if self.target_frame_bytes.is_some() {
             return self.encode_budget_frame(rgb, width, height, opts, true);
         }
-        self.encode_intra_one(rgb, width, height, opts)
+        self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, opts)
     }
 
     /// Quality-controlled intra encode worker: commits the frame coded
     /// with exactly `opts` to `self`'s rolling/prev state and returns the
     /// bytes. This is the legacy [`Self::encode_intra`] body; the
-    /// budget-driven path calls it once per grid trial.
+    /// budget-driven path calls it once per grid trial. `mode` selects
+    /// the `Yuv12` (RGB-derived) or `Gray8` (luminance-only) pixel
+    /// pipeline so the same stateful carry-over machinery drives both
+    /// the colour and grayscale inter-frame paths.
     fn encode_intra_one(
         &mut self,
         rgb: &[u8],
         width: u32,
         height: u32,
+        mode: PixelMode,
         opts: EncoderOptions,
     ) -> Result<Vec<u8>> {
         let mb_rows = (height / 4) as usize;
@@ -1597,8 +1601,7 @@ impl CinepakEncoder {
         // unless something below changes (it doesn't).
         self.last_stats = FrameStats::default();
         for s in &strips {
-            let bytes =
-                encode_intra_strip(rgb, width, PixelMode::Yuv12, &opts, s, &mut self.rolling)?;
+            let bytes = encode_intra_strip(rgb, width, mode, &opts, s, &mut self.rolling)?;
             frame_strips.push(bytes);
         }
         let bytes = assemble_frame(width, height, &frame_strips)?;
@@ -1643,7 +1646,83 @@ impl CinepakEncoder {
         if self.target_frame_bytes.is_some() {
             return self.encode_budget_frame(rgb, width, height, opts, false);
         }
-        self.encode_inter_one(rgb, width, height, opts)
+        self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, opts)
+    }
+
+    /// Encode an intra frame from packed 8-bit `Gray8` (luminance-only)
+    /// input, starting (or restarting) a **grayscale** inter sequence.
+    ///
+    /// This is the `Gray8` analog of [`Self::encode_intra`]. It resets
+    /// the rolling codebook state and emits full-replace grayscale
+    /// codebook chunks (`0x2400` V4 / `0x2600` V1). The reconstructed
+    /// frame held for the next call's SKIP-MB selection is a `Gray8`
+    /// frame, so the subsequent [`Self::encode_inter_gray8`] calls
+    /// carry the rolling grayscale codebook forward and resolve SKIP /
+    /// selective-update against the grayscale reconstruction.
+    ///
+    /// `input` is `width * height` bytes (one luma sample per pixel).
+    /// Target-bitrate mode (round 96) is `Yuv12`-scored and does not
+    /// apply to the grayscale path; the caller's `opts` are used
+    /// verbatim regardless of any configured byte budget.
+    pub fn encode_intra_gray8(
+        &mut self,
+        input: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
+        validate_dims(width, height)?;
+        validate_opts(&opts)?;
+        validate_input_size(input, width, height, PixelMode::Gray8)?;
+        self.encode_intra_one(input, width, height, PixelMode::Gray8, opts)
+    }
+
+    /// Encode an inter frame from packed 8-bit `Gray8` input, referencing
+    /// the previously-emitted grayscale frame for SKIP-MB selection and
+    /// using the rolling grayscale codebook state for selective-update
+    /// emission.
+    ///
+    /// This is the `Gray8` analog of [`Self::encode_inter`]. The rolling
+    /// codebook (warm-started from the prior frame's grayscale centroids
+    /// per the round-5 cross-frame persistence machinery) and round-7
+    /// slot reclamation carry across grayscale frames exactly as they do
+    /// on the colour path — the per-strip encoder is mode-generic, so the
+    /// same selective-update / chunk-omission wins apply to grayscale.
+    ///
+    /// Returns an error if no prior frame has been emitted, or if the
+    /// prior frame was a colour (`Rgb24`) frame: a grayscale inter frame
+    /// must follow a grayscale frame so the SKIP-MB comparison and the
+    /// rolling codebook entry layout line up. Start a grayscale sequence
+    /// with [`Self::encode_intra_gray8`].
+    pub fn encode_inter_gray8(
+        &mut self,
+        input: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<Vec<u8>> {
+        validate_dims(width, height)?;
+        validate_opts(&opts)?;
+        validate_input_size(input, width, height, PixelMode::Gray8)?;
+
+        let prev = self.prev_frame.as_ref().ok_or_else(|| {
+            CinepakError::other(
+                "encoder: encode_inter_gray8 called before encode_intra_gray8; no prev frame",
+            )
+        })?;
+        if prev.width != width || prev.height != height {
+            return Err(CinepakError::other(format!(
+                "encoder: prev frame dims {}x{} != current {width}x{height}",
+                prev.width, prev.height
+            )));
+        }
+        if prev.pixel_format != CinepakPixelFormat::Gray8 {
+            return Err(CinepakError::other(
+                "encoder: encode_inter_gray8 requires a grayscale prev frame; \
+                 start the sequence with encode_intra_gray8",
+            ));
+        }
+        self.encode_inter_one(input, width, height, PixelMode::Gray8, opts)
     }
 
     /// Quality-controlled inter encode worker: commits the frame coded
@@ -1651,11 +1730,13 @@ impl CinepakEncoder {
     /// bytes. This is the legacy [`Self::encode_inter`] body; the
     /// budget-driven path calls it once per grid trial. The caller has
     /// already validated dims/opts and confirmed a prev frame exists.
+    /// `mode` selects the `Yuv12` or `Gray8` pixel pipeline.
     fn encode_inter_one(
         &mut self,
         rgb: &[u8],
         width: u32,
         height: u32,
+        mode: PixelMode,
         opts: EncoderOptions,
     ) -> Result<Vec<u8>> {
         let mb_rows = (height / 4) as usize;
@@ -1670,7 +1751,7 @@ impl CinepakEncoder {
                 rgb,
                 &prev,
                 width,
-                PixelMode::Yuv12,
+                mode,
                 &opts,
                 s,
                 &mut self.rolling,
@@ -1767,9 +1848,9 @@ impl CinepakEncoder {
         for opts in &candidates {
             self.restore_state(snap.clone());
             let bytes = if intra {
-                self.encode_intra_one(rgb, width, height, *opts)
+                self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, *opts)
             } else {
-                self.encode_inter_one(rgb, width, height, *opts)
+                self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, *opts)
             };
             let bytes = match bytes {
                 Ok(b) => b,
@@ -1818,9 +1899,9 @@ impl CinepakEncoder {
                 // caller still gets a frame (or a real error from it).
                 self.restore_state(snap);
                 return if intra {
-                    self.encode_intra_one(rgb, width, height, base)
+                    self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, base)
                 } else {
-                    self.encode_inter_one(rgb, width, height, base)
+                    self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, base)
                 };
             }
         };
@@ -1829,9 +1910,9 @@ impl CinepakEncoder {
         // self's carry-over state matches the emitted bytes exactly.
         self.restore_state(snap);
         let bytes = if intra {
-            self.encode_intra_one(rgb, width, height, winning_opts)?
+            self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, winning_opts)?
         } else {
-            self.encode_inter_one(rgb, width, height, winning_opts)?
+            self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, winning_opts)?
         };
         let actual = bytes.len();
         self.last_rate_stats = Some(RateStats {
@@ -2646,6 +2727,44 @@ pub fn encode_rgb24_inter(
         ));
     }
     encode_inter_frame(rgb, prev, width, height, PixelMode::Yuv12, opts)
+}
+
+/// Encode an 8-bit grayscale inter frame from packed `Gray8`
+/// (luminance-only) input, referencing `prev` for SKIP-MB selection.
+///
+/// This is the stateless `Gray8` analog of [`encode_rgb24_inter`].
+/// `prev` must be a `Gray8` reconstructed frame of the same dimensions
+/// as `(width, height)` — typically the previous grayscale frame this
+/// crate emitted, decoded back through [`crate::CinepakDecoder`]. Like
+/// the colour stateless path it emits full-replace codebook chunks
+/// (`0x2400` V4 / `0x2600` V1) and a `0x3100` mixed-inter vector chunk;
+/// macroblocks whose per-pixel luma MSE against the same-position `prev`
+/// block is below `opts.skip_threshold` are coded as SKIP.
+///
+/// For cross-frame codebook persistence + selective-update / chunk-
+/// omission wins across a grayscale sequence, use the stateful
+/// [`CinepakEncoder::encode_intra_gray8`] /
+/// [`CinepakEncoder::encode_inter_gray8`] pair instead — the stateless
+/// path always emits full-replace codebooks.
+pub fn encode_gray8_inter(
+    input: &[u8],
+    prev: &CinepakFrame,
+    width: u32,
+    height: u32,
+    opts: EncoderOptions,
+) -> Result<Vec<u8>> {
+    if prev.width != width || prev.height != height {
+        return Err(CinepakError::other(format!(
+            "encoder: prev frame dims {}x{} != current {width}x{height}",
+            prev.width, prev.height
+        )));
+    }
+    if prev.pixel_format != CinepakPixelFormat::Gray8 {
+        return Err(CinepakError::other(
+            "encoder: encode_gray8_inter requires Gray8 prev frame",
+        ));
+    }
+    encode_inter_frame(input, prev, width, height, PixelMode::Gray8, opts)
 }
 
 // ---------------------------------------------------------------------------

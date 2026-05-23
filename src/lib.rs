@@ -58,7 +58,7 @@ pub const CODEC_ID_STR: &str = "cinepak";
 // Standalone, framework-free re-exports.
 pub use decoder::{CinepakDecoder, DeviantConfig};
 pub use encoder::{
-    encode_gray8, encode_gray8_best_rd_grid, encode_gray8_round7, encode_rgb24,
+    encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter, encode_gray8_round7, encode_rgb24,
     encode_rgb24_best_rd_grid, encode_rgb24_best_rd_grid_3axis, encode_rgb24_best_strips,
     encode_rgb24_inter, encode_rgb24_per_strip_rd, encode_rgb24_round6, encode_rgb24_round7,
     encode_rgb24_round8, CinepakEncoder, EncoderOptions, FrameStats, RateControlledFrame,

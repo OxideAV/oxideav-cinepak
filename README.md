@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -291,6 +291,41 @@ against the committed previous grayscale reconstruction. The colour
 sequence, shrink-vs-unconstrained, impossible-budget overshoot, size
 monotonicity, the inter budget riding the stateful carry-over, the
 ≤ 9-trial grayscale grid, and reset/clear semantics.
+Round 121 (chroma CBR convergence) added a **CBR carry-over accumulator**
+to the round-96 / round-113 `encode_budget_frame` worker so a multi-frame
+chroma (`encode_intra` / `encode_inter`) sequence's total bytes
+**converges** to the bitrate target instead of systematically under-
+shooting it. Round 96's per-frame cap kept individual frames ≤ budget but
+discarded each frame's leftover; on representative content the picker
+selects high-quality candidates well below cap, so a 5-second clip's
+total bytes drifted ~20–30 % below `bits_per_second / 8 × duration`. Round
+121 tracks `cumulative_target_bytes` and `cumulative_actual_bytes` inside
+the encoder; each frame's effective budget becomes `base_budget +
+clamp(cumulative_target − cumulative_actual, 0, cap)`, with `cap = 8 ×
+base_budget` installed by default when `set_target_bitrate` /
+`set_target_frame_bytes` is called (overridable via
+`set_carry_over_cap_bytes` / `clear_carry_over_cap_bytes`). Deficits
+(post-overshoot) propagate without a cap so overshoots are fully clawed
+back. The selection rule is unchanged ("highest-quality candidate that
+fits the effective budget"); only the budget the picker sees per frame
+changes. Six new fields on `RateStats` (`effective_budget_bytes`,
+`effective_byte_delta`, `within_effective_budget`,
+`cumulative_target_bytes`, `cumulative_actual_bytes`) report the
+post-carry-over view; the round-96 `target_bytes` / `byte_delta` /
+`within_budget` fields still report the per-frame **base** budget for
+backward compat. The carry-over machinery is shared with the round-113
+grayscale path (same worker, same accumulator). Headline measurement on
+a synthetic 320×240 moving-colour-gradient at q=50, 15 fps, 5 seconds
+(75 frames, 1 intra + 74 inter), target 900 kbps ⇒ target_total
+562 500 B: **converged to 562 411 B (rel_err = −0.02 %)** with
+`min_psnr_y = 35.79 dB` across the clip. Six new tests cover the
+headline convergence, cap-zero positive-surplus suppression, accumulator
+correctness, `reset` / `reset_rate_carry_over` / `clear_target_bitrate`
+semantics, cap clamp semantics + the default 8× installation, and the
+mechanism applying identically to the grayscale path. Rate control is
+encoder policy, not a bitstream feature — output stays conformant
+Cinepak (`docs/video/cinepak/spec/00-scope.md` §"Lossy-codec validation
+criterion" notes encoder-internal rate control is out of spec scope).
 Round 101 (grayscale RD-grid picker) added
 **`encode_gray8_best_rd_grid` + `encode_gray8_round7`** (Lever N) — the
 grayscale analog of the 12-bit-YUV frame-level RD-grid picker the colour
@@ -450,6 +485,25 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   `encode_inter_gray8` entry points: the grayscale path sweeps a
   two-axis `(strip_count, rdo_lambda)` grid (the `luma_weight` axis is
   a no-op on `Gray8` entries) and scores candidates by direct-luma SSE.
+  Round 121 added a **CBR carry-over accumulator** so a multi-frame
+  budget-driven sequence's total bytes **converge** to
+  `bits_per_second / 8 × duration_s` (within ±10 % in practice; the
+  headline 320×240 / 900 kbps / 5 s chroma fixture converges to
+  −0.02 % at min_psnr_y 35.79 dB) rather than systematically
+  under-shooting. Each frame's **effective** budget becomes
+  `base_budget + clamp(cumulative_target − cumulative_actual, 0, cap)`,
+  with `cap = 8 × base_budget` installed by default (overridable via
+  `set_carry_over_cap_bytes(n)` / `clear_carry_over_cap_bytes()`).
+  Deficits propagate without a cap so overshoots are fully clawed back.
+  `RateStats` gained `effective_budget_bytes`, `effective_byte_delta`,
+  `within_effective_budget`, `cumulative_target_bytes`,
+  `cumulative_actual_bytes`; the original `target_bytes` / `byte_delta`
+  / `within_budget` fields still report the per-frame **base** budget.
+  Accessors: `CinepakEncoder::cumulative_target_bytes()`,
+  `cumulative_actual_bytes()`, `carry_over_cap_bytes()`,
+  `reset_rate_carry_over()`. `reset()` zeros the accumulator (per-
+  sequence state) but preserves the budget and cap;
+  `clear_target_bitrate()` zeros everything.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

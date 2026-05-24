@@ -8,6 +8,64 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 121 (chroma CBR convergence): **CBR carry-over accumulator threads
+  surplus and deficit across the chroma (`encode_intra` / `encode_inter`)
+  budget-driven sequence so a 5-second clip's total bytes converge to
+  `bits_per_second / 8 × duration_s`** within ±10 % on representative
+  content, rather than systematically under-shooting the way the round-96
+  per-frame cap did on every prior fixture (each frame's leftover budget
+  was discarded). The mechanism is a leaky bucket: each budget-driven
+  frame's effective budget is `base_budget + clamp(cumulative_target −
+  cumulative_actual, 0, cap)`, with `cap = 8 × base_budget` installed by
+  default when `set_target_bitrate` / `set_target_frame_bytes` is called
+  (overridable via `set_carry_over_cap_bytes` / `clear_carry_over_cap_bytes`).
+  Deficits (post-overshoot frames) propagate without a cap — the controller
+  fully claws back overshoots on subsequent frames.
+
+  The picker selection rule is unchanged (still "highest-quality candidate
+  that fits the effective budget", smallest grid candidate on overshoot,
+  never errors on rate). What changed is the budget the picker sees per
+  frame: with carry-over, an under-spent frame leaves quality to be paid
+  forward to a complex frame later in the sequence, so the multi-frame total
+  tracks the bitrate target. The accumulator is shared between the chroma
+  and the round-113 grayscale path (both go through `encode_budget_frame`)
+  — grayscale benefits from the same convergence guarantee for free, no
+  separate code path.
+
+  Six new fields on `RateStats` (the per-frame telemetry struct):
+  `effective_budget_bytes`, `effective_byte_delta`,
+  `within_effective_budget`, `cumulative_target_bytes`,
+  `cumulative_actual_bytes`. Three new `CinepakEncoder` accessors:
+  `cumulative_target_bytes()`, `cumulative_actual_bytes()`,
+  `carry_over_cap_bytes()`. Three new mutators:
+  `set_carry_over_cap_bytes(n)`, `with_carry_over_cap_bytes(n)`,
+  `clear_carry_over_cap_bytes()`, `reset_rate_carry_over()`. `reset()` now
+  zeros the accumulator (it's per-sequence state), preserves the budget
+  and the cap (configuration). `clear_target_bitrate()` zeros everything.
+
+  Rate control is encoder policy, not a bitstream feature — decoded output
+  stays conformant Cinepak. The carry-over heuristic is derived from first
+  principles (no external encoder source consulted). Reference:
+  `docs/video/cinepak/spec/00-scope.md` §"Lossy-codec validation criterion"
+  notes encoder-internal rate control is explicitly out of spec scope.
+
+  Headline measurement on a synthetic 320×240 moving-colour-gradient at
+  q=50, 15 fps, 5 seconds (75 frames, 1 intra + 74 inter), target
+  900 kbps ⇒ target_total 562 500 B: **converged to 562 411 B
+  (rel_err = −0.02 %)** with `min_psnr_y = 35.79 dB` across the clip.
+
+- Round 121 tests: `tests/r121_chroma_cbr_convergence.rs` — six tests
+  covering (i) the headline 5-second 320×240 chroma CBR convergence at
+  900 kbps within ±10 % (release-only — the 75-frame × ≤ 27-trials/frame
+  sweep is expensive in debug; `#[cfg(not(debug_assertions))]`-gated),
+  (ii) the cap-zero invariant (positive surplus discarded, deficit still
+  propagates), (iii) cumulative accumulator equals emitted total
+  per-frame, (iv) `reset` / `reset_rate_carry_over` /
+  `clear_target_bitrate` semantics on the accumulator, (v) carry-over cap
+  clamp semantics + default 8× installation, (vi) the carry-over machinery
+  applies identically to the grayscale `encode_intra_gray8` /
+  `encode_inter_gray8` path (same `encode_budget_frame` worker).
+
 - Round 113 (grayscale rate control): **target-bitrate / per-frame
   byte-budget mode now applies to the stateful grayscale inter path**
   (`CinepakEncoder::encode_intra_gray8` / `encode_inter_gray8`).

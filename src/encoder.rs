@@ -1332,6 +1332,25 @@ pub struct CinepakEncoder {
     /// Round-96 telemetry: outcome of the most recent budget-driven
     /// frame. `None` when the encoder is not in target-bitrate mode.
     last_rate_stats: Option<RateStats>,
+    /// Round-121 CBR carry-over: cumulative target bytes (`base_budget × N`)
+    /// across all budget-driven frames since the carry-over was last reset.
+    /// Used to pad the per-frame effective budget on frame N by the leftover
+    /// `cumulative_target - cumulative_actual` so under-spent frames pay
+    /// quality forward and the multi-frame total converges to the target
+    /// bitrate. Zero when the encoder is not in target-bitrate mode or no
+    /// frame has been encoded yet.
+    cumulative_target_bytes: u64,
+    /// Round-121 CBR carry-over: cumulative actual encoded bytes across all
+    /// budget-driven frames since the carry-over was last reset.
+    cumulative_actual_bytes: u64,
+    /// Round-121 CBR carry-over cap. When `Some(n)`, the surplus carried
+    /// forward into any single frame is clamped to `n` bytes, preventing a
+    /// long run of under-spends from giving one outlier frame an
+    /// effectively unlimited budget. `None` lets the carry-over grow without
+    /// bound. Default `Some(8 × base_budget)` (set whenever the budget is
+    /// configured) — a small-integer multiple of the base per-frame budget
+    /// is a standard VBV-style ceiling.
+    carry_over_cap_bytes: Option<u64>,
 }
 
 /// Round-7 per-frame telemetry, queried via
@@ -1362,8 +1381,12 @@ pub struct FrameStats {
 /// target-bitrate mode.
 #[derive(Clone, Copy, Debug)]
 pub struct RateStats {
-    /// The per-frame byte budget in effect for the most recent frame
-    /// (`bits_per_second / 8 / fps`, or the directly-set byte budget).
+    /// The per-frame **base** byte budget in effect for the most recent frame
+    /// (`bits_per_second / 8 / fps`, or the directly-set byte budget). This
+    /// is the constant-bitrate slice; round 121 added a separate
+    /// [`Self::effective_budget_bytes`] field that may differ when carry-over
+    /// is non-zero. Most existing assertions reference `target_bytes`; the
+    /// round-121 convergence tests reference `effective_budget_bytes`.
     pub target_bytes: usize,
     /// The encoded size of the frame the picker committed to.
     pub actual_bytes: usize,
@@ -1371,13 +1394,39 @@ pub struct RateStats {
     /// budget (the common case — the picker takes the highest-quality
     /// grid point that still fits). Positive ⇒ overshoot: even the
     /// smallest grid candidate exceeded the budget, so the smallest was
-    /// emitted and the budget could not be honoured.
+    /// emitted and the budget could not be honoured. Round 121: this is
+    /// the delta against the per-frame **base** budget, *not* the effective
+    /// (carry-over-adjusted) budget. See [`Self::effective_byte_delta`] for
+    /// the delta the picker actually saw.
     pub byte_delta: i64,
-    /// `true` when the committed frame fits the budget
-    /// (`actual_bytes ≤ target_bytes`).
+    /// `true` when the committed frame fits the per-frame **base** budget
+    /// (`actual_bytes ≤ target_bytes`). Round 121: see
+    /// [`Self::within_effective_budget`] for the carry-over-adjusted view.
     pub within_budget: bool,
     /// Number of grid candidates trial-encoded for this frame.
     pub trials: usize,
+    /// Round 121: the **effective** per-frame budget the picker actually
+    /// used, after CBR carry-over from prior under/over-spends. Equals
+    /// `target_bytes + max(0, cumulative_target − cumulative_actual_before_this_frame)`
+    /// (clamped to the carry-over cap). Without the carry-over feature this
+    /// equals `target_bytes` for the first frame; subsequent frames may carry
+    /// surplus forward so a 5-second clip's total bytes converge to
+    /// `bits_per_second / 8 × duration_s` even when individual frames under-
+    /// spend the base budget.
+    pub effective_budget_bytes: usize,
+    /// Round 121: signed delta against the effective (carry-over-adjusted)
+    /// budget — `actual_bytes as i64 - effective_budget_bytes as i64`.
+    pub effective_byte_delta: i64,
+    /// Round 121: `true` when the committed frame fits the **effective**
+    /// budget (`actual_bytes ≤ effective_budget_bytes`).
+    pub within_effective_budget: bool,
+    /// Round 121: cumulative target bytes (`base_budget × frame_count`)
+    /// across all budget-driven frames since the carry-over was last reset,
+    /// **after** this frame.
+    pub cumulative_target_bytes: u64,
+    /// Round 121: cumulative actual encoded bytes across all budget-driven
+    /// frames since the carry-over was last reset, **after** this frame.
+    pub cumulative_actual_bytes: u64,
 }
 
 impl Default for CinepakEncoder {
@@ -1390,6 +1439,9 @@ impl Default for CinepakEncoder {
             last_stats: FrameStats::default(),
             target_frame_bytes: None,
             last_rate_stats: None,
+            cumulative_target_bytes: 0,
+            cumulative_actual_bytes: 0,
+            carry_over_cap_bytes: None,
         }
     }
 }
@@ -1408,12 +1460,25 @@ impl CinepakEncoder {
     /// per-frame byte budget configuration, so a configured rate-control
     /// encoder can be re-used across independent sequences without
     /// re-applying [`Self::with_target_bitrate`].
+    ///
+    /// Round 121: also resets the CBR carry-over accumulator (the
+    /// `cumulative_target_bytes` / `cumulative_actual_bytes` tracked across
+    /// budget-driven frames). This is what makes `reset()` a true "new
+    /// sequence" boundary — without zeroing the accumulator, leftover
+    /// surplus from the prior sequence would inflate the first frame of the
+    /// new one. The carry-over cap is preserved (it's a configuration knob,
+    /// not per-sequence state).
     pub fn reset(&mut self) {
         let cf = self.cross_frame_persistence;
         let tgt = self.target_frame_bytes;
+        let cap = self.carry_over_cap_bytes;
         *self = Self::default();
         self.cross_frame_persistence = cf;
         self.target_frame_bytes = tgt;
+        self.carry_over_cap_bytes = cap;
+        // CBR accumulator zeroed by Self::default(); explicit here for clarity.
+        self.cumulative_target_bytes = 0;
+        self.cumulative_actual_bytes = 0;
     }
 
     /// Toggle round-5 cross-frame codebook persistence (warm-starting
@@ -1486,6 +1551,12 @@ impl CinepakEncoder {
     }
 
     /// In-place form of [`Self::with_target_bitrate`].
+    ///
+    /// Round 121: also installs a default CBR carry-over cap of `8 ×
+    /// base_budget` (overridable via [`Self::set_carry_over_cap_bytes`] /
+    /// [`Self::clear_carry_over_cap_bytes`]). The cap prevents a long run of
+    /// under-spent frames from giving one outlier frame an effectively
+    /// unbounded budget — a standard VBV-style ceiling.
     pub fn set_target_bitrate(&mut self, bits_per_second: u64, fps: f64) {
         let fps = if fps.is_finite() { fps.max(1.0) } else { 1.0 };
         // bytes/frame = (bits/s) / 8 / (frames/s). Round to nearest.
@@ -1496,6 +1567,12 @@ impl CinepakEncoder {
             0
         };
         self.target_frame_bytes = Some(bytes);
+        // Reset the CBR accumulator: the prior sequence's surplus / deficit
+        // does not carry into this new bitrate target.
+        self.cumulative_target_bytes = 0;
+        self.cumulative_actual_bytes = 0;
+        // Install a default carry-over cap of 8 × base (saturating).
+        self.carry_over_cap_bytes = Some((bytes as u64).saturating_mul(8));
     }
 
     /// Round-96 builder: set the per-frame byte budget directly (instead
@@ -1505,13 +1582,19 @@ impl CinepakEncoder {
     /// container's per-frame allowance rather than a constant bitrate.
     #[must_use]
     pub fn with_target_frame_bytes(mut self, bytes_per_frame: usize) -> Self {
-        self.target_frame_bytes = Some(bytes_per_frame);
+        self.set_target_frame_bytes(bytes_per_frame);
         self
     }
 
     /// In-place form of [`Self::with_target_frame_bytes`].
+    ///
+    /// Round 121: also resets the CBR carry-over accumulator and installs a
+    /// default carry-over cap of `8 × bytes_per_frame`.
     pub fn set_target_frame_bytes(&mut self, bytes_per_frame: usize) {
         self.target_frame_bytes = Some(bytes_per_frame);
+        self.cumulative_target_bytes = 0;
+        self.cumulative_actual_bytes = 0;
+        self.carry_over_cap_bytes = Some((bytes_per_frame as u64).saturating_mul(8));
     }
 
     /// The per-frame byte budget currently in effect, or `None` when the
@@ -1522,9 +1605,73 @@ impl CinepakEncoder {
 
     /// Disable target-bitrate mode; subsequent frames use the caller's
     /// `EncoderOptions` verbatim (legacy quality-controlled behaviour).
+    ///
+    /// Round 121: also clears the CBR carry-over accumulator and the
+    /// carry-over cap.
     pub fn clear_target_bitrate(&mut self) {
         self.target_frame_bytes = None;
         self.last_rate_stats = None;
+        self.cumulative_target_bytes = 0;
+        self.cumulative_actual_bytes = 0;
+        self.carry_over_cap_bytes = None;
+    }
+
+    /// Round 121: set the CBR carry-over cap explicitly. Caps the surplus
+    /// (cumulative-target − cumulative-actual) the picker is allowed to
+    /// spend on any single frame to `n` bytes, regardless of how much the
+    /// prior sequence under-spent. Lower caps make the rate-control output
+    /// closer to a fixed per-frame CBR slice; higher caps let the
+    /// rate-controller harvest more savings into a single intra refresh.
+    /// Default after [`Self::set_target_bitrate`] /
+    /// [`Self::set_target_frame_bytes`] is `Some(8 × base_budget)`.
+    pub fn set_carry_over_cap_bytes(&mut self, n: u64) {
+        self.carry_over_cap_bytes = Some(n);
+    }
+
+    /// Round 121: builder form of [`Self::set_carry_over_cap_bytes`].
+    #[must_use]
+    pub fn with_carry_over_cap_bytes(mut self, n: u64) -> Self {
+        self.carry_over_cap_bytes = Some(n);
+        self
+    }
+
+    /// Round 121: remove the CBR carry-over cap so under-spent budget can
+    /// accumulate without limit. Useful for short fixtures where the cap
+    /// would otherwise discard convergence-relevant surplus; not recommended
+    /// for long sequences (a long calm stretch followed by a complex one can
+    /// produce an outlier frame that breaks the rate target).
+    pub fn clear_carry_over_cap_bytes(&mut self) {
+        self.carry_over_cap_bytes = None;
+    }
+
+    /// Round 121: the CBR carry-over cap currently in effect, or `None`
+    /// when uncapped (or no budget is configured).
+    pub fn carry_over_cap_bytes(&self) -> Option<u64> {
+        self.carry_over_cap_bytes
+    }
+
+    /// Round 121: cumulative target bytes (`base_budget × frame_count`)
+    /// across all budget-driven frames since the carry-over was last
+    /// reset. Zero when not in target-bitrate mode or no frame has been
+    /// encoded yet.
+    pub fn cumulative_target_bytes(&self) -> u64 {
+        self.cumulative_target_bytes
+    }
+
+    /// Round 121: cumulative actual encoded bytes across all budget-driven
+    /// frames since the carry-over was last reset. Zero when not in
+    /// target-bitrate mode or no frame has been encoded yet.
+    pub fn cumulative_actual_bytes(&self) -> u64 {
+        self.cumulative_actual_bytes
+    }
+
+    /// Round 121: explicit handle to reset just the CBR carry-over
+    /// accumulator (without changing the budget or other carry-over state).
+    /// Useful when chaining sequences that share the same target bitrate
+    /// but want independent convergence boundaries.
+    pub fn reset_rate_carry_over(&mut self) {
+        self.cumulative_target_bytes = 0;
+        self.cumulative_actual_bytes = 0;
     }
 
     /// Round-96 telemetry: outcome of the most recent budget-driven
@@ -1859,7 +2006,40 @@ impl CinepakEncoder {
         intra: bool,
         mode: PixelMode,
     ) -> Result<Vec<u8>> {
-        let budget = self.target_frame_bytes.unwrap_or(usize::MAX);
+        let base_budget = self.target_frame_bytes.unwrap_or(usize::MAX);
+        // Round 121 CBR carry-over: the per-frame base budget represents the
+        // constant-bitrate slice, but the previous frames in this sequence
+        // may have under- or over-spent. The leftover (target - actual) is
+        // added to this frame's budget so the multi-frame total converges to
+        // the target bitrate. Negative leftovers (overshoot) reduce the
+        // effective budget but never below zero (the smallest grid candidate
+        // is the floor regardless).
+        //
+        // The carry-over cap clamps the additive surplus so a long run of
+        // calm content can't give an outlier frame an effectively unbounded
+        // budget. Deficits are not capped — overshoots claw back fully on
+        // subsequent frames.
+        let surplus_signed =
+            self.cumulative_target_bytes as i128 - self.cumulative_actual_bytes as i128;
+        let surplus_clamped = if surplus_signed >= 0 {
+            let cap = self.carry_over_cap_bytes.unwrap_or(u64::MAX);
+            (surplus_signed as u128).min(cap as u128) as i128
+        } else {
+            surplus_signed
+        };
+        let effective_budget: usize = if base_budget == usize::MAX {
+            usize::MAX
+        } else {
+            let eff = base_budget as i128 + surplus_clamped;
+            if eff <= 0 {
+                0
+            } else if eff > usize::MAX as i128 {
+                usize::MAX
+            } else {
+                eff as usize
+            }
+        };
+        let budget = effective_budget;
         let candidates = budget_grid_candidates(base, mode);
         // Snapshot once; every trial restores back to this point so the
         // grid candidates are scored from identical state.
@@ -1942,13 +2122,31 @@ impl CinepakEncoder {
             self.encode_inter_one(rgb, width, height, mode, winning_opts)?
         };
         let actual = bytes.len();
+        // Round 121: advance the CBR accumulator. The per-frame slice the
+        // accumulator credits is `base_budget` (the constant-bitrate target),
+        // NOT `effective_budget` — otherwise the surplus a frame harvested
+        // would be re-spent and the rate-controller would never converge.
+        self.cumulative_target_bytes = self
+            .cumulative_target_bytes
+            .saturating_add(base_budget as u64);
+        self.cumulative_actual_bytes = self.cumulative_actual_bytes.saturating_add(actual as u64);
+        let eff_delta = actual as i64 - effective_budget as i64;
+        let within_effective = actual <= effective_budget;
         self.last_rate_stats = Some(RateStats {
-            target_bytes: budget,
+            target_bytes: base_budget,
             actual_bytes: actual,
-            byte_delta: actual as i64 - budget as i64,
-            within_budget,
+            byte_delta: actual as i64 - base_budget as i64,
+            within_budget: actual <= base_budget,
             trials,
+            effective_budget_bytes: effective_budget,
+            effective_byte_delta: eff_delta,
+            within_effective_budget: within_effective,
+            cumulative_target_bytes: self.cumulative_target_bytes,
+            cumulative_actual_bytes: self.cumulative_actual_bytes,
         });
+        // Quiet "within_budget" unused-when-shadowed warning: the carry-over
+        // path may compute it twice (effective + base). Bind to suppress.
+        let _ = within_budget;
         Ok(bytes)
     }
 }

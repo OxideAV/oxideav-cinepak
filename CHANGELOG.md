@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 113 (grayscale rate control): **target-bitrate / per-frame
+  byte-budget mode now applies to the stateful grayscale inter path**
+  (`CinepakEncoder::encode_intra_gray8` / `encode_inter_gray8`).
+
+  Round 96 added per-frame byte-budget rate control
+  (`with_target_bitrate(bits_per_second, fps)` /
+  `with_target_frame_bytes(n)`) to the colour (`Yuv12`) path: the encoder
+  sweeps an RD grid around the caller's `EncoderOptions` and commits the
+  highest-quality candidate whose encoded size fits a per-frame budget,
+  reporting adherence via `last_rate_stats()` and never erroring on
+  overshoot. That worker (`encode_budget_frame`) was hardcoded to the
+  `Yuv12` pipeline and BT.601 Y-channel SSE scoring, so the round-104
+  grayscale stateful inter path explicitly used the caller's `opts`
+  verbatim regardless of any configured budget — the documented gap
+  "target-bitrate mode is `Yuv12`-scored and does not apply to the
+  grayscale path".
+
+  Round 113 threads `PixelMode` through `encode_budget_frame` (and its
+  `budget_grid_candidates` / candidate-SSE scorer, now `decode_sse`) and
+  routes `encode_intra_gray8` / `encode_inter_gray8` through it when a
+  budget is configured. Two mode-specific behaviours:
+
+  - **Grayscale grid drops the no-op `luma_weight` axis.** For `Gray8`
+    codebook entries the distance metric scales all four Y dims by
+    `luma_weight`, a uniform positive scale that leaves every
+    nearest-neighbour / clustering decision invariant (same rationale as
+    the round-101 grayscale picker), so the grayscale budget grid is a
+    two-axis `(strip_count, rdo_lambda)` cross-product (≤ 9 trials) vs the
+    colour grid's three-axis ≤ 27.
+  - **Direct-luma SSE scoring.** The 8-bit luminance *is* the Y channel,
+    so the candidate ranking uses direct-luma SSE rather than the BT.601
+    Y-channel weighting the `Yuv12` path applies to its RGB decode.
+
+  Inter frames stay budgeted and skip / selectively-update against the
+  committed previous grayscale reconstruction (the budget sweep rides the
+  same snapshot-and-restore carry-over the colour path uses). `reset()`
+  preserves the budget; `clear_target_bitrate()` returns the grayscale
+  entry points to quality-controlled (verbatim-`opts`) behaviour. Rate
+  control is encoder policy, not a bitstream feature — decoded output is
+  conformant Cinepak. The colour `encode_intra` / `encode_inter` budget
+  path is byte-for-byte unchanged (still three-axis, still BT.601-scored).
+
+- Round 113 tests: `tests/r113_gray_rate_control.rs` — seven tests
+  covering (i) generous-budget adherence across an intra+inter grayscale
+  sequence (every frame under cap, stays decodable at > 20 dB PSNR),
+  (ii) moderate-budget shrink vs the unconstrained grayscale encode at the
+  same base quality, (iii) impossible-budget overshoot reporting without
+  erroring, (iv) tighter-budget size monotonicity, (v) the inter budget
+  riding the stateful carry-over on a static fixture (inter tail collapses
+  below the intra keyframe), (vi) the grayscale grid omitting the
+  `luma_weight` axis (≤ 9 trials via `RateStats::trials`), (vii)
+  `reset` preserving the budget + `clear_target_bitrate` disabling it.
+
 - Round 104 (inter-frame grayscale encode path): **stateful and stateless
   grayscale inter-frame encoders**
   (`CinepakEncoder::encode_intra_gray8` + `encode_inter_gray8` carrying

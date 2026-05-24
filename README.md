@@ -270,9 +270,27 @@ fully chunk-omitted grayscale inter frame (no codebook chunks, all SKIP
 MBs) stays `Gray8` instead of being misclassified as `Rgb24` — without
 the hint the historical `Yuv12` default would have rendered grayscale
 content as colour. Standard frames (with codebook chunks pinning the
-mode) are unaffected. Target-bitrate mode (round 96) is `Yuv12`-scored
-and does not apply to the grayscale path; the grayscale entry points
-use the caller's `opts` verbatim.
+mode) are unaffected. Target-bitrate mode (round 96) was `Yuv12`-scored
+and originally did not apply to the grayscale path — round 113 closes
+that gap (see below).
+Round 113 (grayscale rate control) extended the round-96 target-bitrate /
+per-frame byte-budget mode to the **stateful grayscale inter path**
+(`CinepakEncoder::encode_intra_gray8` / `encode_inter_gray8`). The
+round-96 budget worker — which sweeps an RD grid around the caller's
+`opts` and commits the highest-quality candidate that fits the per-frame
+budget, never erroring on overshoot — was hardcoded to the `Yuv12`
+pipeline and BT.601 Y-channel SSE scoring. Round 113 threads `PixelMode`
+through it so the grayscale path sweeps a two-axis `(strip_count,
+rdo_lambda)` grid (≤ 9 trials; the `luma_weight` axis is a no-op on
+`Gray8` entries, dropped per the round-101 rationale) and scores
+candidates by direct-luma SSE (the 8-bit luminance *is* the Y channel).
+Grayscale inter frames stay budgeted and skip / selectively-update
+against the committed previous grayscale reconstruction. The colour
+`encode_intra` / `encode_inter` budget path is byte-for-byte unchanged.
+7 new tests cover budget adherence across an intra+inter grayscale
+sequence, shrink-vs-unconstrained, impossible-budget overshoot, size
+monotonicity, the inter budget riding the stateful carry-over, the
+≤ 9-trial grayscale grid, and reset/clear semantics.
 Round 101 (grayscale RD-grid picker) added
 **`encode_gray8_best_rd_grid` + `encode_gray8_round7`** (Lever N) — the
 grayscale analog of the 12-bit-YUV frame-level RD-grid picker the colour
@@ -345,9 +363,14 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   rejected with a clear error. On a 32×32 four-quadrant static fixture
   at q=50 over 5 inter frames: **88.0 % wire savings** (250 B stateful
   vs 2090 B stateless) with the last inter frame entirely SKIP.
-  Target-bitrate mode (round 96) is `Yuv12`-scored and does not apply
-  to the grayscale path; the grayscale entry points use the caller's
-  `opts` verbatim.
+  Round 113 wired these grayscale entry points into the round-96
+  target-bitrate / per-frame byte-budget mode: when a budget is
+  configured they sweep a two-axis `(strip_count, rdo_lambda)` grid
+  (≤ 9 trials — the `luma_weight` axis is a no-op on `Gray8` entries)
+  and commit the highest-quality candidate scored by direct-luma SSE
+  that fits the budget, with adherence in `last_rate_stats()` and no
+  error on overshoot. In quality-controlled mode (no budget) the
+  caller's `opts` are still used verbatim.
 - `encode_rgb24_inter` — inter-frame encoder. Compares each macroblock
   against the same-position 4×4 block in the previous reconstructed
   frame; macroblocks whose per-pixel MSE is below `skip_threshold` are
@@ -422,7 +445,11 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   land at 95.8 % / 82.1 % / 99.2 % of budget, all under cap; budgets
   below the grid's ~2833 B smallest-frame floor emit that floor and
   report overshoot. Rate control is encoder policy, not a bitstream
-  feature — output stays conformant Cinepak.
+  feature — output stays conformant Cinepak. Round 113 extended this
+  budget mode to the grayscale `encode_intra_gray8` /
+  `encode_inter_gray8` entry points: the grayscale path sweeps a
+  two-axis `(strip_count, rdo_lambda)` grid (the `luma_weight` axis is
+  a no-op on `Gray8` entries) and scores candidates by direct-luma SSE.
 - Median-cut codebook quantiser builds V1 and V4 codebooks
   per-strip; per-MB nearest-neighbour selection picks V1 vs V4 by
   squared-error against the source.

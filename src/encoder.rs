@@ -1570,7 +1570,7 @@ impl CinepakEncoder {
         validate_opts(&opts)?;
         validate_input_size(rgb, width, height, PixelMode::Yuv12)?;
         if self.target_frame_bytes.is_some() {
-            return self.encode_budget_frame(rgb, width, height, opts, true);
+            return self.encode_budget_frame(rgb, width, height, opts, true, PixelMode::Yuv12);
         }
         self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, opts)
     }
@@ -1644,7 +1644,7 @@ impl CinepakEncoder {
             )));
         }
         if self.target_frame_bytes.is_some() {
-            return self.encode_budget_frame(rgb, width, height, opts, false);
+            return self.encode_budget_frame(rgb, width, height, opts, false, PixelMode::Yuv12);
         }
         self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, opts)
     }
@@ -1661,9 +1661,15 @@ impl CinepakEncoder {
     /// selective-update against the grayscale reconstruction.
     ///
     /// `input` is `width * height` bytes (one luma sample per pixel).
-    /// Target-bitrate mode (round 96) is `Yuv12`-scored and does not
-    /// apply to the grayscale path; the caller's `opts` are used
-    /// verbatim regardless of any configured byte budget.
+    ///
+    /// When the encoder is in **target-bitrate mode** (round 96,
+    /// configured via [`Self::with_target_bitrate`] /
+    /// [`Self::with_target_frame_bytes`]) the grayscale two-axis
+    /// `(strip_count, rdo_lambda)` RD grid is swept around `opts` and the
+    /// highest-quality candidate (lowest direct-luma SSE) that fits the
+    /// per-frame byte budget is committed (round 113). See
+    /// [`Self::with_target_bitrate`] for the selection rule and
+    /// [`Self::last_rate_stats`] for the per-frame adherence telemetry.
     pub fn encode_intra_gray8(
         &mut self,
         input: &[u8],
@@ -1674,6 +1680,9 @@ impl CinepakEncoder {
         validate_dims(width, height)?;
         validate_opts(&opts)?;
         validate_input_size(input, width, height, PixelMode::Gray8)?;
+        if self.target_frame_bytes.is_some() {
+            return self.encode_budget_frame(input, width, height, opts, true, PixelMode::Gray8);
+        }
         self.encode_intra_one(input, width, height, PixelMode::Gray8, opts)
     }
 
@@ -1694,6 +1703,13 @@ impl CinepakEncoder {
     /// must follow a grayscale frame so the SKIP-MB comparison and the
     /// rolling codebook entry layout line up. Start a grayscale sequence
     /// with [`Self::encode_intra_gray8`].
+    ///
+    /// When the encoder is in **target-bitrate mode** the grayscale
+    /// two-axis `(strip_count, rdo_lambda)` RD grid is swept around `opts`
+    /// per frame and the highest-quality candidate that fits the per-frame
+    /// byte budget is committed (round 113); inter frames stay budgeted
+    /// and skip / selectively-update against the committed previous
+    /// grayscale reconstruction. See [`Self::with_target_bitrate`].
     pub fn encode_inter_gray8(
         &mut self,
         input: &[u8],
@@ -1721,6 +1737,9 @@ impl CinepakEncoder {
                 "encoder: encode_inter_gray8 requires a grayscale prev frame; \
                  start the sequence with encode_intra_gray8",
             ));
+        }
+        if self.target_frame_bytes.is_some() {
+            return self.encode_budget_frame(input, width, height, opts, false, PixelMode::Gray8);
         }
         self.encode_inter_one(input, width, height, PixelMode::Gray8, opts)
     }
@@ -1813,17 +1832,24 @@ impl CinepakEncoder {
         self.last_stats = snap.last_stats;
     }
 
-    /// Round-96 budget-driven frame encode. Sweeps the three-axis
-    /// `(strip_count, rdo_lambda, luma_weight)` RD grid around `base`,
-    /// trial-encodes each candidate against a snapshot of the encoder's
-    /// current carry-over state, and commits the highest-quality
-    /// candidate (lowest Y-channel SSE) whose encoded size fits the
-    /// per-frame byte budget. When no candidate fits, commits the
-    /// smallest candidate and reports the overshoot via
-    /// [`RateStats::byte_delta`] — never errors on overshoot.
+    /// Round-96 budget-driven frame encode. Sweeps the RD grid around
+    /// `base`, trial-encodes each candidate against a snapshot of the
+    /// encoder's current carry-over state, and commits the highest-quality
+    /// candidate (lowest SSE) whose encoded size fits the per-frame byte
+    /// budget. When no candidate fits, commits the smallest candidate and
+    /// reports the overshoot via [`RateStats::byte_delta`] — never errors
+    /// on overshoot.
     ///
     /// `intra` selects the intra (`true`) or inter (`false`) worker for
-    /// each trial. Both validations have already run in the public entry.
+    /// each trial. `mode` selects the pixel pipeline: `Yuv12` (colour)
+    /// sweeps the three-axis `(strip_count, rdo_lambda, luma_weight)` grid
+    /// and scores by BT.601 Y-channel SSE; `Gray8` (round 113) sweeps the
+    /// two-axis `(strip_count, rdo_lambda)` grid (the `luma_weight` axis is
+    /// a no-op on grayscale — for `Gray8` entries the distance metric
+    /// scales all four Y dims by `luma_weight`, a uniform positive scale
+    /// that leaves every clustering decision invariant) and scores by
+    /// direct-luma SSE. Both validations have already run in the public
+    /// entry.
     fn encode_budget_frame(
         &mut self,
         rgb: &[u8],
@@ -1831,15 +1857,16 @@ impl CinepakEncoder {
         height: u32,
         base: EncoderOptions,
         intra: bool,
+        mode: PixelMode,
     ) -> Result<Vec<u8>> {
         let budget = self.target_frame_bytes.unwrap_or(usize::MAX);
-        let candidates = budget_grid_candidates(base);
+        let candidates = budget_grid_candidates(base, mode);
         // Snapshot once; every trial restores back to this point so the
         // grid candidates are scored from identical state.
         let snap = self.snapshot_state();
 
         // Track, in a single pass:
-        //   - best_fit: lowest Y-SSE candidate whose bytes ≤ budget.
+        //   - best_fit: lowest-SSE candidate whose bytes ≤ budget.
         //   - smallest: smallest-byte candidate overall (overshoot floor).
         let mut best_fit: Option<(f64, usize, EncoderOptions)> = None;
         let mut smallest: Option<(usize, EncoderOptions)> = None;
@@ -1848,9 +1875,9 @@ impl CinepakEncoder {
         for opts in &candidates {
             self.restore_state(snap.clone());
             let bytes = if intra {
-                self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, *opts)
+                self.encode_intra_one(rgb, width, height, mode, *opts)
             } else {
-                self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, *opts)
+                self.encode_inter_one(rgb, width, height, mode, *opts)
             };
             let bytes = match bytes {
                 Ok(b) => b,
@@ -1870,7 +1897,7 @@ impl CinepakEncoder {
                 smallest = Some((len, *opts));
             }
             // Best-fit tracker: only candidates within budget compete on
-            // quality (Y-SSE). Tiebreak toward smaller wire size.
+            // quality (SSE). Tiebreak toward smaller wire size.
             if len <= budget {
                 // Decode the candidate against a clone of the
                 // pre-frame decoder state (held in the snapshot) so an
@@ -1878,13 +1905,13 @@ impl CinepakEncoder {
                 // against the correct previous reconstruction — a fresh
                 // decoder would reject `0x3100` skips with no prev frame.
                 let mut trial_dec = snap.decoder.clone();
-                let y_sse = decode_y_sse(&mut trial_dec, &bytes, rgb, width, height)?;
+                let sse = decode_sse(&mut trial_dec, &bytes, rgb, width, height, mode)?;
                 let take = match &best_fit {
                     None => true,
-                    Some((b_sse, b_len, _)) => y_sse < *b_sse || (y_sse == *b_sse && len < *b_len),
+                    Some((b_sse, b_len, _)) => sse < *b_sse || (sse == *b_sse && len < *b_len),
                 };
                 if take {
-                    best_fit = Some((y_sse, len, *opts));
+                    best_fit = Some((sse, len, *opts));
                 }
             }
         }
@@ -1899,9 +1926,9 @@ impl CinepakEncoder {
                 // caller still gets a frame (or a real error from it).
                 self.restore_state(snap);
                 return if intra {
-                    self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, base)
+                    self.encode_intra_one(rgb, width, height, mode, base)
                 } else {
-                    self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, base)
+                    self.encode_inter_one(rgb, width, height, mode, base)
                 };
             }
         };
@@ -1910,9 +1937,9 @@ impl CinepakEncoder {
         // self's carry-over state matches the emitted bytes exactly.
         self.restore_state(snap);
         let bytes = if intra {
-            self.encode_intra_one(rgb, width, height, PixelMode::Yuv12, winning_opts)?
+            self.encode_intra_one(rgb, width, height, mode, winning_opts)?
         } else {
-            self.encode_inter_one(rgb, width, height, PixelMode::Yuv12, winning_opts)?
+            self.encode_inter_one(rgb, width, height, mode, winning_opts)?
         };
         let actual = bytes.len();
         self.last_rate_stats = Some(RateStats {
@@ -1927,35 +1954,56 @@ impl CinepakEncoder {
 }
 
 /// Decode `bytes` through `dec` (which must hold the correct pre-frame
-/// carry-over state for an inter frame) and return the BT.601 Y-channel
-/// SSE between the decoded frame and the source `rgb`. Used by the
-/// round-96 budget grid sweep to rank candidates that fit the byte
-/// budget by quality.
-fn decode_y_sse(
+/// carry-over state for an inter frame) and return the luma SSE between
+/// the decoded frame and the source `src`. Used by the round-96 / round-113
+/// budget grid sweep to rank candidates that fit the byte budget by
+/// quality.
+///
+/// For `Yuv12` the source is packed `Rgb24` and the decoded frame is
+/// `Rgb24`; the distortion is BT.601 Y-channel SSE. For `Gray8` both the
+/// source and the decoded frame are one luma byte per pixel and the
+/// distortion is direct-luma SSE (the 8-bit luminance *is* the Y channel).
+fn decode_sse(
     dec: &mut crate::decoder::CinepakDecoder,
     bytes: &[u8],
-    rgb: &[u8],
+    src: &[u8],
     width: u32,
     height: u32,
+    mode: PixelMode,
 ) -> Result<f64> {
     let frame = dec.decode_frame(bytes, None)?;
     let stride = frame.stride();
     let pixels = frame.pixels();
+    let w = width as usize;
     let mut sum_sq: f64 = 0.0;
-    for r in 0..height as usize {
-        let off_dec = r * stride;
-        let off_src = r * (width as usize) * 3;
-        for c in 0..(width as usize) {
-            let r_a = rgb[off_src + c * 3] as f64;
-            let g_a = rgb[off_src + c * 3 + 1] as f64;
-            let b_a = rgb[off_src + c * 3 + 2] as f64;
-            let r_b = pixels[off_dec + c * 3] as f64;
-            let g_b = pixels[off_dec + c * 3 + 1] as f64;
-            let b_b = pixels[off_dec + c * 3 + 2] as f64;
-            let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
-            let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
-            let d = ya - yb;
-            sum_sq += d * d;
+    match mode {
+        PixelMode::Yuv12 => {
+            for r in 0..height as usize {
+                let off_dec = r * stride;
+                let off_src = r * w * 3;
+                for c in 0..w {
+                    let r_a = src[off_src + c * 3] as f64;
+                    let g_a = src[off_src + c * 3 + 1] as f64;
+                    let b_a = src[off_src + c * 3 + 2] as f64;
+                    let r_b = pixels[off_dec + c * 3] as f64;
+                    let g_b = pixels[off_dec + c * 3 + 1] as f64;
+                    let b_b = pixels[off_dec + c * 3 + 2] as f64;
+                    let ya = 0.299 * r_a + 0.587 * g_a + 0.114 * b_a;
+                    let yb = 0.299 * r_b + 0.587 * g_b + 0.114 * b_b;
+                    let d = ya - yb;
+                    sum_sq += d * d;
+                }
+            }
+        }
+        PixelMode::Gray8 => {
+            for r in 0..height as usize {
+                let off_dec = r * stride;
+                let off_src = r * w;
+                for c in 0..w {
+                    let d = pixels[off_dec + c] as f64 - src[off_src + c] as f64;
+                    sum_sq += d * d;
+                }
+            }
         }
     }
     Ok(sum_sq)
@@ -1973,16 +2021,24 @@ struct EncoderSnapshot {
     last_stats: FrameStats,
 }
 
-/// Build the round-96 budget grid candidate list around `base`: the
-/// same deduplicated 3×3×3 `(strip_count, rdo_lambda, luma_weight)`
-/// cross-product the round-7 picker sweeps, expressed as concrete
-/// [`EncoderOptions`] (the rest of the fields inherited from `base`).
+/// Build the round-96 / round-113 budget grid candidate list around
+/// `base`, expressed as concrete [`EncoderOptions`] (the rest of the
+/// fields inherited from `base`).
+///
+/// For `Yuv12` (colour) this is the same deduplicated 3×3×3
+/// `(strip_count, rdo_lambda, luma_weight)` cross-product the round-7
+/// picker sweeps. For `Gray8` (round 113) the `luma_weight` axis is
+/// dropped — for grayscale codebook entries the distance metric scales all
+/// four Y dims by `luma_weight`, a uniform positive scale that leaves
+/// every nearest-neighbour / clustering decision invariant, so sweeping it
+/// would only waste byte-identical trials. The grayscale grid is therefore
+/// a 3×3 `(strip_count, rdo_lambda)` cross-product (≤ 9 trials).
 ///
 /// Candidates are ordered cheapest-first within each strip count so the
 /// smallest-byte floor (the overshoot fallback) tends to appear early —
 /// high `rdo_lambda` (more V1 macroblocks) and low strip count produce
 /// the smallest frames.
-fn budget_grid_candidates(base: EncoderOptions) -> Vec<EncoderOptions> {
+fn budget_grid_candidates(base: EncoderOptions, mode: PixelMode) -> Vec<EncoderOptions> {
     let strip_candidates = [1u16, 2, 4];
     let lambda_seed: [Option<f32>; 3] = [
         Some(base.rdo_lambda.unwrap_or(5.0_f32)),
@@ -1995,13 +2051,22 @@ fn budget_grid_candidates(base: EncoderOptions) -> Vec<EncoderOptions> {
             lambdas.push(lam);
         }
     }
-    let luma_seed: [u8; 3] = [base.luma_weight.max(1), 4, 8];
-    let mut lumas: Vec<u8> = Vec::with_capacity(3);
-    for &lw in &luma_seed {
-        if !lumas.contains(&lw) {
-            lumas.push(lw);
+    // Grayscale: single-element luma axis (the base weight) — the metric is
+    // invariant to it on Gray8 entries. Colour: the round-7 three-element
+    // axis.
+    let lumas: Vec<u8> = match mode {
+        PixelMode::Gray8 => vec![base.luma_weight.max(1)],
+        PixelMode::Yuv12 => {
+            let luma_seed: [u8; 3] = [base.luma_weight.max(1), 4, 8];
+            let mut v: Vec<u8> = Vec::with_capacity(3);
+            for &lw in &luma_seed {
+                if !v.contains(&lw) {
+                    v.push(lw);
+                }
+            }
+            v
         }
-    }
+    };
     let mut out: Vec<EncoderOptions> =
         Vec::with_capacity(strip_candidates.len() * lambdas.len() * lumas.len());
     for &strip_count in &strip_candidates {

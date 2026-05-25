@@ -33,3 +33,26 @@ default = ["registry"]
 # against `oxideav-core`. Default-on; turn off for image-library
 # use-cases that just want the standalone `CinepakDecoder` API.
 registry = ["dep:oxideav-core"]
+
+[dev-dependencies]
+# Round 126 (depth-mode benchmarks): Criterion drives the three bench
+# harnesses (`decode`, `encode`, `roundtrip`) that future encoder-
+# optimisation rounds use to A/B their picker / codebook-training
+# tweaks. Pinned to the same 0.5 line the other OxideAV crates with
+# benches (magicyuv, h264, pixfmt) already track.
+criterion = "0.5"
+
+# Round 126 benches. Each binary lives in `benches/<name>.rs` and is
+# self-contained (no committed fixture files). Run with:
+#     cargo bench -p oxideav-cinepak --bench <name>
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "roundtrip"
+harness = false

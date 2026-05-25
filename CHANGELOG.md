@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 126 (depth-mode benchmarks): three `criterion` bench harnesses
+  (`benches/decode.rs`, `benches/encode.rs`, `benches/roundtrip.rs`)
+  covering the cinepak decoder hot paths, the encoder picker tiers
+  (baseline / round-6 / round-7 / grayscale round-7), and the stateful
+  `CinepakEncoder` + `CinepakDecoder` intra+inter roundtrip path. Each
+  bench is self-contained — inputs are synthesised on-the-fly with a
+  deterministic xorshift32 gradient so no fixture files are committed
+  and the run is reproducible across machines. `criterion` is added as
+  a dev-only dependency (`[dev-dependencies] criterion = "0.5"`) and
+  three `[[bench]]` entries with `harness = false` register the
+  binaries.
+
+  Per the workspace "saturated codecs grow fuzz / bench / profile"
+  memo: cinepak is at ≈ 96 % decoder coverage / ≈ 98 % encoder
+  coverage after r121, so the next coherent work is making the
+  encoder's many picker tiers (rounds 47, 4, 5, 6, 7, 8, 9, 47, 101)
+  measurable — not adding another lever to a heap of 12. With
+  `criterion` wired up future "Lever N+1" PRs can diff per-frame
+  encode cost against the round-9 baseline rather than relying on
+  one-shot wall-clock measurements in test output.
+
+  Indicative release-mode numbers (Apple M-class, single thread,
+  `cargo bench -- --quick`): decoder ≈ 2.7..3.3 GiB/s on RGB intra,
+  ≈ 930 MiB/s on grayscale; `encode_rgb24` 64×64 q=50 baseline
+  ≈ 1.4 ms, `encode_rgb24_round6` ≈ 11 ms (× 8 baseline),
+  `encode_rgb24_round7` ≈ 31 ms (× 23 baseline) — matching the picker
+  trial-encode counts (9 / 27) within constant factors.
+
 - Round 121 (chroma CBR convergence): **CBR carry-over accumulator threads
   surplus and deficit across the chroma (`encode_intra` / `encode_inter`)
   budget-driven sequence so a 5-second clip's total bytes converge to

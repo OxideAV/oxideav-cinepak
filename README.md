@@ -717,3 +717,49 @@ The default `registry` cargo feature wires the crate into
 the feature for an `oxideav-core`-free build that exposes only the
 crate-local `CinepakDecoder`, `CinepakFrame`, `CinepakPixelFormat`,
 and `CinepakError` types.
+
+## Benchmarks (round 126)
+
+Round 126 wired up three `criterion` benchmark harnesses so future
+encoder-optimisation rounds can A/B-test their picker / codebook-
+training tweaks. Each harness is self-contained (no committed
+fixtures — inputs are synthesised on-the-fly with a deterministic
+xorshift32 gradient) and the criterion dependency is dev-only.
+
+- `benches/decode.rs` — decoder hot paths: 320×240 / 64×64 / 640×480
+  intra, 320×240 grayscale, and a 320×240 all-SKIP inter case.
+- `benches/encode.rs` — encoder picker tiers: stateless `encode_rgb24`
+  baseline + `encode_rgb24_round6` (~9 trials) + `encode_rgb24_round7`
+  (~27 trials), plus the round-101 grayscale picker.
+- `benches/roundtrip.rs` — stateful `CinepakEncoder` + `CinepakDecoder`
+  intra+inter sequences (static + slow-drift content; RGB + grayscale).
+
+Run with `cargo bench -p oxideav-cinepak --bench {decode,encode,roundtrip}`
+(or `--bench <name> -- --quick` for a fast sanity check). Indicative
+release-mode numbers on the development machine (Apple M-class, single
+thread; criterion `--quick`):
+
+| Bench                                     | Per-iter time  | Throughput      |
+| ----------------------------------------- | -------------- | --------------- |
+| `decode rgb24 320×240 q=50`               | ≈  80 µs       | ≈ 2.7 GiB/s     |
+| `decode rgb24 64×64 q=50`                 | ≈  4.1 µs      | ≈ 2.7 GiB/s     |
+| `decode rgb24 640×480 q=70`               | ≈ 260 µs       | ≈ 3.3 GiB/s     |
+| `decode gray8 320×240 q=50`               | ≈  78 µs       | ≈ 930 MiB/s     |
+| `decode rgb24 320×240 inter-allskip`      | ≈ 143 µs (2-fr)| ≈ 1.5 GiB/s     |
+| `encode rgb24 64×64 q=50 baseline`        | ≈ 1.4 ms       | ≈ 8.4 MiB/s     |
+| `encode rgb24 64×64 q=50 round6 (~9×)`    | ≈ 11.1 ms      | ≈ 1.0 MiB/s     |
+| `encode rgb24 64×64 q=50 round7 (~27×)`   | ≈ 31.5 ms      | ≈ 380 KiB/s     |
+| `encode rgb24 320×240 q=50 baseline`      | ≈ 25.0 ms      | ≈ 8.7 MiB/s     |
+| `encode gray8 320×240 q=50 baseline`      | ≈ 13.0 ms      | ≈ 5.6 MiB/s     |
+| `encode gray8 320×240 q=50 round7 (~9×)`  | ≈ 113.8 ms     | ≈ 650 KiB/s     |
+| `roundtrip rgb24 64×64 static (5 frames)` | ≈ 3.7 ms       | ≈ 15.6 MiB/s    |
+| `roundtrip rgb24 64×64 drift (5 frames)`  | ≈ 6.1 ms       | ≈ 9.6 MiB/s     |
+| `roundtrip rgb24 320×240 (4 frames)`      | ≈ 61.4 ms      | ≈ 14.3 MiB/s    |
+| `roundtrip gray8 128×96 static (5 frames)`| ≈ 2.4 ms       | ≈ 24.3 MiB/s    |
+
+The encode-side numbers confirm the round-tier multiplier: `round6 ≈ 8×
+baseline`, `round7 ≈ 23× baseline` on the 64×64 fixture — matching the
+9 / 27 trial-encode counts within constant factors (some trials hit
+cheaper grid points). These tables are descriptive (per-machine
+variation is expected); future optimisation rounds should diff the
+absolute `criterion` JSON output rather than the README headline.

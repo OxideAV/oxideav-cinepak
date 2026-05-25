@@ -739,13 +739,17 @@ Run with `cargo bench -p oxideav-cinepak --bench {decode,encode,roundtrip}`
 release-mode numbers on the development machine (Apple M-class, single
 thread; criterion `--quick`):
 
+The decode rows below reflect the **post-round-129 decoder** (the
+round-126 figures pre-dated the r129 hot-path rewrite); re-measured in
+round 134 with `--warm-up-time 1 --measurement-time 3`.
+
 | Bench                                     | Per-iter time  | Throughput      |
 | ----------------------------------------- | -------------- | --------------- |
-| `decode rgb24 320×240 q=50`               | ≈  80 µs       | ≈ 2.7 GiB/s     |
-| `decode rgb24 64×64 q=50`                 | ≈  4.1 µs      | ≈ 2.7 GiB/s     |
-| `decode rgb24 640×480 q=70`               | ≈ 260 µs       | ≈ 3.3 GiB/s     |
-| `decode gray8 320×240 q=50`               | ≈  78 µs       | ≈ 930 MiB/s     |
-| `decode rgb24 320×240 inter-allskip`      | ≈ 143 µs (2-fr)| ≈ 1.5 GiB/s     |
+| `decode rgb24 320×240 q=50`               | ≈  60 µs       | ≈ 3.6 GiB/s     |
+| `decode rgb24 64×64 q=50`                 | ≈  3.1 µs      | ≈ 3.7 GiB/s     |
+| `decode rgb24 640×480 q=70`               | ≈ 211 µs       | ≈ 4.1 GiB/s     |
+| `decode gray8 320×240 q=50`               | ≈  25 µs       | ≈ 2.8 GiB/s     |
+| `decode rgb24 320×240 inter-allskip`      | ≈ 112 µs (2-fr)| ≈ 1.9 GiB/s     |
 | `encode rgb24 64×64 q=50 baseline`        | ≈ 1.4 ms       | ≈ 8.4 MiB/s     |
 | `encode rgb24 64×64 q=50 round6 (~9×)`    | ≈ 11.1 ms      | ≈ 1.0 MiB/s     |
 | `encode rgb24 64×64 q=50 round7 (~27×)`   | ≈ 31.5 ms      | ≈ 380 KiB/s     |

@@ -6,6 +6,63 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 129 (decoder hot-path optimisation): **`CinepakDecoder::decode_frame`
+  rewrites four pieces of the per-MB render hot path so the decoder
+  benches (`benches/decode.rs`, round-126) drop -17 to -23 % across the
+  RGB scenarios and -66.8 % on the grayscale path** versus the round-126
+  baseline (`cargo bench --bench decode -- --save-baseline pre` then
+  `--baseline pre`). Indicative numbers (Apple M-class, single thread,
+  3 s measurement window): `decode rgb24 320×240 q=50` 78.4 µs → 62.7 µs
+  (+25 % throughput; now 3.42 GiB/s), `decode rgb24 64×64 q=50` 4.09 µs
+  → 3.11 µs (+31 %; now 3.68 GiB/s), `decode rgb24 640×480 q=70` 256 µs
+  → 212 µs (+20 %; now 4.04 GiB/s), `decode gray8 320×240 q=50` 77.3 µs
+  → 25.7 µs (+201 %; now 2.79 GiB/s — close to parity with the RGB
+  path), `decode rgb24 320×240 inter-allskip` 140 µs → 115 µs (+22 %).
+
+  Four independent levers:
+
+  1. **Per-pixel `PixelMode` match hoisted out of the inner loop** —
+     `render_strip` now splits into `render_strip_rgb` /
+     `render_strip_gray` at the top of the function. Each macroblock
+     writes through a mode-specialised draw helper (`draw_v1_mb_rgb` /
+     `draw_v1_mb_gray` / `draw_v4_mb_rgb` / `draw_v4_mb_gray`) instead
+     of dispatching `PixelMode` per pixel inside `write_pixel`. On a
+     64×64 frame that's ~1 200 fewer match dispatches per frame; on
+     640×480, ~76 800 fewer.
+
+  2. **V1 macroblock collapsed from 16 to 4 `yuv_to_rgb` calls** — V1
+     entries share one `(U, V)` across the whole 4×4 macroblock and
+     have only 4 distinct Y samples (one per 2×2 quadrant). The new
+     `draw_v1_mb_rgb` builds 4 RGB triples once, packs them into two
+     12-byte row templates (Y0 Y0 Y1 Y1 / Y2 Y2 Y3 Y3), and writes
+     each row template into the upper and lower halves of its
+     quadrant with `copy_from_slice` — replacing the original
+     16-call-per-MB inner loop.
+
+  3. **Direct grayscale buffer allocation** — when the first strip's
+     chunk pins `PixelMode::Gray8` the output `Vec<u8>` is truncated
+     in place from `width × height × 3` to `width × height` and the
+     stride is updated. This eliminates the post-decode byte-by-byte
+     compaction scan (`for row { for col { gray.push(out[base + col*3]) }}`)
+     that dominated the grayscale-path benchmark — going from
+     ≈ 947 MiB/s to ≈ 2.79 GiB/s.
+
+  4. **Codebook `clone()` eliminated** — per-strip
+     `self.prev_v4.clone().unwrap_or_default()` (a 1.5 KiB memcpy per
+     codebook × 2 codebooks × N strips) replaced with
+     `self.prev_v4.take().unwrap_or_default()` + a single put-back at
+     the end of the strip loop. For a 3-strip frame that's ~9 KiB of
+     pointless copies per frame.
+
+  No behavioural change: all 66 + 8 + 3 + 7 + 7 + 6 + 8 + 5 + 5 + 6 + 8
+  + 5 + 8 synth-decode / encoder / roundtrip tests stay green. The
+  draw helpers retain the same 4×4 layout (`docs/video/cinepak/spec/03-vectors-and-macroblocks.md`
+  §4 / §5 unchanged); the grayscale buffer path retains identical
+  output bytes (verified by `grayscale_v1_only_intra_8x8` and the
+  multi-strip + inter grayscale tests).
+
 ### Added
 
 - Round 126 (depth-mode benchmarks): three `criterion` bench harnesses

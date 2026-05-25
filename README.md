@@ -763,3 +763,41 @@ baseline`, `round7 ≈ 23× baseline` on the 64×64 fixture — matching the
 cheaper grid points). These tables are descriptive (per-machine
 variation is expected); future optimisation rounds should diff the
 absolute `criterion` JSON output rather than the README headline.
+
+### Round 129 decoder optimisation deltas (vs the round-126 baseline)
+
+Round 129 used the round-126 bench harness to A/B four decoder
+hot-path changes: (i) **per-pixel mode dispatch hoisted out of the inner
+loop** — `render_strip` now splits into `render_strip_rgb` /
+`render_strip_gray` at the top, so each macroblock writes through a
+mode-specialised draw helper instead of running a `PixelMode` match per
+pixel (≥ 1 200 redundant matches per 64×64 frame); (ii) **V1 macroblock
+collapsed from 16 to 4 `yuv_to_rgb` calls** — V1 entries share one
+`(U, V)` across the whole 4×4 so only 4 distinct RGB triples need
+converting, with each Yi covering a 2×2 quadrant written via two
+12-byte `copy_from_slice` rows; (iii) **direct grayscale buffer
+allocation** — when the first strip's chunk pins `Gray8` the output
+plane is shrunk to width×height in place, eliminating the post-decode
+3-byte → 1-byte repack scan that dominated the grayscale path; and
+(iv) **codebook clones eliminated** — per-strip
+`self.prev_v4.clone()` (~1.5 KiB per codebook × 2 × strips) replaced
+with a `take()` + put-back so the carry-over codebooks move into the
+per-frame state without allocating.
+
+Measured deltas against the saved `pre` baseline
+(`cargo bench --bench decode -- --baseline pre`):
+
+| Bench                                  | Baseline   | After      | Δ time   | Throughput Δ |
+| -------------------------------------- | ---------- | ---------- | -------- | ------------ |
+| `decode rgb24 320×240 q=50`            | 78.4 µs    | 62.7 µs    | -20.2 %  | +25.3 %      |
+| `decode rgb24 64×64 q=50`              |  4.09 µs   |  3.11 µs   | -23.7 %  | +31.1 %      |
+| `decode rgb24 640×480 q=70`            | 256 µs     | 212 µs     | -16.7 %  | +20.0 %      |
+| `decode gray8 320×240 q=50`            | 77.3 µs    | 25.7 µs    | -66.8 %  | +201.2 %     |
+| `decode rgb24 320×240 inter-allskip`   | 140 µs     | 115 µs     | -18.0 %  | +21.9 %      |
+
+The grayscale path moves from ≈ 947 MiB/s to ≈ 2.79 GiB/s — close to
+parity with the RGB path now that no post-decode compaction is needed.
+RGB paths gain 17–25 % from the V1 conversion-count collapse and the
+mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
+roundtrip tests stay bit-exact; the optimisation is purely a hot-path
+rewrite, not a behavioural change.

@@ -6,6 +6,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 143 (seek-friendly keyframe interval enforcement):
+  `CinepakEncoder::with_keyframe_interval(n)` /
+  `set_keyframe_interval(n)` / `clear_keyframe_interval()` /
+  `keyframe_interval()` / `gop_position()` / `force_next_keyframe()` plus
+  new `encode_frame(rgb, w, h, opts) -> EncodedFrame` and
+  `encode_frame_gray8(input, w, h, opts) -> EncodedFrame` auto-routing
+  entry points (and the public `EncodedFrame { bytes, is_keyframe,
+  frame_number_in_gop }` struct). Configure an interval and the
+  encoder dispatches each frame to `encode_intra` / `encode_inter`
+  automatically — frame `0`, `n`, `2n`, … are intra, the rest are
+  inter — and returns the encoded bytes together with the
+  `is_keyframe` flag the container muxer needs to set the container's
+  keyframe sample bit (AVI `AVIF_KEYFRAME`, QuickTime sync sample,
+  Sega FILM `sample_info_1`). `force_next_keyframe()` requests a
+  one-shot intra refresh that overrides the schedule (useful for
+  scene-cut detection feeding back from
+  `last_rate_stats().byte_delta > 0` overshoot signalling, or from
+  upstream scene-detect); the GOP counter resets at the forced
+  keyframe so subsequent keyframes are interval-spaced from the
+  forced one. The router also defensively re-keyframes on a pixel
+  mode switch (`Rgb24` ⇒ `Gray8` or vice versa) so the inter
+  worker's grayscale-after-colour rejection can't trip an
+  auto-routed sequence. Composes with all existing levers: the
+  budget-driven worker (round 96 / 113 / 121) continues to drive
+  the RD grid toward the configured per-frame budget, cross-frame
+  persistence (round 5) and slot reclamation (round 7) carry across
+  inter frames unchanged, and `reset()` preserves the configured
+  interval (it's a configuration knob, not per-sequence state) while
+  zeroing the GOP counter so the next call is a clean intra.
+  `keyframe_interval = None` (the default) preserves the legacy
+  manual-routing behaviour exactly — `encode_intra` / `encode_inter`
+  callers see no change, and `encode_frame` returns a clear "set the
+  interval first" error in that mode.
+
+  Spec reference: `docs/video/cinepak/spec/01-frame-and-strip.md`
+  §1.1 (container keyframe flag ⇔ codec `flags = 0x00` ⇔ all strips
+  `0x1000` intra; the auto-router's `is_keyframe` flag agrees with
+  the first strip's `strip_id` on the wire per §2.1, the conformant
+  intra/inter dispatch signal). Rate control / GOP scheduling are
+  encoder policy, not bitstream features (per
+  `00-scope.md` §"Lossy-codec validation criterion"); output stays
+  conformant Cinepak. 13 new tests cover error-without-interval,
+  the period pattern at intervals 1 / 5, zero-interval clamping to
+  1, `force_next_keyframe` schedule reset, force one-shot semantics,
+  `reset` preserving the interval while clearing the GOP counter,
+  `clear_keyframe_interval` returning to manual mode, end-to-end
+  decode of an interval-3 / 10-frame sequence, the grayscale path
+  period pattern, the mode-switch defensive intra, the
+  `gop_position()` accessor tracking the router, and composition
+  with `with_target_bitrate` round-96 rate control.
+
 ### Changed
 
 - Round 129 (decoder hot-path optimisation): **`CinepakDecoder::decode_frame`

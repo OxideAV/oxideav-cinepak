@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -291,6 +291,43 @@ against the committed previous grayscale reconstruction. The colour
 sequence, shrink-vs-unconstrained, impossible-budget overshoot, size
 monotonicity, the inter budget riding the stateful carry-over, the
 ≤ 9-trial grayscale grid, and reset/clear semantics.
+Round 143 (seek-friendly keyframe interval enforcement) added
+**`CinepakEncoder::with_keyframe_interval(n)` + new `encode_frame` /
+`encode_frame_gray8` auto-routing entry points** returning the new
+`EncodedFrame { bytes, is_keyframe, frame_number_in_gop }` struct. The
+encoder dispatches each call to `encode_intra` / `encode_inter`
+automatically — frame `0`, `n`, `2n`, … are intra, the rest inter — so
+container muxers (AVI / QuickTime / Sega FILM) can mark the per-frame
+keyframe flag directly from `is_keyframe` without inspecting the bytes
+themselves. Companion helpers: `set_keyframe_interval(n)` /
+`clear_keyframe_interval()` / `keyframe_interval()` / `gop_position()`
+plus a `force_next_keyframe()` one-shot for scene-cut refresh (request
+an extra intra; the GOP counter resets at that frame so subsequent
+keyframes are interval-spaced from the forced one). Defensive
+auto-intra also fires on pixel-mode switch (`Rgb24` ⇒ `Gray8` or vice
+versa), so the inter worker's grayscale-after-colour rejection can't
+trip an auto-routed sequence. Composes with all existing rate-control
+and persistence levers — the round-96 / round-121 budget worker drives
+the RD grid toward the per-frame budget unchanged on both intra and
+inter paths, cross-frame codebook persistence (round 5) and slot
+reclamation (round 7) ride through inter frames as before, and
+`reset()` preserves the configured interval (configuration knob, not
+per-sequence state) while zeroing the GOP counter so the next call is
+a clean intra. `keyframe_interval = None` (the default) keeps the
+legacy manual-routing behaviour exactly: `encode_intra` /
+`encode_inter` callers see no change, and `encode_frame` returns a
+clear "set the interval first" error. The auto-router's `is_keyframe`
+flag agrees with the first strip's `strip_id` on the wire (`0x1000`
+intra / `0x1100` inter per spec §2.1 — the conformant intra/inter
+dispatch signal). Rate control / GOP scheduling are encoder policy,
+not bitstream features (spec `00-scope.md` §"Lossy-codec validation
+criterion"); output stays conformant Cinepak. 13 new tests cover error-
+without-interval, the period pattern at intervals 1 / 5, zero-interval
+clamping, force-keyframe schedule reset + one-shot semantics, reset
+preservation, clear-interval round-trip, end-to-end decode of an
+interval-3 / 10-frame sequence, the grayscale period pattern, mode-
+switch defensive intra, the `gop_position()` accessor, and composition
+with `with_target_bitrate` (round 96).
 Round 121 (chroma CBR convergence) added a **CBR carry-over accumulator**
 to the round-96 / round-113 `encode_budget_frame` worker so a multi-frame
 chroma (`encode_intra` / `encode_inter`) sequence's total bytes
@@ -639,6 +676,36 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   cold-start. Has no effect on the warm-start path (inter strips
   with cross-frame seed); cross-frame slot identity continues to
   rely on `lloyd_max_iter` Lloyd refinement of the prior codebook.
+- `CinepakEncoder::with_keyframe_interval(n)` /
+  `set_keyframe_interval(n)` / `clear_keyframe_interval()` /
+  `keyframe_interval()` / `gop_position()` / `force_next_keyframe()` +
+  `CinepakEncoder::encode_frame(rgb, w, h, opts) -> EncodedFrame` and
+  `encode_frame_gray8(input, w, h, opts) -> EncodedFrame` (round 143)
+  — **seek-friendly keyframe interval enforcement**. Configure an
+  interval and the encoder routes each frame to intra / inter
+  automatically (`I P P … P I P P …`, intra every `n`-th frame), and
+  the returned `EncodedFrame { bytes, is_keyframe,
+  frame_number_in_gop }` carries the keyframe-flag metadata container
+  muxers need to mark the per-sample keyframe bit (AVI
+  `AVIF_KEYFRAME`, QuickTime sync sample, Sega FILM `sample_info_1`
+  per `01-frame-and-strip.md` §1.1) without re-inspecting the bytes.
+  `force_next_keyframe()` requests a one-shot intra refresh that
+  overrides the schedule and resets the GOP counter (useful for
+  scene-cut response feeding back from
+  `last_rate_stats().byte_delta > 0`). The router also defensively
+  re-keyframes on pixel-mode switch (`Rgb24` ⇔ `Gray8`), so the inter
+  worker's grayscale-after-colour rejection can't trip an auto-routed
+  sequence. Composes with `with_target_bitrate` (round 96 / 121) —
+  the budget worker drives the RD grid toward the per-frame budget
+  on both the auto-routed intra and inter paths. `reset()` preserves
+  the interval (it's a configuration knob, not per-sequence state)
+  and zeroes the GOP counter so the next call is a clean intra.
+  Default `keyframe_interval = None` preserves the legacy manual-
+  routing behaviour exactly: `encode_intra` / `encode_inter` callers
+  see no change, and `encode_frame` returns a clear "set the interval
+  first" error. Output stays conformant Cinepak — GOP scheduling is
+  encoder policy, not a bitstream feature (spec `00-scope.md`
+  §"Lossy-codec validation criterion").
 - `encode_gray8_best_rd_grid` / `encode_gray8_round7` (round 101) —
   **grayscale RD-grid frame-level picker** (Lever N), the `Gray8`
   analog of `encode_rgb24_best_rd_grid` / `encode_rgb24_round7`.

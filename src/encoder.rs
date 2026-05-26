@@ -1351,6 +1351,56 @@ pub struct CinepakEncoder {
     /// configured) — a small-integer multiple of the base per-frame budget
     /// is a standard VBV-style ceiling.
     carry_over_cap_bytes: Option<u64>,
+    /// Round 143: seek-friendly GOP keyframe interval. When `Some(n)`, the
+    /// auto-routing [`Self::encode_frame`] / [`Self::encode_frame_gray8`]
+    /// entry points emit an intra (keyframe) frame every `n` frames — frame
+    /// 0, frame n, frame 2n, … — and inter frames in between. `None` (the
+    /// default) disables auto-routing: callers must explicitly choose
+    /// between [`Self::encode_intra`] and [`Self::encode_inter`].
+    ///
+    /// See spec `docs/video/cinepak/spec/01-frame-and-strip.md` §1.1 for
+    /// the wire-format keyframe convention this primitive targets
+    /// (container keyframe flag ⇔ codec `flags = 0x00` ⇔ all strips
+    /// `0x1000` ⇔ intra). The intra/inter dispatch is **encoder policy**
+    /// — output stays conformant Cinepak regardless of interval choice.
+    keyframe_interval: Option<u32>,
+    /// Round 143: position within the current GOP, counted from the most
+    /// recent keyframe. Zero immediately after [`Self::reset`] or after a
+    /// keyframe-emitting [`Self::encode_frame`] call; incremented by each
+    /// inter frame the auto-router emits. Frame counts in the
+    /// keyframe-interval rule are 0-indexed: with `interval = 5` the
+    /// emitted pattern is `I P P P P I P P P P I …` (counter cycles
+    /// `0..5` then resets to `0`).
+    gop_pos: u32,
+    /// Round 143: one-shot keyframe request. Set by
+    /// [`Self::force_next_keyframe`]; consumed by the next
+    /// [`Self::encode_frame`] / [`Self::encode_frame_gray8`] call. Always
+    /// produces an intra frame on the next call regardless of
+    /// `keyframe_interval` state, then resets the GOP counter to `0` for
+    /// the rest of the sequence.
+    force_keyframe: bool,
+}
+
+/// Round 143: auto-routed encoded frame returned by
+/// [`CinepakEncoder::encode_frame`] / [`CinepakEncoder::encode_frame_gray8`].
+/// Carries the encoded byte stream plus the keyframe / GOP-position
+/// metadata the container muxer needs to set the container's keyframe
+/// flag (e.g. AVI `AVIF_KEYFRAME` / QuickTime sync sample / Sega FILM
+/// `sample_info_1`) without re-decoding the first byte.
+#[derive(Clone, Debug)]
+pub struct EncodedFrame {
+    /// The conformant Cinepak frame bytes (10-byte frame header + strips).
+    /// Identical to the return value of [`CinepakEncoder::encode_intra`] /
+    /// [`CinepakEncoder::encode_inter`].
+    pub bytes: Vec<u8>,
+    /// `true` when this frame was coded as intra (full-replace codebooks,
+    /// no inter dependencies). The container muxer should mark the
+    /// corresponding container sample as a keyframe.
+    pub is_keyframe: bool,
+    /// 0-based position of this frame within the current GOP, counted
+    /// from the most recent keyframe. `0` for keyframes; `1` for the
+    /// first inter frame after a keyframe; etc.
+    pub frame_number_in_gop: u32,
 }
 
 /// Round-7 per-frame telemetry, queried via
@@ -1442,6 +1492,9 @@ impl Default for CinepakEncoder {
             cumulative_target_bytes: 0,
             cumulative_actual_bytes: 0,
             carry_over_cap_bytes: None,
+            keyframe_interval: None,
+            gop_pos: 0,
+            force_keyframe: false,
         }
     }
 }
@@ -1472,13 +1525,19 @@ impl CinepakEncoder {
         let cf = self.cross_frame_persistence;
         let tgt = self.target_frame_bytes;
         let cap = self.carry_over_cap_bytes;
+        let gop = self.keyframe_interval;
         *self = Self::default();
         self.cross_frame_persistence = cf;
         self.target_frame_bytes = tgt;
         self.carry_over_cap_bytes = cap;
+        self.keyframe_interval = gop;
         // CBR accumulator zeroed by Self::default(); explicit here for clarity.
         self.cumulative_target_bytes = 0;
         self.cumulative_actual_bytes = 0;
+        // Round 143: GOP position resets to 0 — the next encode_frame call
+        // must emit a keyframe (no prev_frame after reset, anyway).
+        self.gop_pos = 0;
+        self.force_keyframe = false;
     }
 
     /// Toggle round-5 cross-frame codebook persistence (warm-starting
@@ -1692,6 +1751,234 @@ impl CinepakEncoder {
     /// [`FrameStats::default`] (all zeros).
     pub fn last_frame_stats(&self) -> FrameStats {
         self.last_stats
+    }
+
+    /// Round 143: configure a seek-friendly GOP keyframe interval
+    /// (builder form). When `n >= 1` is supplied, the auto-routing
+    /// [`Self::encode_frame`] / [`Self::encode_frame_gray8`] entry
+    /// points emit an intra frame every `n`-th call (frame 0, frame
+    /// `n`, frame `2n`, …) and inter frames in between.
+    ///
+    /// Spec reference: `docs/video/cinepak/spec/01-frame-and-strip.md`
+    /// §1.1 — the container's keyframe flag (`AVIF_KEYFRAME` /
+    /// `sample_info_1` keyframe bit / QuickTime sync sample) and the
+    /// codec's `flags = 0x00` + all-strips-`0x1000` intra advertise
+    /// seekable boundaries together. The interval setting is encoder
+    /// policy; output stays conformant Cinepak.
+    ///
+    /// `n = 1` means "every frame is a keyframe" (intra-only stream;
+    /// no inter savings, but every frame is independently seekable).
+    /// `n = 0` is treated as `1` (silently clamped — a zero-interval
+    /// would be meaningless). Larger intervals trade seek granularity
+    /// for compression: typical playback streams use `15` (one keyframe
+    /// per ~0.5 s at 30 fps) to `60` (~2 s at 30 fps).
+    ///
+    /// Preserved across [`Self::reset`] (it's a configuration knob,
+    /// not per-sequence state). Use [`Self::clear_keyframe_interval`]
+    /// to return to manual-routing mode (call `encode_intra` / `encode_inter`
+    /// directly), or pass `0` (also clamped to `clear`-equivalent
+    /// behaviour via [`Self::set_keyframe_interval`]).
+    #[must_use]
+    pub fn with_keyframe_interval(mut self, n: u32) -> Self {
+        self.set_keyframe_interval(n);
+        self
+    }
+
+    /// Round 143: in-place form of [`Self::with_keyframe_interval`].
+    /// `n = 0` is clamped to `1` (a zero interval is meaningless).
+    /// Also resets the GOP position counter so the next
+    /// [`Self::encode_frame`] call emits a keyframe.
+    pub fn set_keyframe_interval(&mut self, n: u32) {
+        self.keyframe_interval = Some(n.max(1));
+        // Reset GOP position so the next encode_frame call emits an intra
+        // keyframe — without this, switching the interval mid-sequence
+        // could leave gop_pos > new_interval briefly, producing two
+        // back-to-back keyframes only if force_keyframe is set.
+        self.gop_pos = 0;
+    }
+
+    /// Round 143: disable auto-routing — callers must explicitly choose
+    /// between [`Self::encode_intra`] and [`Self::encode_inter`].
+    /// Resets the GOP position counter to `0` and clears any pending
+    /// [`Self::force_next_keyframe`] request.
+    pub fn clear_keyframe_interval(&mut self) {
+        self.keyframe_interval = None;
+        self.gop_pos = 0;
+        self.force_keyframe = false;
+    }
+
+    /// Round 143: the GOP keyframe interval currently in effect, or `None`
+    /// when in manual-routing mode (no auto-keyframe scheduling).
+    pub fn keyframe_interval(&self) -> Option<u32> {
+        self.keyframe_interval
+    }
+
+    /// Round 143: 0-based position within the current GOP. Zero when the
+    /// next [`Self::encode_frame`] call will emit a keyframe (either
+    /// because the GOP boundary is due, or because [`Self::force_next_keyframe`]
+    /// has been requested, or because no frame has been emitted yet).
+    /// Otherwise the number of inter frames that have been emitted since
+    /// the most recent keyframe.
+    pub fn gop_position(&self) -> u32 {
+        if self.force_keyframe {
+            0
+        } else {
+            self.gop_pos
+        }
+    }
+
+    /// Round 143: request a one-shot keyframe on the next
+    /// [`Self::encode_frame`] / [`Self::encode_frame_gray8`] call,
+    /// regardless of the configured [`Self::keyframe_interval`]. Useful
+    /// for scene-cut refresh (e.g. when [`Self::last_rate_stats`] flags a
+    /// budget overshoot, or when an upstream scene-detect notes a cut),
+    /// for inserting an extra seekable boundary on demand, or for
+    /// recovering after a forced encoder-state reset on the receiver.
+    ///
+    /// The request is consumed by the next auto-routed encode; the GOP
+    /// counter resets to `0` afterwards (so the next regular keyframe
+    /// is `keyframe_interval` frames later, not at the original
+    /// schedule). Has no effect when [`Self::keyframe_interval`] is
+    /// `None`; in that case the caller should just call
+    /// [`Self::encode_intra`] directly.
+    pub fn force_next_keyframe(&mut self) {
+        self.force_keyframe = true;
+    }
+
+    /// Round 143: auto-routed encode entry point for `Rgb24` content.
+    /// Selects intra vs inter based on the configured
+    /// [`Self::keyframe_interval`] and the encoder's GOP position
+    /// counter, then dispatches to [`Self::encode_intra`] or
+    /// [`Self::encode_inter`]. Returns an [`EncodedFrame`] carrying the
+    /// bytes plus the `is_keyframe` flag for the container muxer.
+    ///
+    /// Routing rule:
+    /// - When `keyframe_interval` is `None`, returns an error — the
+    ///   caller is in manual-routing mode and must call `encode_intra` /
+    ///   `encode_inter` directly. Use [`Self::with_keyframe_interval`] /
+    ///   [`Self::set_keyframe_interval`] to enable auto-routing first.
+    /// - When `force_next_keyframe` was requested, emits intra and
+    ///   consumes the request.
+    /// - When the GOP-position counter is `0` (start of a new GOP, or
+    ///   the encoder has just been [`Self::reset`]), emits intra.
+    /// - When no `prev_frame` is held (first call after construction or
+    ///   after a configuration change that cleared it), emits intra
+    ///   defensively even if the counter would otherwise route to inter.
+    /// - Otherwise emits inter.
+    ///
+    /// Composes with all existing levers: target-bitrate budget mode
+    /// (round 96 / 121), cross-frame codebook persistence (round 5),
+    /// slot reclamation (round 7), and the RD grid picker run inside
+    /// the intra / inter workers. The GOP counter increments after a
+    /// successful inter frame and resets to `0` after a keyframe — the
+    /// rest of the encoder state is unchanged from the manual
+    /// `encode_intra` / `encode_inter` path.
+    ///
+    /// See `docs/video/cinepak/spec/01-frame-and-strip.md` §1.1 for the
+    /// wire-format keyframe convention this primitive targets.
+    pub fn encode_frame(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<EncodedFrame> {
+        self.encode_frame_mode(rgb, width, height, opts, PixelMode::Yuv12)
+    }
+
+    /// Round 143: auto-routed encode entry point for `Gray8` content.
+    /// Grayscale analog of [`Self::encode_frame`]. Same routing rule,
+    /// dispatches to [`Self::encode_intra_gray8`] /
+    /// [`Self::encode_inter_gray8`].
+    ///
+    /// As with the manual grayscale path, a grayscale inter frame must
+    /// follow a grayscale frame. The auto-router's first-call /
+    /// no-prev-frame intra fallback handles this implicitly — a fresh
+    /// encoder (or one reset between sequences) always emits intra on
+    /// the first call, so a mode switch between an `Rgb24` and a
+    /// `Gray8` sequence requires a [`Self::reset`] (or an explicit
+    /// [`Self::force_next_keyframe`]) between them.
+    pub fn encode_frame_gray8(
+        &mut self,
+        input: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+    ) -> Result<EncodedFrame> {
+        self.encode_frame_mode(input, width, height, opts, PixelMode::Gray8)
+    }
+
+    /// Round 143: shared auto-routing worker. Decides intra vs inter,
+    /// dispatches to the right public entry, increments the GOP
+    /// counter, and packs the result into an [`EncodedFrame`].
+    fn encode_frame_mode(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        opts: EncoderOptions,
+        mode: PixelMode,
+    ) -> Result<EncodedFrame> {
+        let interval = self.keyframe_interval.ok_or_else(|| {
+            CinepakError::other(
+                "encoder: encode_frame requires keyframe_interval to be set; \
+                 call with_keyframe_interval / set_keyframe_interval first, or \
+                 use encode_intra / encode_inter for manual routing",
+            )
+        })?;
+        // Decide intra vs inter. Intra when:
+        //   1. a force_next_keyframe request is pending; OR
+        //   2. the GOP counter is at a boundary (gop_pos == 0, or the next
+        //      frame would equal/exceed the interval — gop_pos % interval == 0); OR
+        //   3. no prev_frame is held (first call / state cleared); OR
+        //   4. the prev_frame is in a different mode than the current call
+        //      (a mode switch — defensively re-keyframe to avoid the
+        //      grayscale-after-colour rejection the inter worker enforces).
+        let mode_mismatch = match (&self.prev_frame, mode) {
+            (Some(f), PixelMode::Yuv12) => f.pixel_format != CinepakPixelFormat::Rgb24,
+            (Some(f), PixelMode::Gray8) => f.pixel_format != CinepakPixelFormat::Gray8,
+            (None, _) => false, // handled by prev_frame.is_none() arm below
+        };
+        let intra = self.force_keyframe
+            || self.gop_pos == 0
+            || (interval > 0 && self.gop_pos % interval == 0)
+            || self.prev_frame.is_none()
+            || mode_mismatch;
+
+        let bytes = if intra {
+            match mode {
+                PixelMode::Yuv12 => self.encode_intra(pixels, width, height, opts)?,
+                PixelMode::Gray8 => self.encode_intra_gray8(pixels, width, height, opts)?,
+            }
+        } else {
+            match mode {
+                PixelMode::Yuv12 => self.encode_inter(pixels, width, height, opts)?,
+                PixelMode::Gray8 => self.encode_inter_gray8(pixels, width, height, opts)?,
+            }
+        };
+
+        // GOP position tracking. The frame_number_in_gop returned is the
+        // 0-based position of *this* frame within its GOP — 0 for the
+        // keyframe we just emitted, gop_pos (pre-increment) for an inter
+        // frame.
+        let frame_number_in_gop = if intra { 0 } else { self.gop_pos };
+        if intra {
+            self.gop_pos = 1;
+            self.force_keyframe = false;
+        } else {
+            self.gop_pos = self.gop_pos.saturating_add(1);
+            // Wrap when we hit the interval — the *next* call will detect
+            // gop_pos % interval == 0 and emit intra.
+            if interval > 0 && self.gop_pos >= interval {
+                self.gop_pos = 0;
+            }
+        }
+
+        Ok(EncodedFrame {
+            bytes,
+            is_keyframe: intra,
+            frame_number_in_gop,
+        })
     }
 
     /// Encode an intra frame from packed `Rgb24` input. Resets the

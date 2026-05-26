@@ -1,0 +1,47 @@
+[package]
+name = "oxideav-cinepak-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Cinepak's decoder surface — `header::FrameHeader::parse`,
+# `header::RawStripHeader::parse`, `CinepakDecoder::decode_frame`,
+# `CinepakDecoder::decode_deviant_frame` (Saturn + Lemmings configs) —
+# plus the Sega FILM demuxer (`probe_film`, `FilmDemuxer::parse`) is the
+# part worth fuzzing: every codec entry point above ingests
+# attacker-controlled bytes and drives downstream allocation /
+# bit-extractor / codebook / vector / YUV-RGB paths from those bytes.
+# There is no external library worth pulling in as a cross-decode
+# oracle (and the clean-room wall bars any reference codec source
+# anyway), so this fuzz crate is **decode-only**: feed arbitrary bytes
+# to every public parser and assert each always returns a `Result`
+# rather than panicking / aborting / overflowing / indexing OOB /
+# OOMing on an attacker-claimed `strip_count` / `frame_length` /
+# `STAB.num_entries` value.
+#
+# `default-features = false` keeps the framework registry (and its
+# `oxideav-core` dependency) out of the fuzz binary — every decoder
+# entry point under test is feature-independent (the standalone
+# re-exports in `lib.rs`).
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-cinepak]
+path = ".."
+default-features = false
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_cinepak"
+path = "fuzz_targets/decode_cinepak.rs"
+test = false
+doc = false

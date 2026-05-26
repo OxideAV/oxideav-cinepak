@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 148 (panic-free fuzz harness): new `fuzz/` directory with a
+  `cargo-fuzz` harness (`decode_cinepak`) that funnels arbitrary
+  fuzz-supplied bytes through every public byte-driven parser —
+  `header::FrameHeader::parse`, `header::RawStripHeader::parse`,
+  `CinepakDecoder::decode_frame`, `CinepakDecoder::decode_deviant_frame`
+  driven twice (with `DeviantConfig::saturn` and
+  `DeviantConfig::lemmings_3do`), `probe_film`, and
+  `FilmDemuxer::parse`. The contract under test is panic-freedom: a
+  malformed stream must yield `Err(CinepakError::…)`, a well-formed one
+  `Ok(…)`, and neither path may panic / abort / integer-overflow / OOB /
+  pre-allocate an attacker-claimed `width × height` (frame raster) or
+  `STAB.num_entries` (Sega FILM sample table) buffer that exceeds the
+  input's plausible backing. The harness pre-screens both fields against
+  a 16 MiB output-raster cap and a ~65 536-record (1 MiB) sample-table
+  cap before driving the heavy paths, so the fuzzer surfaces logic bugs
+  rather than legitimate resource requests against the 16-bit `width` /
+  `height` and 32-bit `num_entries` wire fields. The library itself
+  imposes no such cap (the spec allows the full ranges). The fuzz
+  crate uses `default-features = false` so the binary doesn't pull in
+  `oxideav-core`; every entry point is exposed via the standalone
+  re-exports in `lib.rs`. Companion `.github/workflows/fuzz.yml` runs
+  the harness via the org-level `crate-fuzz.yml` reusable workflow on
+  a daily 06:53 UTC cron with a 30-minute budget.
+
 - Round 143 (seek-friendly keyframe interval enforcement):
   `CinepakEncoder::with_keyframe_interval(n)` /
   `set_keyframe_interval(n)` / `clear_keyframe_interval()` /

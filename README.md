@@ -872,3 +872,52 @@ RGB paths gain 17–25 % from the V1 conversion-count collapse and the
 mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
+
+## Fuzzing (round 148)
+
+Round 148 wired up a `cargo-fuzz` harness so every public byte-driven
+parser ingests attacker-controlled input under libFuzzer. The whole
+contract under test is panic-freedom: a malformed stream yields
+`Err(CinepakError::…)`, a well-formed one yields `Ok(…)`, and neither
+path may panic, abort, integer-overflow (debug / ASAN), index out of
+bounds, or pre-allocate an attacker-claimed `width × height` /
+`STAB.num_entries` buffer that exceeds what the input could possibly
+back. Six entry points fire on every input:
+
+- `header::FrameHeader::parse` — the 10-byte frame header (`spec/01`
+  §1).
+- `header::RawStripHeader::parse` — the 12-byte strip header
+  (`spec/01` §2).
+- `CinepakDecoder::decode_frame` — the full standard-Cinepak frame
+  decode (chunk walker + V4 / V1 codebook + 0x3000 / 0x3100 / 0x3200
+  vector chunks + macroblock expansion + YUV→RGB).
+- `CinepakDecoder::decode_deviant_frame` × `DeviantConfig::saturn` —
+  12-byte prefix + 8-byte-short `frame_length` + codebook-pad tolerance
+  (`Sega_FILM.wiki` lines 125–143).
+- `CinepakDecoder::decode_deviant_frame` × `DeviantConfig::lemmings_3do`
+  — 16-byte prefix, otherwise identical to Saturn
+  (`Sega_FILM.wiki` line 189). Different prefix arithmetic ⇒
+  separate bounds-check coverage.
+- `probe_film` + `FilmDemuxer::parse` — the Sega FILM / CPK header
+  walker (FILM + FDSC + STAB + sample-record table).
+
+The harness caps the declared output raster at 16 MiB and the declared
+`STAB.num_entries` at ~65 536 records (1 MiB sample table) before
+calling the heavy paths — the 16-bit `width` / `height` and 32-bit
+`num_entries` fields are wire-controlled, so without the cap the
+fuzzer would surface every multi-GiB resource request as an OOM and
+mask real logic bugs. The library itself imposes no such cap (the
+spec allows the full u16 range). The fuzz crate uses
+`default-features = false` so the harness binary doesn't pull in
+`oxideav-core`; every entry point is exposed via the standalone
+re-exports in `lib.rs`.
+
+Run locally with:
+
+```sh
+cd crates/oxideav-cinepak/fuzz
+cargo +nightly fuzz run decode_cinepak
+```
+
+CI runs the harness on the daily 06:53 UTC cron via the org-level
+`crate-fuzz.yml` reusable workflow (30-minute budget).

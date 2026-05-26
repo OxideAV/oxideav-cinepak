@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -411,6 +411,26 @@ into `assemble_frame` — intra call sites pass `0`, inter call sites pass
 mean **34.18 dB PSNR** with every per-frame value ≥ 31.7 dB (intra
 32.03 / inter 31.73 / 34.75 / 35.70 / 36.67 dB), exactly matching the
 self-decode trace.
+
+Round 160 (depth-mode profiling) added a standalone profiling driver
+(`examples/profile_cinepak.rs`) plus a captured baseline under
+`profile/README.md`. The driver is a flat measure-this-thing harness
+designed for `samply` / `cargo flamegraph` capture against the four
+cost-axis scenarios the round-126 Criterion benches use
+(`rgb24/64x64/q50/round7`, `rgb24/320x240/q50/baseline`,
+`rgb24/640x480/q70/baseline`, `gray8/320x240/q50/baseline`), plus a
+stateful 5-frame GOP mode that exercises the picker + rolling-codebook
++ rate-control machinery the stateless `encode_*` entry points bypass.
+The committed baseline (Apple M4 Max, release) anchors **decode at
+3.2–4.4 GiB/s of raw output** (~3000× realtime at 320×240@30, no
+measurable inner hot loop for algorithmic gains — further speed-ups
+need SIMD), **stateless encode at ~24 ms/iter for 320×240/q50** (~9.1
+MiB/s of raw input dominated by the picker + codebook trainer), and
+the headline **stateful 5-frame GOP at ~67 ms/seq** (~13.5 ms/frame
+mixing intra + 4 inter, ~7.6 KiB CVID per frame averaged). The
+artefact's intent: persist a stable visual / numerical baseline that
+future encoder-optimisation rounds can A/B-compare their algorithmic
+tweaks against, without having to re-discover the capture recipe.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.

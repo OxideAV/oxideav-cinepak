@@ -6,6 +6,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 160 (depth-mode profiling driver): new
+  `examples/profile_cinepak.rs` driver — a flat measure-this-thing
+  harness that builds deterministic xorshift32-seeded RGB / grayscale
+  inputs once then runs a fixed iteration count of the four
+  cost-axis scenarios the round-126 Criterion benches target
+  (`rgb24/64x64/q50/round7`, `rgb24/320x240/q50/baseline`,
+  `rgb24/640x480/q70/baseline`, `gray8/320x240/q50/baseline`) plus a
+  `stateful` mode that drives a 5-frame GOP through the full picker
+  + rolling-codebook + rate-control machinery the stateless
+  `encode_*` entry points bypass. The driver is intended for
+  sampling-profiler capture (`samply` on macOS, `perf record` on
+  Linux, `cargo flamegraph` on either) without the warm-up + sampler
+  layers Criterion adds between iterations. Modes:
+  - `encode` — synth pixels, encode N times (decoder cost excluded)
+  - `decode` — encode each scenario once outside the loop, decode N
+    times against the cached bytes
+  - `roundtrip` — synth pixels, encode + decode every iteration
+  - `stateful` — drive a 5-frame GOP (intra + 4 inter), measuring
+    the picker / rate-control cost as it appears in a real streaming
+    use case
+  - `all` — run every mode (default)
+  Captured baseline numbers (Apple M4 Max, release build) committed
+  alongside the driver under `profile/README.md`: decode peaks at
+  4.4 GiB/s of raw output on the 640×480/q70 fixture (~3000×
+  realtime at 320×240@30); stateless encode runs at 24 ms/iter on
+  320×240/q50 (~9.1 MiB/s of raw input); the stateful 5-frame GOP at
+  320×240/q50 averages 13.5 ms/frame across 1 intra + 4 inter. The
+  baseline is the durable artefact — future optimisation rounds
+  re-run the driver against the same scenarios to A/B-compare their
+  changes, with regression > 10 % on any row the bisect trigger.
+
 ### Fixed
 
 - Round 155 (frame-header `flags` byte on inter frames): the encoder

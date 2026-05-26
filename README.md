@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -388,6 +388,29 @@ localise the luminance ramp; on the 320×240 gradient **+5.16 dB** (44.84
 change). 7 new tests cover conformance, the headline gain, no-regression
 vs the fixed default across three sizes, noise handling, empty-candidate
 rejection, and pure-distortion (`rdo_lambda = None`) ranking.
+
+Round 155 (ffmpeg multi-frame inter cross-decode + frame-header `flags`
+fix) closed a long-standing wire-format gap: every ffmpeg-as-decoder
+test in the crate ran against **single-frame** AVIs through r154, so the
+round-4 stateful selective-update (`0x2100` / `0x2300`) and chunk-
+omission wire patterns the `CinepakEncoder` emits on inter frames had
+never been validated against ffmpeg as a third-party decoder. Building
+that test (`tests/ffmpeg_multi_frame_inter.rs` — a 5-frame 96×64 single-
+GOP slow-pan fixture wrapped in a proper multi-entry-`idx1` AVI and
+piped through ffmpeg) surfaced a spec-conformance bug in the encoder:
+`assemble_frame` was hardcoding `flags = 0x00` in the 10-byte frame
+header on every call, including inter frames. Spec
+`docs/video/cinepak/spec/01-frame-and-strip.md` §1.1 (lines 88–99) +
+`02-codebooks.md` §5.2 require `flags & 0x01` set on an inter frame to
+advertise codebook inheritance from the previous strip / previous
+frame's last strip; ffmpeg's decoder honours the bit strictly while our
+own decoder is permissive and inherits unconditionally (which is why no
+in-crate test caught it). The fix threads an explicit `flags: u8` arg
+into `assemble_frame` — intra call sites pass `0`, inter call sites pass
+`0x01`. With the fix in place the 5-frame inter cross-decode hits a
+mean **34.18 dB PSNR** with every per-frame value ≥ 31.7 dB (intra
+32.03 / inter 31.73 / 34.75 / 35.70 / 36.67 dB), exactly matching the
+self-decode trace.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.

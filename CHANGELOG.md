@@ -6,7 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 155 (frame-header `flags` byte on inter frames): the encoder
+  previously hardcoded `flags = 0x00` in every frame header it
+  emitted, including inter frames where spec
+  `docs/video/cinepak/spec/01-frame-and-strip.md` §1.1
+  (lines 88–99) + `02-codebooks.md` §5.2 require `flags & 0x01` set
+  on the inter frame to advertise codebook inheritance from the
+  previous strip / previous frame's last strip. Our own decoder is
+  permissive and inherits unconditionally (which is why no in-crate
+  test caught the bug), but ffmpeg's decoder is strict about the bit:
+  a `flags = 0x00` inter frame carrying selective-update (`0x2100` /
+  `0x2300`) or chunk-omitted strips would decode against an
+  uninitialised codebook on ffmpeg's side, producing visible drift on
+  multi-frame inter sequences. The fix:
+  - `assemble_frame` now takes an explicit `flags: u8` parameter.
+  - Intra call sites (stateful `encode_intra_one`, stateless
+    `encode_intra_frame`, and the `encode_rgb24_per_strip_rd` /
+    `_round8` intra picker) pass `0`.
+  - Inter call sites (stateful `encode_inter_one`, stateless
+    `encode_inter_frame`) pass `0x01`.
+  Single-frame self-decode tests are unaffected; the new
+  `tests/ffmpeg_multi_frame_inter.rs` covers the cross-decode
+  conformance for a single-GOP 5-frame sequence (≥ 28 dB per frame
+  against ffmpeg 8.1).
+
 ### Added
+
+- Round 155 (multi-frame stateful-inter cross-decode against ffmpeg):
+  `tests/ffmpeg_multi_frame_inter.rs` exercises a 5-frame 96×64
+  single-GOP RGB24 sequence — encodes with
+  `CinepakEncoder::encode_intra` + `encode_inter`, wraps in a
+  multi-frame AVI with proper per-frame keyframe flags + multi-entry
+  `idx1`, and pipes through ffmpeg as a black-box decoder. Asserts
+  per-frame PSNR ≥ 28 dB versus the synthetic source and reports a
+  mean PSNR of 34.18 dB on the local fixture. A companion
+  `self_multi_frame_inter_decode` runs the same sequence through our
+  own decoder and asserts the same floor, providing a fixture-driven
+  regression even when ffmpeg is unavailable on the CI runner. The
+  test gracefully skips (with `eprintln!` + early return) when
+  `ffmpeg` is absent or `OXIDEAV_SKIP_FFMPEG_TESTS` is set.
 
 - Round 148 (decoder cargo-fuzz harness): new `fuzz/` sub-package
   with four panic-free libFuzzer targets — `frame_header_parse`,

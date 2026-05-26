@@ -1064,8 +1064,9 @@ pub fn encode_rgb24_per_strip_rd(
         if !frame_ok {
             continue;
         }
-        // Assemble the multi-strip frame.
-        let assembled = assemble_frame(width, height, &chosen_strip_bytes)?;
+        // Assemble the multi-strip frame (intra-only path; `flags = 0`
+        // per the spec §1.1 natural-content convention).
+        let assembled = assemble_frame(width, height, &chosen_strip_bytes, 0)?;
         // Score the assembled frame on a frame-level Y-SSE / R basis
         // (note: the per-strip cost above is in per-strip units; we
         // need a frame-level comparable cost across strip_count
@@ -2038,7 +2039,9 @@ impl CinepakEncoder {
             let bytes = encode_intra_strip(rgb, width, mode, &opts, s, &mut self.rolling)?;
             frame_strips.push(bytes);
         }
-        let bytes = assemble_frame(width, height, &frame_strips)?;
+        // Intra frame: `flags = 0` per the spec §1.1 natural-content
+        // convention (all codebooks sent fresh, no inheritance).
+        let bytes = assemble_frame(width, height, &frame_strips, 0)?;
         // Reconstruct frame for next-call SKIP-MB selection.
         self.decoder.reset();
         let f = self.decoder.decode_frame(&bytes, None)?;
@@ -2234,7 +2237,13 @@ impl CinepakEncoder {
             reclaimed_v1_slots: acc.reclaimed_v1_slots,
             forced_full_chunks: acc.forced_full_chunks,
         };
-        let bytes = assemble_frame(width, height, &frame_strips)?;
+        // Inter frame: `flags = 0x01` per the spec §1.1 natural-content
+        // convention — bit 0 advertises codebook inheritance from the
+        // previous strip (or previous frame's last strip, for the first
+        // strip). The stateful encoder's selective-update / chunk-
+        // omission emission relies on the decoder honouring this bit;
+        // ffmpeg's decoder is strict about it.
+        let bytes = assemble_frame(width, height, &frame_strips, 0x01)?;
         // Reconstruct frame for next-call SKIP-MB selection. The
         // internal decoder picks up from where it left off, so its
         // codebook + prev-frame state stays in sync with an external
@@ -3341,7 +3350,8 @@ fn encode_intra_frame(
         let bytes = encode_intra_strip(pixels, width, mode, &opts, s, &mut roll)?;
         frame_strips.push(bytes);
     }
-    assemble_frame(width, height, &frame_strips)
+    // Intra frame: `flags = 0` per spec §1.1 natural-content convention.
+    assemble_frame(width, height, &frame_strips, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -3367,7 +3377,11 @@ fn encode_inter_frame(
     // every strip emits full-replace codebook chunks. Cross-frame
     // seeding is also disabled here — the free-function path has no
     // notion of "previous frame's codebook", only "previous frame's
-    // pixels".
+    // pixels". The decoder still receives a structurally inter-coded
+    // frame, so we advertise `flags = 0x01` per spec §1.1 natural-
+    // content convention; the chunks themselves are all full-replace
+    // so inheritance doesn't actually fire, but the bit aligns with
+    // the strip-id (0x1100) on the wire.
     let mut frame_strips: Vec<Vec<u8>> = Vec::with_capacity(strips.len());
     let mut roll = RollingCodebooks::default();
     for s in &strips {
@@ -3375,7 +3389,7 @@ fn encode_inter_frame(
             encode_inter_strip(pixels, prev, width, mode, &opts, s, &mut roll, false, false)?;
         frame_strips.push(bytes);
     }
-    assemble_frame(width, height, &frame_strips)
+    assemble_frame(width, height, &frame_strips, 0x01)
 }
 
 // ---------------------------------------------------------------------------
@@ -4472,7 +4486,7 @@ fn finalise_strip(strip_id: u16, s: &StripPlan, width: u32, chunks: &[u8]) -> Re
     Ok(out)
 }
 
-fn assemble_frame(width: u32, height: u32, strips: &[Vec<u8>]) -> Result<Vec<u8>> {
+fn assemble_frame(width: u32, height: u32, strips: &[Vec<u8>], flags: u8) -> Result<Vec<u8>> {
     let strips_total: usize = strips.iter().map(|s| s.len()).sum();
     let frame_length_usize = FRAME_HEADER_SIZE + strips_total;
     if frame_length_usize > 0x00ff_ffff {
@@ -4482,7 +4496,7 @@ fn assemble_frame(width: u32, height: u32, strips: &[Vec<u8>]) -> Result<Vec<u8>
     }
     let frame_length = frame_length_usize as u32;
     let frame_hdr = FrameHeader {
-        flags: 0,
+        flags,
         frame_length,
         width: width as u16,
         height: height as u16,

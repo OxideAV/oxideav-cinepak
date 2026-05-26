@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 148 (decoder cargo-fuzz harness): new `fuzz/` sub-package
+  with four panic-free libFuzzer targets — `frame_header_parse`,
+  `strip_header_parse`, `decode_frame`, `film_demuxer_parse` — and a
+  `.github/workflows/fuzz.yml` shim around the org-level
+  `crate-fuzz.yml` reusable workflow (1800 s daily budget split
+  across the four). `decode_frame` peeks at the wire `width`/`height`
+  (bytes 4..8) and caps coded pixels at 256 × 256 before invoking the
+  decoder, so a wire-legal `u16 × u16` raster (worst case ~12 GiB
+  RGB24) can't OOM the runner. The structural parse harnesses cap raw
+  input at 64 KiB.
+
+### Fixed
+
+- Round 148 (fuzz-found subtract-with-overflow bugs in the strip
+  header path):
+  - Decoder now rejects strips with wire `x_top > x_bottom` before
+    the modulo-4 alignment check underflows `sx1 - sx0`. New unit
+    test `decoder::tests::rejects_strip_with_x_top_above_x_bottom`.
+  - Decoder now rejects strips with resolved
+    `actual_y_top > actual_y_bottom` before the chunk loop reads
+    `StripHeader::height()`. The `height()` accessor itself also
+    moved to `saturating_sub` as defence-in-depth. New unit test
+    `decoder::tests::rejects_strip_with_y_top_above_y_bottom`.
+
+  Both bugs surfaced within the first ~10 seconds of fuzzing on the
+  fresh `decode_frame` target. A follow-up 90-second
+  `cargo fuzz run decode_frame` after both fixes (~19.7 M execs,
+  cov 53, ft 53) found no further crashes.
+
 - Round 143 (seek-friendly keyframe interval enforcement):
   `CinepakEncoder::with_keyframe_interval(n)` /
   `set_keyframe_interval(n)` / `clear_keyframe_interval()` /

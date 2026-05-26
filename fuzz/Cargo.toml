@@ -1,0 +1,57 @@
+[package]
+name = "oxideav-cinepak-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone sub-package owned by cargo-fuzz. Lives outside the umbrella
+# `[workspace] members = ["crates/*"]` glob via `[workspace]` of its own
+# so the umbrella's `cargo build` doesn't try to compile the libFuzzer
+# harnesses (which require nightly + libfuzzer_sys runtime).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The crate under test. Path-dep to the sibling so `cargo fuzz run` always
+# exercises the in-tree source. Cap dimensions in the harness rather than
+# pin a feature here; `registry` would drag oxideav-core into the fuzz
+# build for no benefit since the harnesses target standalone APIs only.
+oxideav-cinepak = { path = "..", default-features = false }
+
+# Per-target binary sections. Each `fuzz_target!` lives in its own file
+# under `fuzz_targets/`; cargo-fuzz expects one [[bin]] per target with
+# `path` pointing at the file and `test = false`/`doc = false`/
+# `bench = false` so the libFuzzer entry point doesn't collide with the
+# `cargo test` / `cargo bench` harnesses.
+
+[[bin]]
+name = "frame_header_parse"
+path = "fuzz_targets/frame_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strip_header_parse"
+path = "fuzz_targets/strip_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "film_demuxer_parse"
+path = "fuzz_targets/film_demuxer_parse.rs"
+test = false
+doc = false
+bench = false

@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -872,3 +872,37 @@ RGB paths gain 17–25 % from the V1 conversion-count collapse and the
 mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
+
+## Fuzz harness (round 148)
+
+Round 148 added a `cargo-fuzz` harness under `fuzz/` covering the
+four user-reachable parse / decode entry points on the public API:
+
+| Target | Surface |
+|--------|---------|
+| `frame_header_parse` | `header::FrameHeader::parse` — 10-byte frame header |
+| `strip_header_parse` | `header::RawStripHeader::parse` — 12-byte strip header |
+| `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline |
+| `film_demuxer_parse` | `FilmDemuxer::parse` — Sega FILM container parse |
+
+`decode_frame` peeks at the wire `width`/`height` (bytes 4..8) and
+short-circuits inputs above a 256 × 256 coded-pixel budget so the
+~12 GiB worst-case `u16 × u16` RGB24 raster doesn't OOM the runner;
+the structural parse harnesses cap raw input at 64 KiB. `.github/workflows/fuzz.yml`
+is a thin shim around the org-level `crate-fuzz.yml` reusable workflow
+with a 1800-second daily budget split across the four targets.
+
+Initial 90-second local run of the four targets (`~22M execs / target`)
+surfaced two real subtract-with-overflow bugs in the decoder, both now
+fixed with regression unit tests in `src/decoder.rs`:
+
+- `rejects_strip_with_x_top_above_x_bottom` — strip with wire
+  `x_top > x_bottom` would underflow `sx1 - sx0` at the modulo-4
+  check.
+- `rejects_strip_with_y_top_above_y_bottom` — strip with resolved
+  `actual_y_top > actual_y_bottom` would underflow inside
+  `StripHeader::height()` (which also gained a `saturating_sub` belt
+  even though the decoder now rejects before reaching it).
+
+After both fixes a follow-up 90-second `decode_frame` run hits ~19.7M
+executions with no further crashes.

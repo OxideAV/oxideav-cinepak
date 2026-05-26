@@ -236,6 +236,27 @@ impl CinepakDecoder {
                     strip_hdr.actual_y_top, strip_hdr.actual_y_bottom
                 )));
             }
+            // Per `docs/video/cinepak/spec/01-frame-and-strip.md` §2 the
+            // strip's `x_top` (left edge) must be <= `x_bottom` (right
+            // edge); without this guard fuzz-discovered `x_top > x_bottom`
+            // inputs trip a `sx1 - sx0` subtract-with-overflow on the
+            // next line (debug) or wrap to a huge u32 (release) and
+            // mislead the modulo-4 check. Same rule for y: a strip with
+            // wire `y_bottom < y_top` (or a non-first strip whose
+            // resolved `prev_y_bottom + raw.y_bottom` lands below
+            // `prev_y_bottom`) must be rejected before the chunk loop
+            // dereferences `strip_hdr.height()`.
+            if sx0 > sx1 {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} x_top {sx0} exceeds x_bottom {sx1}"
+                )));
+            }
+            if strip_hdr.actual_y_top > strip_hdr.actual_y_bottom {
+                return Err(CinepakError::invalid(format!(
+                    "strip {strip_index} y_top {} exceeds y_bottom {}",
+                    strip_hdr.actual_y_top, strip_hdr.actual_y_bottom
+                )));
+            }
             if (sx1 - sx0) % 4 != 0 || strip_hdr.height() % 4 != 0 {
                 return Err(CinepakError::invalid(format!(
                     "strip {strip_index} dims ({}x{}) not multiples of 4",
@@ -828,5 +849,67 @@ mod tests {
         assert_eq!(p[row2_off], 150);
         // Row 2, col 2: Y3=200
         assert_eq!(p[row2_off + 6], 200);
+    }
+
+    /// Regression for the r148 fuzz-discovered subtract-with-overflow
+    /// when a strip header reports `x_top > x_bottom`. Decoder must
+    /// reject cleanly, not panic.
+    #[test]
+    fn rejects_strip_with_x_top_above_x_bottom() {
+        // 8×4 frame so the inverted-x strip's `x_bottom = 0` is
+        // technically "in range" (0 <= width=8) — the bug fires inside
+        // the modulo-4 check before any bounds error trips.
+        let mut bytes = Vec::new();
+        // Frame header: flags=0, frame_length=?, w=8, h=4, sc=1
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 8, 0, 4, 0, 1]);
+        // Strip header: id=0x1000, size=?, y_top=0, x_top=8, y_bottom=4, x_bottom=0
+        let strip_hdr_pos = bytes.len();
+        bytes.extend_from_slice(&[0x10, 0x00, 0, 0, 0, 0, 0, 8, 0, 4, 0, 0]);
+
+        // Patch strip_size and frame_length.
+        let strip_size = (bytes.len() - strip_hdr_pos) as u16;
+        bytes[strip_hdr_pos + 2..strip_hdr_pos + 4].copy_from_slice(&strip_size.to_be_bytes());
+        let frame_len = bytes.len() as u32;
+        bytes[1] = ((frame_len >> 16) & 0xff) as u8;
+        bytes[2] = ((frame_len >> 8) & 0xff) as u8;
+        bytes[3] = (frame_len & 0xff) as u8;
+
+        let mut dec = CinepakDecoder::new();
+        let err = dec.decode_frame(&bytes, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("x_top") && msg.contains("exceeds x_bottom"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Regression for the r148 fuzz-discovered subtract-with-overflow
+    /// when a strip's resolved `actual_y_top > actual_y_bottom`. The
+    /// most reachable input is a first strip with raw `y_top > y_bottom`
+    /// where both are within the frame's `height`.
+    #[test]
+    fn rejects_strip_with_y_top_above_y_bottom() {
+        let mut bytes = Vec::new();
+        // 8×16 frame, 1 strip.
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 8, 0, 16, 0, 1]);
+        // Strip: y_top=8 > y_bottom=4 (both wire-legal absolutes since
+        // this is the first strip — sentinel rule doesn't fire).
+        let strip_hdr_pos = bytes.len();
+        bytes.extend_from_slice(&[0x10, 0x00, 0, 0, 0, 8, 0, 0, 0, 4, 0, 8]);
+
+        let strip_size = (bytes.len() - strip_hdr_pos) as u16;
+        bytes[strip_hdr_pos + 2..strip_hdr_pos + 4].copy_from_slice(&strip_size.to_be_bytes());
+        let frame_len = bytes.len() as u32;
+        bytes[1] = ((frame_len >> 16) & 0xff) as u8;
+        bytes[2] = ((frame_len >> 8) & 0xff) as u8;
+        bytes[3] = (frame_len & 0xff) as u8;
+
+        let mut dec = CinepakDecoder::new();
+        let err = dec.decode_frame(&bytes, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("y_top") && msg.contains("exceeds y_bottom"),
+            "unexpected error: {msg}"
+        );
     }
 }

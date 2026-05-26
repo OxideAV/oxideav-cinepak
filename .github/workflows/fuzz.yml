@@ -1,0 +1,22 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Cinepak's
+# decode pipeline (frame header -> per-strip headers -> codebook chunks
+# -> vector chunks -> macroblock expansion -> RGB24 / Gray8 raster) and
+# its Sega FILM container parser are the attack surface; there is no
+# external library oracle worth pulling in (and the clean-room wall bars
+# the C references anyway), so these are decode-only panic-free
+# harnesses. The 30-minute total budget is split across the four
+# targets (~7.5 min each) by the org-level reusable workflow.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"   # daily 06:23 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

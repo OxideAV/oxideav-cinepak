@@ -189,8 +189,15 @@ impl StripHeader {
     }
 
     /// Strip height in pixels.
+    ///
+    /// Uses saturating subtraction because malformed wire data can
+    /// produce `actual_y_bottom < actual_y_top` (e.g. a strip with
+    /// `y_bottom < y_top` directly from the bitstream, or a non-first
+    /// strip whose `prev_y_bottom + raw.y_bottom` wraps). The decoder
+    /// catches the ordering separately and rejects the frame, but the
+    /// accessor must not panic.
     pub fn height(&self) -> u32 {
-        self.actual_y_bottom - self.actual_y_top
+        self.actual_y_bottom.saturating_sub(self.actual_y_top)
     }
 
     /// Strip width in pixels.

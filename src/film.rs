@@ -253,6 +253,19 @@ impl SampleRecord {
             Some(self.sample_info_1 & 0x7FFF_FFFF)
         }
     }
+
+    /// For video records: `sample_info_2` is the number of
+    /// `STAB.base_frequency` ticks until the next frame is rendered
+    /// (per `Sega_FILM.wiki` line 116). Returns `None` for audio
+    /// samples — that field is always `1` for audio and carries no
+    /// inter-frame-gap meaning.
+    pub fn next_frame_ticks(&self) -> Option<u32> {
+        if self.is_audio() {
+            None
+        } else {
+            Some(self.sample_info_2)
+        }
+    }
 }
 
 /// A parsed FILM container's full header (FILM + FDSC + STAB and the
@@ -346,6 +359,114 @@ impl FilmDemuxer {
             .iter()
             .enumerate()
             .filter(|(_, s)| !s.is_audio())
+    }
+
+    /// Mirror of [`Self::video_samples`] for audio: returns just the
+    /// records whose `sample_info_1 == 0xFFFFFFFF` per
+    /// `Sega_FILM.wiki` line 104. Audio codec decoding is out of
+    /// scope for this crate, but the iterator is useful for callers
+    /// that need to skip over audio in the interleaved sample stream
+    /// to pull only the audio bytes (e.g. routing them to a separate
+    /// audio decoder).
+    pub fn audio_samples(&self) -> impl Iterator<Item = (usize, &SampleRecord)> {
+        self.samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_audio())
+    }
+
+    /// Returns just the video **keyframes**, in sample-table order.
+    /// Per `Sega_FILM.wiki` line 104 a video record's
+    /// `sample_info_1`-top-bit clear identifies a keyframe — the wiki
+    /// notes this "is useful for seeking since it is a good idea to
+    /// only jump to key frames when seeking through a file". This
+    /// helper is the entry point most seek implementations want.
+    pub fn keyframes(&self) -> impl Iterator<Item = (usize, &SampleRecord)> {
+        self.samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_audio() && s.is_keyframe())
+    }
+
+    /// Find the video keyframe whose timestamp (in
+    /// [`StabHeader::base_frequency`] ticks) is the **largest value
+    /// less than or equal to** `target_ticks`. Returns the sample
+    /// index + record, or `None` if no keyframe meets the criterion
+    /// (i.e. `target_ticks < ts(first keyframe)`, including the
+    /// no-keyframe case).
+    ///
+    /// This is the standard "snap-to-keyframe" seek primitive: the
+    /// caller picks the playback time the user requested (in
+    /// `base_frequency` ticks), this helper returns the keyframe
+    /// they must restart decoding from, and the caller skips
+    /// intermediate inter frames until reaching the target tick.
+    ///
+    /// The sample table is **not** assumed to be timestamp-sorted —
+    /// callers in the wild sometimes interleave samples non-
+    /// monotonically — so the scan is O(n) over the keyframes, not
+    /// a binary search. With Cinepak's CD-era frame counts (a few
+    /// thousand samples at most) the linear scan is well within
+    /// budget for any conceivable use.
+    pub fn seek_keyframe_for_tick(&self, target_ticks: u32) -> Option<(usize, &SampleRecord)> {
+        let mut best: Option<(usize, &SampleRecord, u32)> = None;
+        for (idx, s) in self.keyframes() {
+            // `is_keyframe()` already excluded audio, so
+            // `timestamp_ticks()` returns `Some` here.
+            let ts = s.timestamp_ticks().unwrap_or(0);
+            if ts <= target_ticks {
+                match best {
+                    None => best = Some((idx, s, ts)),
+                    Some((_, _, bts)) if ts > bts => best = Some((idx, s, ts)),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(idx, s, _)| (idx, s))
+    }
+
+    /// Total stream duration in `base_frequency` ticks: the
+    /// highest video-sample timestamp + that sample's
+    /// `next_frame_ticks()`. Returns `None` when the file contains
+    /// no video samples.
+    ///
+    /// Per `Sega_FILM.wiki` line 116, a video sample's
+    /// `sample_info_2` is the tick count until the next frame
+    /// renders — so the natural duration of a video clip is
+    /// `max(ts) + ticks_to_next` of that last frame.
+    pub fn duration_ticks(&self) -> Option<u32> {
+        let mut max_ts = None::<u32>;
+        let mut max_end = None::<u32>;
+        for (_, s) in self.video_samples() {
+            let ts = s.timestamp_ticks().unwrap_or(0);
+            let next = s.next_frame_ticks().unwrap_or(0);
+            let end = ts.saturating_add(next);
+            match max_ts {
+                None => {
+                    max_ts = Some(ts);
+                    max_end = Some(end);
+                }
+                Some(prev_ts) if ts > prev_ts => {
+                    max_ts = Some(ts);
+                    max_end = Some(end);
+                }
+                _ => {}
+            }
+        }
+        max_end
+    }
+
+    /// Total stream duration in seconds, computed as
+    /// [`Self::duration_ticks`] / [`StabHeader::base_frequency`].
+    /// Returns `None` if no video samples are present or the
+    /// recorded `base_frequency` is zero (a degenerate file).
+    pub fn duration_seconds(&self) -> Option<f64> {
+        let ticks = self.duration_ticks()?;
+        let base = self.stab_header.base_frequency;
+        if base == 0 {
+            None
+        } else {
+            Some(f64::from(ticks) / f64::from(base))
+        }
     }
 
     /// Classify the Cinepak wire-format variant in use by this FILM
@@ -568,5 +689,231 @@ mod tests {
         let video: Vec<_> = dem.video_samples().collect();
         assert_eq!(video.len(), 1);
         assert_eq!(video[0].0, 0);
+    }
+
+    // ---- r187: seek-friendly helpers -----------------------------------
+
+    /// Build a FILM file with `records` raw 16-byte STAB rows. The
+    /// first record's file-offset starts at 0; subsequent records are
+    /// appended in order. `header_length` is auto-computed.
+    fn build_film_with_records(records: &[[u32; 4]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let header_length: u32 = 16 + 32 + 16 + 16 * records.len() as u32;
+        // FILM header.
+        out.extend_from_slice(b"FILM");
+        out.extend_from_slice(&header_length.to_be_bytes());
+        out.extend_from_slice(b"1.09");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        // FDSC chunk (32 B).
+        out.extend_from_slice(b"FDSC");
+        out.extend_from_slice(&0x20u32.to_be_bytes());
+        out.extend_from_slice(b"cvid");
+        out.extend_from_slice(&64u32.to_be_bytes()); // height
+        out.extend_from_slice(&64u32.to_be_bytes()); // width
+        out.extend_from_slice(&[24u8, 0, 0, 0]);
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&[0u8; 6]);
+        // STAB chunk header.
+        out.extend_from_slice(b"STAB");
+        let stab_chunk_length: u32 = 16 + 16 * records.len() as u32;
+        out.extend_from_slice(&stab_chunk_length.to_be_bytes());
+        out.extend_from_slice(&600u32.to_be_bytes()); // base_frequency = 600 Hz
+        out.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for r in records {
+            out.extend_from_slice(&r[0].to_be_bytes());
+            out.extend_from_slice(&r[1].to_be_bytes());
+            out.extend_from_slice(&r[2].to_be_bytes());
+            out.extend_from_slice(&r[3].to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn next_frame_ticks_is_video_only() {
+        let video = SampleRecord {
+            sample_offset: 0,
+            sample_length: 5177,
+            sample_info_1: 0x00000040, // keyframe, ts=64
+            sample_info_2: 20,
+        };
+        assert_eq!(video.next_frame_ticks(), Some(20));
+        let audio = SampleRecord {
+            sample_offset: 0,
+            sample_length: 1024,
+            sample_info_1: 0xFFFF_FFFF,
+            sample_info_2: 1,
+        };
+        assert_eq!(audio.next_frame_ticks(), None);
+    }
+
+    #[test]
+    fn audio_samples_iterates_only_audio() {
+        // 4 records: video(K, ts=0), audio, video(I, ts=20), audio.
+        let bytes = build_film_with_records(&[
+            [0, 500, 0x00000000, 20],
+            [500, 100, 0xFFFF_FFFF, 1],
+            [600, 300, 0x80000014, 20],
+            [900, 100, 0xFFFF_FFFF, 1],
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        let audio: Vec<_> = dem.audio_samples().collect();
+        assert_eq!(audio.len(), 2);
+        // Sample-table indices 1 and 3 are audio.
+        assert_eq!(audio[0].0, 1);
+        assert_eq!(audio[1].0, 3);
+    }
+
+    #[test]
+    fn keyframes_iterates_only_video_keyframes() {
+        // K=ts0, I=ts20, K=ts40, I=ts60.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 20],   // V key ts=0
+            [100, 100, 0x80000014, 20], // V inter ts=20
+            [200, 100, 0x00000028, 20], // V key ts=40
+            [300, 100, 0x8000003c, 20], // V inter ts=60 (note: 0x3c = 60)
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        let kfs: Vec<_> = dem.keyframes().collect();
+        assert_eq!(kfs.len(), 2);
+        assert_eq!(kfs[0].0, 0);
+        assert_eq!(kfs[0].1.timestamp_ticks(), Some(0));
+        assert_eq!(kfs[1].0, 2);
+        assert_eq!(kfs[1].1.timestamp_ticks(), Some(40));
+    }
+
+    #[test]
+    fn keyframes_excludes_audio_with_top_bit_set() {
+        // An audio record's `sample_info_1 == 0xFFFFFFFF` has the
+        // top bit set; without the explicit audio filter on the
+        // keyframe iterator, `!is_keyframe()` would already exclude
+        // it — but defence-in-depth: the iterator should never yield
+        // an audio record under any circumstances.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 20],   // V key
+            [100, 100, 0xFFFF_FFFF, 1], // audio
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        let kfs: Vec<_> = dem.keyframes().collect();
+        assert_eq!(kfs.len(), 1);
+        assert_eq!(kfs[0].0, 0);
+    }
+
+    #[test]
+    fn seek_keyframe_for_tick_snaps_to_latest_at_or_below() {
+        // K=0, I=20, K=40, I=60, K=80.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 20],   // K, ts=0
+            [100, 100, 0x80000014, 20], // I, ts=20
+            [200, 100, 0x00000028, 20], // K, ts=40
+            [300, 100, 0x8000003c, 20], // I, ts=60
+            [400, 100, 0x00000050, 20], // K, ts=80
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // Seek to before any keyframe: ts=0 is the floor, found.
+        let (idx, s) = dem.seek_keyframe_for_tick(0).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(s.timestamp_ticks(), Some(0));
+        // Seek between K@0 and K@40: snap back to K@0.
+        let (idx, _) = dem.seek_keyframe_for_tick(35).unwrap();
+        assert_eq!(idx, 0);
+        // Seek exactly at K@40.
+        let (idx, _) = dem.seek_keyframe_for_tick(40).unwrap();
+        assert_eq!(idx, 2);
+        // Seek between K@40 and K@80: snap to K@40.
+        let (idx, _) = dem.seek_keyframe_for_tick(79).unwrap();
+        assert_eq!(idx, 2);
+        // Seek at K@80.
+        let (idx, _) = dem.seek_keyframe_for_tick(80).unwrap();
+        assert_eq!(idx, 4);
+        // Seek past EOS: snap to last keyframe.
+        let (idx, _) = dem.seek_keyframe_for_tick(10_000).unwrap();
+        assert_eq!(idx, 4);
+    }
+
+    #[test]
+    fn seek_keyframe_for_tick_returns_none_when_no_keyframes() {
+        // All-inter sample table — pathological but expressible.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x80000000, 20],   // I, ts=0
+            [100, 100, 0x80000014, 20], // I, ts=20
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert!(dem.seek_keyframe_for_tick(0).is_none());
+        assert!(dem.seek_keyframe_for_tick(50).is_none());
+    }
+
+    #[test]
+    fn seek_keyframe_for_tick_handles_unsorted_table() {
+        // Wire order: K@40, then K@0 — snap should still return the
+        // record whose ts is the largest ≤ target, regardless of
+        // table order.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000028, 20],   // K, ts=40
+            [100, 100, 0x00000000, 20], // K, ts=0
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // Target 30: closest keyframe ≤ 30 is K@0, which is the
+        // *second* table entry (idx=1).
+        let (idx, _) = dem.seek_keyframe_for_tick(30).unwrap();
+        assert_eq!(idx, 1);
+        // Target 50: closest keyframe ≤ 50 is K@40, idx=0.
+        let (idx, _) = dem.seek_keyframe_for_tick(50).unwrap();
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn duration_ticks_uses_last_frame_plus_next_gap() {
+        // 30 fps at 600 Hz base: 20 ticks per frame. 3 frames.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 20],   // K, ts=0,  next=20
+            [100, 100, 0x80000014, 20], // I, ts=20, next=20
+            [200, 100, 0x80000028, 20], // I, ts=40, next=20
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // Duration = ts(last) + next_frame_ticks(last) = 40 + 20 = 60.
+        assert_eq!(dem.duration_ticks(), Some(60));
+        // base_frequency = 600 Hz, so 60 ticks = 0.1 s.
+        assert!((dem.duration_seconds().unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duration_ticks_handles_variable_frame_gap() {
+        // Wiki line 114 — Myst-style: 30 Hz base, gaps of 2/3 ticks.
+        let bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 2],   // K, ts=0,  next=2
+            [100, 100, 0x80000002, 3], // I, ts=2,  next=3
+            [200, 100, 0x80000005, 2], // I, ts=5,  next=2
+            [300, 100, 0x80000007, 3], // I, ts=7,  next=3
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // Last frame ts=7, next=3 → duration=10.
+        assert_eq!(dem.duration_ticks(), Some(10));
+    }
+
+    #[test]
+    fn duration_handles_no_video_or_zero_base() {
+        // Audio-only — no video samples.
+        let bytes =
+            build_film_with_records(&[[0, 100, 0xFFFF_FFFF, 1], [100, 100, 0xFFFF_FFFF, 1]]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(dem.duration_ticks(), None);
+        assert_eq!(dem.duration_seconds(), None);
+    }
+
+    #[test]
+    fn duration_seconds_returns_none_for_zero_base_frequency() {
+        // Build a file then patch base_frequency to 0 — a degenerate
+        // value the parser doesn't (currently) reject.
+        let mut bytes = build_film_with_records(&[
+            [0, 100, 0x00000000, 20], // K, ts=0, next=20
+        ]);
+        // base_frequency is at: 16 (FILM) + 32 (FDSC) + 8 (STAB sig+len)
+        let base_off = 16 + 32 + 8;
+        bytes[base_off..base_off + 4].copy_from_slice(&0u32.to_be_bytes());
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // duration_ticks is still computable (it doesn't depend on base).
+        assert_eq!(dem.duration_ticks(), Some(20));
+        // duration_seconds short-circuits on zero base.
+        assert_eq!(dem.duration_seconds(), None);
     }
 }

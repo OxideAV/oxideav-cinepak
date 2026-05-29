@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -786,6 +786,23 @@ Container side (round 2):
   `DeviantSaturn` for ASCII `1.0X` versions, `DeviantLemmings3do`
   for NULL versions, `OutOfScope` for `'sega'` / `'Seg4'`
   Cinepak-for-Sega.
+- `FilmDemuxer::audio_samples` / `keyframes` /
+  `seek_keyframe_for_tick(target_ticks)` / `duration_ticks` /
+  `duration_seconds` + `SampleRecord::next_frame_ticks` (round 187)
+  — seek-friendly accessors per `Sega_FILM.wiki` lines 104, 110–116.
+  `audio_samples` mirrors `video_samples`. `keyframes` iterates
+  only video keyframes (the records playback engines must restart
+  decoding from; wiki line 104 explicitly calls out the seek use
+  case). `seek_keyframe_for_tick` returns the keyframe whose
+  timestamp is the largest value ≤ the requested tick — the
+  canonical snap-to-keyframe seek primitive. Tolerates non-sorted
+  sample tables (linear O(n) scan over the keyframe subset).
+  `duration_ticks` returns `max(ts) + next_frame_ticks(last)` per
+  wiki line 116; `duration_seconds` divides by
+  `StabHeader::base_frequency` (returns `None` on a degenerate
+  zero base). `SampleRecord::next_frame_ticks` surfaces
+  `sample_info_2` as the video-only ticks-until-next-frame field
+  the wiki documents.
 
 Decoder side, deviant Saturn variant (round 93):
 

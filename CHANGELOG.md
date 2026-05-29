@@ -8,6 +8,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 187 (FILM demuxer seek-friendly helpers): six new public
+  accessors on `FilmDemuxer` + `SampleRecord` that close the
+  long-standing "FILM parser exposes only the raw sample table, not
+  the seek primitives a player needs" gap. The wire format already
+  carries everything required for keyframe-aware seek per
+  `Sega_FILM.wiki` lines 104, 110-116 (sample_info_1 top bit ⇒
+  keyframe, lower 31 bits ⇒ absolute tick timestamp,
+  sample_info_2 ⇒ ticks-until-next-frame, STAB.base_frequency ⇒
+  ticks/sec); round 187 surfaces it through:
+  - `SampleRecord::next_frame_ticks() -> Option<u32>` —
+    `sample_info_2` exposed with the video-only semantics from
+    wiki line 116 ("the number of clock ticks until the next frame
+    is rendered"). Returns `None` for audio records where the field
+    is hardcoded to `1` and carries no inter-frame-gap meaning.
+  - `FilmDemuxer::audio_samples()` — mirror of the existing
+    `video_samples()`; iterates only records whose
+    `sample_info_1 == 0xFFFFFFFF`. Useful when routing audio bytes
+    to a separate decoder while skipping the interleaved video.
+  - `FilmDemuxer::keyframes()` — iterates only video keyframes in
+    sample-table order. Wiki line 104 explicitly motivates this:
+    "useful for seeking since it is a good idea to only jump to
+    key frames when seeking through a file".
+  - `FilmDemuxer::seek_keyframe_for_tick(target_ticks: u32)` —
+    snap-to-keyframe seek primitive. Returns the
+    `(sample_index, &SampleRecord)` for the keyframe whose
+    timestamp is the **largest value ≤ target_ticks**, the
+    canonical seek-floor operation any FILM player needs. Tolerant
+    of non-timestamp-sorted sample tables (linear O(n) scan over
+    the keyframe subset; Cinepak's CD-era frame counts make the
+    scan cost trivial). Returns `None` only when no keyframes meet
+    the floor (e.g. seeking before the first keyframe, or a
+    pathological all-inter table).
+  - `FilmDemuxer::duration_ticks() -> Option<u32>` — total stream
+    duration in `base_frequency` ticks, computed as
+    `max(ts) + next_frame_ticks(last)` per wiki line 116 — the
+    natural "end of last frame's render window" definition.
+    Returns `None` for video-free files (audio-only).
+  - `FilmDemuxer::duration_seconds() -> Option<f64>` — convenience
+    division by `StabHeader::base_frequency`. Returns `None` on
+    zero base frequency (defence against a degenerate input the
+    parser doesn't currently reject).
+  10 new unit tests in `src/film.rs::tests` cover: video-only
+  `next_frame_ticks` semantics; `audio_samples` index correctness on
+  an interleaved 4-record table; `keyframes` ignoring both inter
+  frames and audio sentinels (defence-in-depth on the `is_audio`
+  guard inside the iterator); `seek_keyframe_for_tick` snapping
+  at, before, between, exactly on, and past the last keyframe;
+  the `None` return for all-inter pathological tables; the linear
+  scan handling non-sorted sample tables; `duration_ticks` against
+  both even-spaced (30 fps @ 600 Hz) and variable-gap
+  (Myst-style 30 Hz with 2/3-tick alternation per wiki line 114)
+  fixtures; and the `duration_seconds` zero-base-frequency guard
+  returning `None` while `duration_ticks` still computes a value.
+  Seek primitives are framework-feature-free — the
+  `default-features = false` standalone build picks them up too.
+
 - Round 181 (codebook-chunk-apply fuzz target): new
   `fuzz/fuzz_targets/codebook_chunk_apply.rs` panic-free libFuzzer
   target plus matching `[[bin]]` entry in `fuzz/Cargo.toml`. Drives

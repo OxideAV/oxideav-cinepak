@@ -50,6 +50,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_deviant_frame"
+path = "fuzz_targets/decode_deviant_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "film_demuxer_parse"
 path = "fuzz_targets/film_demuxer_parse.rs"
 test = false

@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 175 (deviant-frame fuzz target): new
+  `fuzz/fuzz_targets/decode_deviant_frame.rs` panic-free libFuzzer
+  target plus matching `[[bin]]` entry in `fuzz/Cargo.toml`. Closes the
+  coverage gap left by round 148: the prior `decode_frame` target only
+  exercises the strict standard path, so the Saturn / Sega CD `'cvid'`
+  and Lemmings 3DO branches in `CinepakDecoder::decode_deviant_frame`
+  (`src/decoder.rs:136`) were not reached by any fuzz budget. The new
+  target loops over the three documented `DeviantConfig` permutations
+  per input — `saturn()` (2-byte prefix, frame_length short by 8,
+  codebook pad tolerated), `lemmings_3do()` (6-byte prefix, same
+  short-by, same pad), and a `decode_frame` standard-path control —
+  so libFuzzer can shape mutations against the specific
+  deviant-vs-standard branches: `extra_header_bytes`,
+  `frame_length_short_by`, and `tolerate_codebook_pad`. Same
+  `MAX_CODED_PIXELS = 256 × 256` and `MAX_INPUT_BYTES = 64 KiB` caps
+  as the existing `decode_frame` target, so the per-frame raster
+  allocator and libFuzzer corpus shaping behave identically across
+  the standard and deviant harnesses. The reusable fuzz workflow
+  auto-discovers `fuzz/fuzz_targets/*.rs`, so the new file is picked
+  up automatically with the daily budget now split across five
+  targets instead of four.
+
 - Round 160 (depth-mode profiling driver): new
   `examples/profile_cinepak.rs` driver — a flat measure-this-thing
   harness that builds deterministic xorshift32-seeded RGB / grayscale

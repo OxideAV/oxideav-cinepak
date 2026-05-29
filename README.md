@@ -916,24 +916,38 @@ mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
 
-## Fuzz harness (round 148)
+## Fuzz harness (rounds 148 + 175)
 
 Round 148 added a `cargo-fuzz` harness under `fuzz/` covering the
-four user-reachable parse / decode entry points on the public API:
+four user-reachable parse / decode entry points on the public API.
+Round 175 extended it to a fifth target so the deviant-frame path
+gains its own coverage budget instead of relying on the standard
+path's harness to incidentally exercise it:
 
 | Target | Surface |
 |--------|---------|
 | `frame_header_parse` | `header::FrameHeader::parse` — 10-byte frame header |
 | `strip_header_parse` | `header::RawStripHeader::parse` — 12-byte strip header |
-| `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline |
+| `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline (standard path) |
+| `decode_deviant_frame` | `CinepakDecoder::decode_deviant_frame` — Saturn / Sega CD / Lemmings 3DO `'cvid'` deviant paths (round 175) |
 | `film_demuxer_parse` | `FilmDemuxer::parse` — Sega FILM container parse |
 
-`decode_frame` peeks at the wire `width`/`height` (bytes 4..8) and
-short-circuits inputs above a 256 × 256 coded-pixel budget so the
-~12 GiB worst-case `u16 × u16` RGB24 raster doesn't OOM the runner;
-the structural parse harnesses cap raw input at 64 KiB. `.github/workflows/fuzz.yml`
-is a thin shim around the org-level `crate-fuzz.yml` reusable workflow
-with a 1800-second daily budget split across the four targets.
+`decode_frame` and `decode_deviant_frame` both peek at the wire
+`width`/`height` (bytes 4..8) and short-circuit inputs above a
+256 × 256 coded-pixel budget so the ~12 GiB worst-case `u16 × u16`
+RGB24 raster doesn't OOM the runner; the structural parse harnesses
+cap raw input at 64 KiB. `.github/workflows/fuzz.yml` is a thin shim
+around the org-level reusable fuzz workflow with the daily budget
+split evenly across the five targets.
+
+The `decode_deviant_frame` target loops over the three documented
+`DeviantConfig` permutations per input — `saturn()`, `lemmings_3do()`,
+and the standard-path control via `decode_frame` — so libFuzzer can
+shape mutations against the specific deviant-vs-standard branches:
+the `extra_header_bytes` prefix (2 vs 6 vs 0), the
+`frame_length_short_by` undercount (8 vs 8 vs 0), and the
+`tolerate_codebook_pad` chunk-payload tolerance (`true` vs `true`
+vs `false`).
 
 Initial 90-second local run of the four targets (`~22M execs / target`)
 surfaced two real subtract-with-overflow bugs in the decoder, both now

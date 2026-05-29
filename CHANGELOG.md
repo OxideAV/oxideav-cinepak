@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 181 (codebook-chunk-apply fuzz target): new
+  `fuzz/fuzz_targets/codebook_chunk_apply.rs` panic-free libFuzzer
+  target plus matching `[[bin]]` entry in `fuzz/Cargo.toml`. Drives
+  `codebook::apply_codebook_chunk` and `apply_codebook_chunk_with`
+  (the Sega Saturn deviant `tolerate_trailing` sibling, per
+  `docs/video/cinepak/spec/02-codebooks.md` §3.4) directly with
+  arbitrary `chunk_id` + payload pairs, instead of routing all
+  codebook-parser mutations through the existing `decode_frame` /
+  `decode_deviant_frame` targets that have to thread through a
+  frame-header + strip-header + chunk-header first. Sweeps the
+  2 × 2 × 2 grid of codebook chunk-type codes (V4 vs V1, full
+  replacement vs selective update, 12-bit YUV vs 8-bit grayscale —
+  spec §2 / §2.1) per input by flipping the bit-2 grayscale
+  selector after the strict pass to exercise both stride
+  arithmetics (6 B vs 4 B entries) and both `apply_full` /
+  `apply_selective` paths under both strict + tolerate-trailing
+  modes. Per-target memory pressure stays bounded by the
+  `Codebook::default()` 256-entry × ≤ 6 B fixed footprint
+  (≈ 1.5 KiB × ≤ 3 codebooks per input); the standard
+  `MAX_INPUT_BYTES = 64 KiB` defence-in-depth cap matches the
+  sibling targets. The reusable fuzz workflow auto-discovers
+  `fuzz/fuzz_targets/*.rs`, so the new file is picked up
+  automatically with the daily budget now split across six
+  targets instead of five.
+
 - Round 175 (deviant-frame fuzz target): new
   `fuzz/fuzz_targets/decode_deviant_frame.rs` panic-free libFuzzer
   target plus matching `[[bin]]` entry in `fuzz/Cargo.toml`. Closes the

@@ -62,3 +62,10 @@ path = "fuzz_targets/film_demuxer_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "codebook_chunk_apply"
+path = "fuzz_targets/codebook_chunk_apply.rs"
+test = false
+doc = false
+bench = false

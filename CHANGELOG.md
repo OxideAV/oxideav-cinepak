@@ -6,6 +6,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-cinepak/releases/tag/v0.0.2) - 2026-05-30
+
+### Other
+
+- round 192: decode_vector_chunk fuzz target
+- round 187: FILM demuxer seek-friendly helpers
+- round 181: codebook_chunk_apply fuzz target
+- round 175: decode_deviant_frame fuzz target
+- round 160: standalone profiling driver + captured baseline
+- round 155: ffmpeg multi-frame inter cross-decode + frame-header flags fix
+- round 148: cargo-fuzz harness + 2 fuzz-found subtract-with-overflow fixes
+- round 143: seek-friendly keyframe interval enforcement
+- round 134: refresh README decode-bench rows to the post-r129 decoder
+- round 129: decoder hot-path rewrite — −17%..−67% per-frame time vs r126 baseline
+- round 126: criterion benches for decoder + encoder picker tiers + roundtrip
+- round 121: chroma CBR convergence via carry-over accumulator
+- round 113: target-bitrate rate control on the grayscale stateful inter path
+- round 104: inter-frame grayscale encode path + decoder mode-hint fallback
+- round 101 grayscale RD-grid frame-level picker (Lever N)
+- round 96 — bitrate-target per-frame rate control
+- Sega Saturn / Lemmings 3DO deviant Cinepak decoder
+- round 9 — k-means++ initialisation for cold-start codebook training (Lever M)
+- round 8 — per-strip independent (lambda, luma_weight) picker (Lever L)
+- round 7 — 3-axis RD grid picker + Y-channel scoring (Levers J + K)
+- round 6 — post-classification Lloyd polish + RD grid picker (Levers H + I)
+- round 5 — luma-weighted distance + luma-prioritized median-cut split (Levers F + G)
+- round 4 — Linde-Buzo-Gray (LBG) split refinement (Lever E)
+- round-47 encoder PSNR_Y win — Lagrangian V1/V4 RDO + strip picker
+- round 7 — empty-cluster slot reclamation + adaptive bisection tolerance
+- round 6 — windowed bisection rate ctrl + tighter Lloyd + ffmpeg AVI roundtrip
+- round 5 — cross-frame codebook persistence + multi-strip selective + two-pass rate control
+- round 4 — selective-update codebook chunks on inter strips
+- round 3 — multi-strip + inter encoder + quality knob + ffmpeg PSNR floor
+- round 2 — encoder + Sega FILM demuxer + CVID probe
+- round 1 — Implementer: full decoder from clean-room spec
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - Round 192 (`decode_vector_chunk` fuzz target): seventh entry in

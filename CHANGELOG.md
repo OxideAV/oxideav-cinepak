@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 192 (`decode_vector_chunk` fuzz target): seventh entry in
+  the `cargo-fuzz` harness, driving `vector::decode_vector_chunk`
+  directly so libFuzzer's mutations don't have to thread through a
+  frame header + strip header + chunk header before they reach the
+  vector parser. The new target exercises all three vector codes
+  (`0x3200` V1-only intra, `0x3000` mixed V1/V4 intra with per-32-MB
+  flag-word groups, `0x3100` inter with skip codes and bit-grammar
+  selector-bit straddle across flag-word boundaries) on every input:
+  the dispatcher's `chunk_id` branch is fuzzed, plus three explicit
+  re-decodes under each known code so each sub-decoder gets its own
+  coverage signal. `mb_count` is capped at 4096 to bound the
+  pre-allocated `Vec<Mb>` even when the payload is rejected. Raw
+  input is capped at 64 KiB like the sibling structural-parse
+  targets. Source: spec §3 (`docs/video/cinepak/spec/03-vectors-and-macroblocks.md`).
 - Round 187 (FILM demuxer seek-friendly helpers): six new public
   accessors on `FilmDemuxer` + `SampleRecord` that close the
   long-standing "FILM parser exposes only the raw sample table, not

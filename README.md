@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -933,13 +933,22 @@ mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
 
-## Fuzz harness (rounds 148 + 175)
+## Fuzz harness (rounds 148 + 175 + 181 + 192)
 
 Round 148 added a `cargo-fuzz` harness under `fuzz/` covering the
 four user-reachable parse / decode entry points on the public API.
 Round 175 extended it to a fifth target so the deviant-frame path
 gains its own coverage budget instead of relying on the standard
-path's harness to incidentally exercise it:
+path's harness to incidentally exercise it. Round 181 added a
+sixth target driving the codebook-chunk parser directly, since the
+eight-variant `0x2000..0x2700` family had to be reached through a
+full frame + strip + chunk header in the integrated path. Round
+192 added a seventh target driving the vector-chunk parser
+directly for the same reason — the three codes (`0x3200` / `0x3000`
+/ `0x3100`) are the other large per-parser surface in the decoder,
+and `0x3100`'s bit-grammar straddle path is the bug surface that
+motivated the `inter_payload_straddle` regression test and the
+round-5 selector-spillover fix:
 
 | Target | Surface |
 |--------|---------|
@@ -948,14 +957,19 @@ path's harness to incidentally exercise it:
 | `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline (standard path) |
 | `decode_deviant_frame` | `CinepakDecoder::decode_deviant_frame` — Saturn / Sega CD / Lemmings 3DO `'cvid'` deviant paths (round 175) |
 | `film_demuxer_parse` | `FilmDemuxer::parse` — Sega FILM container parse |
+| `codebook_chunk_apply` | `codebook::apply_codebook_chunk{,_with}` — eight chunk-kind family (V4 vs V1 × full-replace vs selective-update × 12-bit-YUV vs 8-bit-grayscale) parsed directly (round 181) |
+| `decode_vector_chunk` | `vector::decode_vector_chunk` — three vector codes (`0x3200` V1-only, `0x3000` mixed intra, `0x3100` inter with skip codes + selector-bit straddle) parsed directly (round 192) |
 
 `decode_frame` and `decode_deviant_frame` both peek at the wire
 `width`/`height` (bytes 4..8) and short-circuit inputs above a
 256 × 256 coded-pixel budget so the ~12 GiB worst-case `u16 × u16`
 RGB24 raster doesn't OOM the runner; the structural parse harnesses
-cap raw input at 64 KiB. `.github/workflows/fuzz.yml` is a thin shim
-around the org-level reusable fuzz workflow with the daily budget
-split evenly across the five targets.
+cap raw input at 64 KiB. The `decode_vector_chunk` target also caps
+`mb_count` at 4096 since `decode_vector_chunk` allocates a
+`Vec<Mb>` of that length before the per-chunk arithmetic decides
+whether the payload is well-formed. `.github/workflows/fuzz.yml`
+is a thin shim around the org-level reusable fuzz workflow with the
+daily budget split evenly across the seven targets.
 
 The `decode_deviant_frame` target loops over the three documented
 `DeviantConfig` permutations per input — `saturn()`, `lemmings_3do()`,

@@ -69,3 +69,10 @@ path = "fuzz_targets/codebook_chunk_apply.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_vector_chunk"
+path = "fuzz_targets/decode_vector_chunk.rs"
+test = false
+doc = false
+bench = false

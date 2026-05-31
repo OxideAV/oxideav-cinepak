@@ -76,3 +76,10 @@ path = "fuzz_targets/decode_vector_chunk.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_multi_frame"
+path = "fuzz_targets/decode_multi_frame.rs"
+test = false
+doc = false
+bench = false

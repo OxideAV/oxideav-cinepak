@@ -933,7 +933,7 @@ mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
 
-## Fuzz harness (rounds 148 + 175 + 181 + 192)
+## Fuzz harness (rounds 148 + 175 + 181 + 192 + 196)
 
 Round 148 added a `cargo-fuzz` harness under `fuzz/` covering the
 four user-reachable parse / decode entry points on the public API.
@@ -948,28 +948,46 @@ directly for the same reason — the three codes (`0x3200` / `0x3000`
 / `0x3100`) are the other large per-parser surface in the decoder,
 and `0x3100`'s bit-grammar straddle path is the bug surface that
 motivated the `inter_payload_straddle` regression test and the
-round-5 selector-spillover fix:
+round-5 selector-spillover fix. Round 196 added an eighth target
+driving the **stateful** decoder over a sequence of frames — the
+inter-frame state machine (rolling V1/V4 codebooks +
+selective-update inheritance across `decode_frame` calls +
+`0x3100` skip-MB copies from the prior frame's reconstructed
+raster) was never exercised by the single-frame `decode_frame`
+target since it instantiates a fresh `CinepakDecoder` per input:
 
 | Target | Surface |
 |--------|---------|
 | `frame_header_parse` | `header::FrameHeader::parse` — 10-byte frame header |
 | `strip_header_parse` | `header::RawStripHeader::parse` — 12-byte strip header |
-| `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline (standard path) |
+| `decode_frame` | `CinepakDecoder::decode_frame` — full intra/inter decode pipeline (standard path, single frame per input) |
 | `decode_deviant_frame` | `CinepakDecoder::decode_deviant_frame` — Saturn / Sega CD / Lemmings 3DO `'cvid'` deviant paths (round 175) |
 | `film_demuxer_parse` | `FilmDemuxer::parse` — Sega FILM container parse |
 | `codebook_chunk_apply` | `codebook::apply_codebook_chunk{,_with}` — eight chunk-kind family (V4 vs V1 × full-replace vs selective-update × 12-bit-YUV vs 8-bit-grayscale) parsed directly (round 181) |
 | `decode_vector_chunk` | `vector::decode_vector_chunk` — three vector codes (`0x3200` V1-only, `0x3000` mixed intra, `0x3100` inter with skip codes + selector-bit straddle) parsed directly (round 192) |
+| `decode_multi_frame` | `CinepakDecoder::decode_frame` driven over a length-prefixed sequence (up to 8 frames per input) on a single decoder instance — rolling V1/V4 codebooks, selective-update inheritance across `decode_frame` calls, `0x3100` skip-MB copy from `prev_frame`, intra-after-inter inheritance wipe, `reset()` (round 196) |
 
-`decode_frame` and `decode_deviant_frame` both peek at the wire
-`width`/`height` (bytes 4..8) and short-circuit inputs above a
-256 × 256 coded-pixel budget so the ~12 GiB worst-case `u16 × u16`
-RGB24 raster doesn't OOM the runner; the structural parse harnesses
-cap raw input at 64 KiB. The `decode_vector_chunk` target also caps
-`mb_count` at 4096 since `decode_vector_chunk` allocates a
-`Vec<Mb>` of that length before the per-chunk arithmetic decides
-whether the payload is well-formed. `.github/workflows/fuzz.yml`
-is a thin shim around the org-level reusable fuzz workflow with the
-daily budget split evenly across the seven targets.
+`decode_frame`, `decode_deviant_frame`, and `decode_multi_frame`
+all peek at the wire `width`/`height` (bytes 4..8) and short-circuit
+inputs above a 256 × 256 coded-pixel budget so the ~12 GiB
+worst-case `u16 × u16` RGB24 raster doesn't OOM the runner; the
+structural parse harnesses cap raw input at 64 KiB. The
+`decode_vector_chunk` target also caps `mb_count` at 4096 since
+`decode_vector_chunk` allocates a `Vec<Mb>` of that length before
+the per-chunk arithmetic decides whether the payload is well-formed.
+`decode_multi_frame` additionally caps the per-input frame count at
+8 so the wall-time per fuzz iteration stays comparable to the
+single-frame target's. `.github/workflows/fuzz.yml` is a thin shim
+around the org-level reusable fuzz workflow with the daily budget
+split evenly across the eight targets.
+
+Round 196 also seeds `corpus/decode_multi_frame/` with two
+encoder-round-tripped streams (intra + 1 inter, intra + 2 inters)
+at 32 × 32 — these give libFuzzer a structurally-valid starting
+point for mutating the inter-frame state machine instead of having
+to first synthesise a well-formed Cinepak frame from scratch. A
+60-second local run after seeding reached 7.94 M executions
+(~130 k execs/s, +1 415 new corpus units) with no crashes.
 
 The `decode_deviant_frame` target loops over the three documented
 `DeviantConfig` permutations per input — `saturn()`, `lemmings_3do()`,

@@ -6,6 +6,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 196 (`decode_multi_frame` fuzz target): eighth entry in the
+  `cargo-fuzz` harness. Drives a single `CinepakDecoder` instance over
+  a sequence of length-prefixed frame slices (u16 BE per-frame length,
+  capped at 8 frames per input), exercising the inter-frame state
+  machine — rolling V1/V4 codebooks across `decode_frame` calls,
+  selective-update codebook chunks inheriting from prior strips, and
+  `0x3100` SKIP macroblocks copying out of the previous frame's
+  reconstructed raster. The single-frame `decode_frame` target
+  instantiates a fresh decoder per input and therefore never reaches
+  the selective-update arithmetic against a non-empty `prev_v4` /
+  `prev_v1`, the skip-copy from a `prev_frame` whose dims / pixel mode
+  were chosen by the fuzzer, or the intra-after-inter transition that
+  must wipe inheritance even with prev_frame state present. Mirrors
+  the per-frame 256 × 256 coded-pixel cap from `decode_frame.rs` plus
+  the 64 KiB raw-input cap from the sibling targets. Seeded with two
+  encoder-round-tripped multi-frame streams (intra + 1 inter, intra +
+  2 inters) at 32 × 32. 60-second local run: 7.94 M executions,
+  130 095 execs/s, 1 415 new corpus units from the two seeds, no
+  crashes.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-cinepak/releases/tag/v0.0.2) - 2026-05-30
 
 ### Other

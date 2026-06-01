@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -988,6 +988,33 @@ point for mutating the inter-frame state machine instead of having
 to first synthesise a well-formed Cinepak frame from scratch. A
 60-second local run after seeding reached 7.94 M executions
 (~130 k execs/s, +1 415 new corpus units) with no crashes.
+
+Round 202 extended the named-seed pattern to the three per-parser
+targets that landed in r181 / r192 / r175 without committed
+corpora — `codebook_chunk_apply` (18 seeds: every chunk-id leaf in
+the 8-code V4/V1 × Full/Selective × YUV/Gray family, both under
+`tolerate_trailing = false` and `tolerate_trailing = true` with 2
+trailing pad bytes, plus a header-only "inherit previous codebook"
+seed and a deliberately-truncated 5-byte payload), `decode_vector_chunk`
+(6 seeds: V1-only intra at 4 MBs, mixed V1/V4 intra at 4 MBs and at
+33 MBs spanning two flag-word groups, inter all-skip at 32 MBs,
+inter with a 34-MB selector-spillover pattern matching the
+`inter_payload_straddle` regression test, and an unknown-id 0x0000
+negative seed for the dispatcher's reject path), and
+`decode_deviant_frame` (3 seeds: Saturn-prefix + Lemmings-3DO-prefix
+deviant frames with the spec §3.1 codebook-pad branch live, plus a
+standard-control 4×4 frame so libFuzzer can A/B the strict-vs-deviant
+branches directly). Generation is reproducible via
+`cargo run --example seed_fuzz_corpora --release`; the seeds are
+deterministic so re-running the generator produces byte-identical
+files. A new `tests/seed_fuzz_corpora.rs` integration test drives
+every committed seed through the same public entry points the fuzz
+harnesses invoke (`apply_codebook_chunk{,_with}`, `decode_vector_chunk`,
+`CinepakDecoder::{decode_deviant_frame,decode_frame}`) and asserts
+the expected counts of positive-arm seeds per target, so a future
+encoder / parser refactor that silently moves the wire surface the
+seeds were drawn from will trip in `cargo test` rather than after
+deploying to fuzz CI.
 
 The `decode_deviant_frame` target loops over the three documented
 `DeviantConfig` permutations per input — `saturn()`, `lemmings_3do()`,

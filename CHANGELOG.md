@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 202 (per-parser fuzz corpora): named seed files for the three
+  fuzz targets that landed in r181 / r192 / r175 without committed
+  corpora. `examples/seed_fuzz_corpora.rs` writes deterministic seeds
+  under `fuzz/corpus/{codebook_chunk_apply,decode_vector_chunk,
+  decode_deviant_frame}/`: 18 codebook seeds covering every chunk-id
+  leaf in the 8-code V4/V1 × Full/Selective × YUV/Gray family with
+  both `tolerate_trailing` settings + header-only + truncated seeds;
+  6 vector seeds covering V1-only intra, mixed-intra at one + two
+  flag-word groups, inter all-skip, inter with the
+  `inter_payload_straddle` selector-spillover pattern, and an
+  unknown-id 0x0000 reject seed; 3 deviant seeds covering Saturn /
+  Lemmings-3DO deviant frames + a standard-control 4×4 frame. New
+  `tests/seed_fuzz_corpora.rs` integration test drives every seed
+  through the same public entry points the fuzz harnesses invoke and
+  asserts the expected positive-arm counts so a wire-surface
+  refactor trips `cargo test` instead of fuzz CI. Mirrors the r196
+  `decode_multi_frame` seeding pattern.
 - Round 196 (`decode_multi_frame` fuzz target): eighth entry in the
   `cargo-fuzz` harness. Drives a single `CinepakDecoder` instance over
   a sequence of length-prefixed frame slices (u16 BE per-frame length,

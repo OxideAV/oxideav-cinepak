@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 209 (depth-mode profiling extension): two new modes on
+  `examples/profile_cinepak.rs` — `picker` sweeps the four public RGB
+  encoder entry points (`encode_rgb24` baseline →
+  `encode_rgb24_round6` 2-axis → `encode_rgb24_round7` 3-axis →
+  `encode_rgb24_round8` per-strip picker) on each scenario, reporting
+  per-entry wall time + output size + trial-count ceiling so the
+  wire-vs-time cost of each picker upgrade is visible side-by-side;
+  `samples=N` argument makes every per-scenario row report median +
+  (max-min)/median jitter across `N` independent rep groups so single-
+  sample noise (±30 % on a contended laptop) doesn't bury real
+  per-pass deltas. Existing round-160 CLI invocations
+  (`profile_cinepak encode 20`, etc.) stay byte-compatible — `samples`
+  defaults to 1 which preserves the original code path. New
+  `profile/README.md` section captures the picker-axis cost
+  progression (baseline → round-6 ≈ 8×, round-6 → round-7 ≈ 3×,
+  round-7 → round-8 ≈ 3×) and the encode/decode jitter floor
+  (decode ≤ 3 %, encode 1–10 % depending on fixture size) so future
+  A/B rounds know the signal threshold before reporting "no
+  regression". Pure additive change to the round-160 driver — no
+  src/ touches, no dep / Cargo.toml changes.
 - Round 202 (per-parser fuzz corpora): named seed files for the three
   fuzz targets that landed in r181 / r192 / r175 without committed
   corpora. `examples/seed_fuzz_corpora.rs` writes deterministic seeds

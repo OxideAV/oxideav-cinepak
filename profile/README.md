@@ -90,6 +90,113 @@ the r155 ffmpeg cross-decode fixture pattern.
   average — well-shaped for the 30 fps@~256 kbit/s rate-control
   band our headline targets).
 
+## Round 209 — picker-axis cost sweep + jitter
+
+Round 160's baseline measures the **headline encoder path** on each
+scenario (the round-7 3-axis picker on `rgb24/64x64/q50/round7`, the
+single-pass `encode_rgb24` everywhere else). Round 209 adds a `picker`
+mode that runs **all four public RGB encoder entry points** on the
+same fixture set, plus a `samples=N` argument that reports
+**median + (max-min)/median jitter** across `N` independent rep
+groups so single-sample noise (±30 % on a contended laptop) doesn't
+bury real per-pass-difference signal.
+
+### Picker-axis sweep (round 209, Apple M4 Max, release build)
+
+Each row is one fixture × one picker entry point. The `trials≤`
+column is the **per-frame trial-count ceiling** the picker can run
+internally (round-6 = 9-trial 2-axis `(strip_count, lambda)` grid;
+round-7 = 27-trial 3-axis grid with `luma_weight`; round-8 = round-7
+grid + per-strip greedy that re-sweeps `lambda × luma_weight` per
+strip — ceiling ~81 trials on a 2-strip pick). The dedup logic in
+each picker may collapse the grid when seeded `lambda` / `luma_weight`
+hit canonical values, so the wall-time numbers are what actually
+fired, not the ceiling.
+
+```
+rgb24/64x64/q50/round7
+  encode_rgb24 (baseline)         iters= 40 trials≤  1    1.379 ms/iter  out= 1684B (0.137 of input)
+  encode_rgb24_round6 (2-axis)    iters= 14 trials≤  9   11.026 ms/iter  out= 2845B (0.232 of input)
+  encode_rgb24_round7 (3-axis)    iters=  8 trials≤ 27   31.469 ms/iter  out= 2881B (0.234 of input)
+  encode_rgb24_round8 (per-strip) iters=  5 trials≤ 81   98.286 ms/iter  out= 2950B (0.240 of input)
+
+rgb24/320x240/q50/baseline
+  encode_rgb24 (baseline)         iters= 12 trials≤  1   24.641 ms/iter  out=11458B (0.050 of input)
+  encode_rgb24_round6 (2-axis)    iters=  4 trials≤  9  186.606 ms/iter  out=10833B (0.047 of input)
+  encode_rgb24_round7 (3-axis)    iters=  3 trials≤ 27  564.703 ms/iter  out=16146B (0.070 of input)
+  encode_rgb24_round8 (per-strip) iters=  2 trials≤ 81 1760.400 ms/iter  out=14808B (0.064 of input)
+
+rgb24/640x480/q70/baseline
+  encode_rgb24 (baseline)         iters=  6 trials≤  1  169.038 ms/iter  out=  35047B (0.038 of input)
+  encode_rgb24_round6 (2-axis)    iters=  2 trials≤  9 1614.384 ms/iter  out=  33547B (0.036 of input)
+  encode_rgb24_round7 (3-axis)    iters=  2 trials≤ 27 4934.863 ms/iter  out=  65941B (0.072 of input)
+  encode_rgb24_round8 (per-strip) iters=  2 trials≤ 81 15709.616 ms/iter  out=  65941B (0.072 of input)
+```
+
+#### Reading the picker rows
+
+- The **baseline → round-6 jump (~8×)** is the
+  `(strip_count, lambda)` grid expanding the underlying intra
+  encoder call by ~9× — slightly under because the lambda dedup
+  trims duplicates when `opts.rdo_lambda` collides with the seed
+  set `[0.0, 2.5, opts.rdo_lambda]`. The wire-size delta is
+  scenario-dependent (smaller on the 64×64 row where the picker's
+  Y-channel scoring picks the higher-quality larger output).
+- The **round-6 → round-7 jump (~3×)** is the `luma_weight` axis
+  multiplying the round-6 grid by 3× — straightforward arithmetic
+  on the grid expansion. Round-7's chosen output is sometimes
+  larger than round-6's (notably the 320×240 / q50 row at 16146 B
+  vs 10833 B) because round-7's scoring switches from RGB SSE to
+  Y-channel SSE per the README narrative; the Y-favouring lever
+  picks a higher-bitrate operating point on smooth-content
+  fixtures.
+- The **round-7 → round-8 jump (~3×)** is the per-strip greedy
+  pass running an extra `lambda × luma_weight` sweep per-strip
+  per `strip_count` candidate. The chosen output frequently
+  matches round-7's exactly on these gradient fixtures (the
+  per-strip greedy converges to the frame-uniform pick on
+  homogeneous content) — the cost is paid for the option of
+  diverging when strip content statistics differ.
+- The **640×480 / q70 row** at round-8 takes ~16 s per frame —
+  this is the deliberate "highest quality, slowest path" call
+  site: the per-strip greedy on a multi-strip large fixture
+  multiplies the underlying `encode_intra_frame` cost by ~93×
+  the baseline. Callers who want round-8's quality without
+  round-8's wall time should use `encode_rgb24_round7` (which is
+  in the 22–30× cost band) or pre-compute the per-strip
+  `(lambda, luma_weight)` once with round-8 then reuse them via
+  the lower-level grid API.
+
+### Decode + encode jitter (round 209, samples=5)
+
+The round-160 single-sample numbers don't tell you whether a single
+row's drift is real or noise. Running `samples=5` gives median +
+jitter — the spread between min and max as a fraction of the median.
+
+```
+encode (median + jitter across 5 rep groups)
+  rgb24/64x64/q50/round7      iters= 40 median= 32.126 ms/iter jitter=10.2%    0.36 MiB/s  out= 2881B
+  rgb24/320x240/q50/baseline  iters= 12 median= 24.990 ms/iter jitter= 1.1%    8.79 MiB/s  out=11458B
+  rgb24/640x480/q70/baseline  iters=  6 median=170.641 ms/iter jitter= 8.8%    5.15 MiB/s  out=35047B
+  gray8/320x240/q50/baseline  iters= 16 median= 13.061 ms/iter jitter= 3.8%    5.61 MiB/s  out= 6412B
+
+decode (median + jitter across 5 rep groups)
+  rgb24/64x64/q50/round7      iters=2000 median= 0.003 ms/iter jitter= 0.9% 3428.71 MiB/s
+  rgb24/320x240/q50/baseline  iters= 600 median= 0.061 ms/iter jitter= 2.8% 3618.10 MiB/s
+  rgb24/640x480/q70/baseline  iters= 300 median= 0.202 ms/iter jitter= 2.3% 4340.37 MiB/s
+  gray8/320x240/q50/baseline  iters= 800 median= 0.023 ms/iter jitter= 1.5% 3229.71 MiB/s
+```
+
+The decode jitter ≤ 3 % everywhere confirms the round-160
+single-sample decode numbers were stable — A/B comparisons against
+the decode baseline can read 5 %-or-better as real signal. The
+encode jitter is bimodal: the 64×64 / round-7 row jitters 10 %
+(small fixture, high per-iter variance), while the 320×240
+baseline row jitters 1 % (steady-state path with no per-fixture
+quirk). A/B comparisons against the encode baseline should use
+`samples=5` and read ≥ 10 % deltas as real on the round-7 row, ≥ 3 %
+on the rest.
+
 ## Reproducing
 
 ```bash
@@ -97,13 +204,18 @@ the r155 ffmpeg cross-decode fixture pattern.
 cargo build --release --example profile_cinepak \
     -p oxideav-cinepak
 
-# 2. Run the four modes — or `all` for the full sweep.
+# 2. Run the four round-160 modes — or `all` for the full sweep.
 ./target/release/examples/profile_cinepak all
 
 # Per-mode subsets are useful for sampler runs (samply / perf):
 ./target/release/examples/profile_cinepak encode    20
 ./target/release/examples/profile_cinepak decode  1000
 ./target/release/examples/profile_cinepak stateful  30
+
+# Round 209 — picker-axis sweep + jitter.
+./target/release/examples/profile_cinepak picker
+./target/release/examples/profile_cinepak encode 12 samples=5
+./target/release/examples/profile_cinepak decode 600 samples=5
 ```
 
 ### Capturing flamegraphs (samply, no root on macOS)

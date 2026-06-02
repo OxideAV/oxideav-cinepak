@@ -18,9 +18,22 @@
 //! harness for the inner tweak-remeasure loop when Criterion's per-run
 //! overhead is too coarse.
 //!
+//! Round 209 (depth-mode profiling extension): adds the `picker` mode
+//! that sweeps the four public RGB encoder entry points
+//! (`encode_rgb24` baseline → `encode_rgb24_round6` 2-axis picker →
+//! `encode_rgb24_round7` 3-axis picker → `encode_rgb24_round8`
+//! per-strip picker) on each scenario so the wire-vs-time cost of
+//! each picker upgrade is visible side-by-side; the underlying
+//! per-frame trial count multiplies up across the four entries
+//! (roughly 1 → 9 → 27 → ≤ 27 + 27·strip-greedy). Also adds an
+//! optional `samples=N` third CLI argument: when N ≥ 2 each
+//! per-scenario row reports median + (max-min)/median jitter across
+//! N independent rep groups so the timing noise floor is visible
+//! (single-sample rows can be ±30 % on a contended laptop).
+//!
 //! Usage:
 //!
-//!     cargo run --example profile_cinepak --release -- <mode> [<iters>]
+//!     cargo run --example profile_cinepak --release -- <mode> [<iters>] [samples=<N>]
 //!
 //! Modes:
 //!
@@ -31,12 +44,17 @@
 //!     stateful    — drive the full stateful encoder over a 5-frame GOP
 //!                   (intra + 4 inter), measuring the picker / rate-ctrl
 //!                   cost as it would appear in a real streaming use case
+//!     picker      — round 209: sweep the four RGB encoder entry points
+//!                   (`encode_rgb24` / `_round6` / `_round7` / `_round8`)
+//!                   on each scenario; reports per-entry-point time +
+//!                   wire-size delta + estimated trial-count multiplier
 //!     all         — run every mode (default)
 //!
 //! With `samply`:
 //!
 //!     samply record -- ./target/release/examples/profile_cinepak encode 30
 //!     samply record -- ./target/release/examples/profile_cinepak decode 100
+//!     samply record -- ./target/release/examples/profile_cinepak picker 8
 //!
 //! With `cargo flamegraph` (needs `cargo install flamegraph`):
 //!
@@ -53,7 +71,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use oxideav_cinepak::{
-    encode_gray8, encode_rgb24, encode_rgb24_round7, CinepakDecoder, CinepakEncoder, EncoderOptions,
+    encode_gray8, encode_rgb24, encode_rgb24_round6, encode_rgb24_round7, encode_rgb24_round8,
+    CinepakDecoder, CinepakEncoder, EncoderOptions,
 };
 
 /// xorshift32 — same constant the bench harnesses use so the profile
@@ -370,13 +389,247 @@ fn profile_stateful(iters_override: Option<u32>) {
     std::io::stdout().flush().ok();
 }
 
+/// Round 209 (depth-mode profiling): per-frame trial-count estimate
+/// for each picker entry point — the multiplier on the underlying
+/// `encode_intra_frame` call. These are the per-public-API costs the
+/// README rounds advertise (round-6 = 9-trial 2-axis grid, round-7 =
+/// 27-trial 3-axis grid, round-8 = round-7 + per-strip greedy that
+/// picks per-strip from up to 27 trials). The integers here are
+/// upper bounds — actual trial counts can drop when the picker's
+/// internal lambda / luma_weight dedup collapses the grid (e.g., if
+/// `opts.rdo_lambda` is already 0.0 the round-6 lambda axis shrinks
+/// to 2 entries). The README rollup uses these for the
+/// "cost per picker upgrade" comparison row.
+const PICKER_TRIAL_COUNT_BASELINE: u32 = 1;
+const PICKER_TRIAL_COUNT_ROUND6: u32 = 9; // 3 strip × 3 lambda
+const PICKER_TRIAL_COUNT_ROUND7: u32 = 27; // 3 strip × 3 lambda × 3 luma_weight
+                                           // Round 8 runs the round-7 grid PLUS a per-strip greedy that, for
+                                           // each candidate strip count, sweeps the lambda × luma_weight grid
+                                           // independently per strip. On a 2-strip pick the per-strip greedy
+                                           // dominates: 9 (round-7 grid) + 2-strip × 2 strips × 9 (lambda×luma) =
+                                           // ≈ 45 trials. We surface the ceiling here; the per-scenario picker
+                                           // run prints the observed wall time which captures the actual
+                                           // dynamic trial count.
+const PICKER_TRIAL_COUNT_ROUND8_CEILING: u32 = 81;
+
+/// Round 209 picker-axis sweep: run each of the four public RGB
+/// encoder entry points against every scenario, reporting per-entry
+/// wall time + output size + estimated trial-count multiplier. The
+/// `Gray8` scenarios are skipped here because the round-6/7/8 picker
+/// API is RGB-only (gray8 has a separate `encode_gray8_round7`
+/// wrapper but no round-6 / round-8 sibling).
+fn profile_picker(iters_override: Option<u32>) {
+    println!("== picker (R209 per-entry-point sweep, RGB only) ==");
+    println!(
+        "  legend: trials = per-frame trial-count multiplier vs the \
+         underlying single-pass encoder"
+    );
+
+    // Define the picker entries as a typed enum so the dispatch is
+    // straight-line + the optimiser keeps the per-call signature flat.
+    type PickerFn = fn(&[u8], u32, u32, EncoderOptions) -> oxideav_cinepak::Result<Vec<u8>>;
+    let pickers: &[(&'static str, PickerFn, u32)] = &[
+        (
+            "encode_rgb24 (baseline)",
+            encode_rgb24,
+            PICKER_TRIAL_COUNT_BASELINE,
+        ),
+        (
+            "encode_rgb24_round6 (2-axis)",
+            encode_rgb24_round6,
+            PICKER_TRIAL_COUNT_ROUND6,
+        ),
+        (
+            "encode_rgb24_round7 (3-axis)",
+            encode_rgb24_round7,
+            PICKER_TRIAL_COUNT_ROUND7,
+        ),
+        (
+            "encode_rgb24_round8 (per-strip)",
+            encode_rgb24_round8,
+            PICKER_TRIAL_COUNT_ROUND8_CEILING,
+        ),
+    ];
+
+    for scen in scenarios() {
+        if scen.bytes_per_pixel != 3 {
+            continue;
+        }
+        println!("  scenario {name}", name = scen.name);
+        let rgb = build_rgb_gradient(scen.width as usize, scen.height as usize);
+        let opts = EncoderOptions::from_quality(scen.quality);
+
+        // Iteration count is forced lower on the heavier pickers to
+        // keep total wall time bounded — the round-8 ceiling can
+        // reach ~80× the baseline cost on the small fixture so even
+        // 4 iterations of round-8 on the 640×480/q70 row is ~5 s.
+        for (label, picker_fn, trials) in pickers {
+            let scale = (*trials).max(1) as f64;
+            let scaled_iters = match iters_override {
+                Some(n) => n,
+                None => ((scen.encode_iters_default as f64 / scale.sqrt()).ceil() as u32).max(2),
+            };
+
+            // Warm-up.
+            let _ = picker_fn(&rgb, scen.width, scen.height, opts).expect("picker warm-up");
+
+            let t = Instant::now();
+            let mut total_out = 0u64;
+            for _ in 0..scaled_iters {
+                let out = std::hint::black_box(
+                    picker_fn(std::hint::black_box(&rgb), scen.width, scen.height, opts)
+                        .expect("picker encode"),
+                );
+                total_out += out.len() as u64;
+                std::hint::black_box(out);
+            }
+            let elapsed = t.elapsed().as_secs_f64();
+            let per_iter_ms = elapsed * 1000.0 / scaled_iters as f64;
+            let avg_out = total_out / scaled_iters.max(1) as u64;
+            let raw_bytes = scen.width as usize * scen.height as usize * scen.bytes_per_pixel;
+            let ratio = avg_out as f64 / raw_bytes as f64;
+            println!(
+                "    {label:34} iters={scaled_iters:>4} trials≤{trials:>3} \
+                 {per_iter_ms:8.3} ms/iter  out={avg_out:>5}B ({ratio:.3} of input)"
+            );
+            std::io::stdout().flush().ok();
+        }
+        println!();
+    }
+}
+
+/// Round 209: median + jitter helper. Returns
+/// (median, jitter_ratio) where jitter_ratio is
+/// (max - min) / median. Caller passes the rep-group times in ms.
+fn median_and_jitter(times_ms: &mut [f64]) -> (f64, f64) {
+    if times_ms.is_empty() {
+        return (0.0, 0.0);
+    }
+    times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = times_ms.len();
+    let median = if n % 2 == 1 {
+        times_ms[n / 2]
+    } else {
+        (times_ms[n / 2 - 1] + times_ms[n / 2]) / 2.0
+    };
+    let min = times_ms[0];
+    let max = times_ms[n - 1];
+    let jitter = if median > 0.0 {
+        (max - min) / median
+    } else {
+        0.0
+    };
+    (median, jitter)
+}
+
+/// Round 209: multi-sample wrapper over the round-160 encode mode.
+/// Each rep group runs `iters` encodes; we report median + jitter
+/// across `samples` independent rep groups so the timing noise floor
+/// is visible. `samples == 1` falls through to the original
+/// single-pass code path.
+fn profile_encode_multi(iters_override: Option<u32>, samples: u32) {
+    if samples <= 1 {
+        profile_encode(iters_override);
+        return;
+    }
+    println!("== encode (samples={samples}) ==");
+    for scen in scenarios() {
+        let iters = iters_override.unwrap_or(scen.encode_iters_default);
+        // Warm-up.
+        let _ = encode_once(scen);
+
+        let mut per_sample_ms: Vec<f64> = Vec::with_capacity(samples as usize);
+        let mut last_out_bytes = 0u64;
+        for _ in 0..samples {
+            let t = Instant::now();
+            let mut total_out = 0u64;
+            for _ in 0..iters {
+                let out = std::hint::black_box(encode_once(std::hint::black_box(scen)));
+                total_out += out.len() as u64;
+                std::hint::black_box(out);
+            }
+            per_sample_ms.push(t.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64);
+            last_out_bytes = total_out / iters.max(1) as u64;
+        }
+        let (median_ms, jitter) = median_and_jitter(&mut per_sample_ms);
+        let raw_bytes_per_iter = scen.width as usize * scen.height as usize * scen.bytes_per_pixel;
+        let ratio = last_out_bytes as f64 / raw_bytes_per_iter as f64;
+        let mib_per_s = (raw_bytes_per_iter as f64) / (median_ms / 1000.0) / (1024.0 * 1024.0);
+        println!(
+            "  encode    {name:30} iters={iters:>4} median={median_ms:8.3} ms/iter \
+             jitter={jitter:5.1}%  {mib_per_s:8.2} MiB/s  out={last_out_bytes}B ({ratio:.3} of input)",
+            name = scen.name,
+            jitter = jitter * 100.0,
+        );
+        std::io::stdout().flush().ok();
+    }
+}
+
+/// Round 209: multi-sample wrapper over the round-160 decode mode.
+fn profile_decode_multi(iters_override: Option<u32>, samples: u32) {
+    if samples <= 1 {
+        profile_decode(iters_override);
+        return;
+    }
+    println!("== decode (samples={samples}) ==");
+    for scen in scenarios() {
+        let iters = iters_override.unwrap_or(scen.encode_iters_default * 50);
+        let bytes = encode_once(scen);
+        let _ = decode_once(&bytes);
+
+        let mut per_sample_ms: Vec<f64> = Vec::with_capacity(samples as usize);
+        for _ in 0..samples {
+            let t = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..iters {
+                sink ^= decode_once(std::hint::black_box(&bytes));
+            }
+            std::hint::black_box(sink);
+            per_sample_ms.push(t.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64);
+        }
+        let (median_ms, jitter) = median_and_jitter(&mut per_sample_ms);
+        let raw_bytes_per_iter = scen.width as usize * scen.height as usize * scen.bytes_per_pixel;
+        let mib_per_s = (raw_bytes_per_iter as f64) / (median_ms / 1000.0) / (1024.0 * 1024.0);
+        println!(
+            "  decode    {name:30} iters={iters:>4} median={median_ms:8.3} ms/iter \
+             jitter={jitter:5.1}%  {mib_per_s:8.2} MiB/s",
+            name = scen.name,
+            jitter = jitter * 100.0,
+        );
+        std::io::stdout().flush().ok();
+    }
+}
+
 fn main() {
-    let mut args = env::args().skip(1);
-    let mode = args.next().unwrap_or_else(|| "all".to_string());
-    let iters_override: Option<u32> = args.next().and_then(|s| s.parse().ok());
+    // Round 209: tolerant arg parsing — positional `mode` then either
+    // a numeric `iters` or `samples=N`, in any order, so existing
+    // round-160 invocations stay byte-compatible while new callers
+    // can request multi-sample jitter rows.
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let mut mode: Option<String> = None;
+    let mut iters_override: Option<u32> = None;
+    let mut samples: u32 = 1;
+    for arg in raw_args {
+        if let Some(rest) = arg.strip_prefix("samples=") {
+            samples = rest.parse().unwrap_or(1).max(1);
+        } else if iters_override.is_none() && mode.is_some() {
+            // After the mode keyword, the first bare numeric token is
+            // iters (matches round-160 positional contract).
+            if let Ok(n) = arg.parse::<u32>() {
+                iters_override = Some(n);
+            } else {
+                eprintln!("warning: ignoring unparsable argument {arg:?}");
+            }
+        } else if mode.is_none() {
+            mode = Some(arg);
+        } else {
+            eprintln!("warning: ignoring extra argument {arg:?}");
+        }
+    }
+    let mode = mode.unwrap_or_else(|| "all".to_string());
 
     println!(
-        "=== oxideav-cinepak profile (mode={mode}, iters={}) ===",
+        "=== oxideav-cinepak profile (mode={mode}, iters={}, samples={samples}) ===",
         iters_override
             .map(|n| n.to_string())
             .unwrap_or_else(|| "default".to_string()),
@@ -384,22 +637,28 @@ fn main() {
     println!();
 
     match mode.as_str() {
-        "encode" => profile_encode(iters_override),
-        "decode" => profile_decode(iters_override),
+        "encode" => profile_encode_multi(iters_override, samples),
+        "decode" => profile_decode_multi(iters_override, samples),
         "roundtrip" => profile_roundtrip(iters_override),
         "stateful" => profile_stateful(iters_override),
+        "picker" => profile_picker(iters_override),
         "all" => {
-            profile_encode(iters_override);
+            profile_encode_multi(iters_override, samples);
             println!();
-            profile_decode(iters_override);
+            profile_decode_multi(iters_override, samples);
             println!();
             profile_roundtrip(iters_override);
             println!();
             profile_stateful(iters_override);
+            println!();
+            profile_picker(iters_override);
         }
         other => {
             eprintln!("unknown mode: {other:?}");
-            eprintln!("usage: profile_cinepak [encode|decode|roundtrip|stateful|all] [<iters>]");
+            eprintln!(
+                "usage: profile_cinepak [encode|decode|roundtrip|stateful|picker|all] \
+                 [<iters>] [samples=<N>]"
+            );
             std::process::exit(2);
         }
     }

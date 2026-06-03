@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -507,6 +507,37 @@ validator, the first-malformed pinpoint, the audio classifier's
 independence from video FDSC fields, and the abbreviated-FDSC
 no-audio rule. Pure additive change to the FILM demuxer — no
 encoder / decoder touches, no Cargo.toml changes.
+
+Round 228 (FILM linear-PCM sample-data shaping) closes the natural
+follow-up gap noted in r221's
+[`FilmAudioFormat::LinearPcm`] docstring ("the consumer is
+responsible for re-interleaving before passing to a typical PCM
+playback API"). Round 221 surfaced the *metadata* about FILM PCM
+payloads — channels, bits-per-sample, sample rate, big-endian byte
+order, twos-complement vs sign/magnitude — but a consumer wanting
+to route the bytes returned from `FilmDemuxer::audio_samples()` to
+a generic PCM sink still had to write three byte transforms by
+hand (sign-magnitude → twos-complement, 16-bit BE → host
+endianness, half-chunk L/R → interleaved L R L R …). Round 228
+adds those transforms as free functions on the `film` module plus
+a `FilmAudioFormat::decode_chunk_to_i16(src) -> Option<Vec<i16>>`
+one-shot accessor that dispatches across the four documented
+combos (mono / stereo × 8-bit / 16-bit). All transforms are
+documented in `docs/video/cinepak/reference/wiki/Sega_FILM.wiki`
+lines 147–169 (line 151 Saturn = twos-complement, line 153 16-bit
+= big-endian, lines 156–160 stereo half-chunk L/R split, lines
+163–169 sign-magnitude rule with the verbatim wiki examples
+`0x81 ⇒ -1` / `0xFF ⇒ -127`). 30 new tests cover the verbatim wiki
+examples, `0x80` "negative zero" collapse to `0i8`, total-function
+coverage of every input byte, the big-endian round-trip across the
+full `i16` range, the channel re-interleave correctness, and every
+length / size precondition (odd source length, non-multiple-of-4
+length, dst-size mismatch, source/channel-count mismatch). PCM
+playback (rate conversion, channel mixing, gain) and ADX ADPCM
+decoding remain out of scope per `00-scope.md`; these helpers only
+re-shape the documented FILM wire bytes into the format a generic
+PCM sink expects. Pure additive change — no demuxer / decoder /
+encoder behaviour change, no Cargo.toml changes.
 
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.

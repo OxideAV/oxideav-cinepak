@@ -390,6 +390,287 @@ impl FilmAudioFormat {
     }
 }
 
+// ---------------------------------------------------------------------
+// Round 228 — linear-PCM sample-data shaping helpers
+// ---------------------------------------------------------------------
+//
+// `Sega_FILM.wiki` lines 147–169 describe three encoding rules for
+// linear-PCM audio that the bytes the demuxer yields are subject to:
+// (a) `lines 151, 162` — Saturn `.cpk` files store signed
+// twos-complement; early Sega CD / 3DO files store **sign/magnitude**
+// where bit 7 is the sign bit and bits 6..0 are the magnitude;
+// (b) `line 153` — 16-bit PCM samples are stored in **big-endian** byte
+// order; and (c) `lines 156–160` — stereo PCM is stored
+// **non-interleaved per chunk**: the first half of each audio sample
+// chunk is the left channel, the second half is the right channel.
+//
+// Round 221 added [`FilmAudioFormat`] to classify these properties from
+// FDSC + the FILM version field. The helpers below close the natural
+// follow-up gap noted in [`FilmAudioFormat::LinearPcm`]'s docstring
+// ("the consumer is responsible for re-interleaving before passing to a
+// typical PCM playback API") by shaping the FILM-wire bytes into the
+// format a standard PCM sink expects (twos-complement, host-endian,
+// LR-interleaved). These are pure byte transformations — no audio
+// decoding, no rate conversion, no channel mixing — and stay aligned
+// with `00-scope.md` ("Audio codec decoding stays out of scope for
+// this crate") because they operate on data the wiki already documents
+// as **linear PCM**, not as a codec wire format.
+
+/// Convert one 8-bit sample from FILM **sign/magnitude** encoding to
+/// standard two's-complement [`i8`] per `Sega_FILM.wiki` lines 163–169.
+///
+/// Sign/magnitude rule:
+/// - bit 7 set ⇒ negative; magnitude = bits 6..0 (so `0x81 = -1`,
+///   `0xFF = -127`).
+/// - bit 7 clear ⇒ non-negative; value = bits 6..0 directly (so
+///   `0x01 = 1`, `0x7F = 127`).
+///
+/// Special case: `0x80` is "negative zero" in sign/magnitude — this
+/// helper maps it to `0i8` since two's complement has no negative-zero
+/// representation. Producers that care to distinguish `+0` from `-0`
+/// must inspect the raw byte directly.
+pub fn pcm_sign_magnitude_to_i8(b: u8) -> i8 {
+    let sign = (b & 0x80) != 0;
+    let magnitude = (b & 0x7F) as i8;
+    if sign {
+        // `0x80` ⇒ `-0` ⇒ collapses to `0`; otherwise `-magnitude`.
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Decode an 8-bit FILM PCM payload to host-side signed bytes,
+/// applying the documented sign convention for the file's
+/// [`FilmHeader::version`] per `Sega_FILM.wiki` lines 151, 162.
+/// `dst.len()` must equal `src.len()`.
+///
+/// - [`PcmSignConvention::TwosComplement`] (Saturn ASCII versions) — a
+///   byte-for-byte bitcast (the bytes are already two's complement).
+/// - [`PcmSignConvention::SignMagnitude`] (Sega CD / 3DO NULL versions)
+///   — every byte is run through [`pcm_sign_magnitude_to_i8`].
+///
+/// Returns `Err` when `dst.len() != src.len()`.
+pub fn pcm_decode_8bit(src: &[u8], convention: PcmSignConvention, dst: &mut [i8]) -> Result<()> {
+    if dst.len() != src.len() {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: 8-bit decode length mismatch (src {} != dst {})",
+            src.len(),
+            dst.len(),
+        )));
+    }
+    match convention {
+        PcmSignConvention::TwosComplement => {
+            for (i, &b) in src.iter().enumerate() {
+                dst[i] = b as i8;
+            }
+        }
+        PcmSignConvention::SignMagnitude => {
+            for (i, &b) in src.iter().enumerate() {
+                dst[i] = pcm_sign_magnitude_to_i8(b);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode a 16-bit FILM PCM payload to host-side [`i16`] per
+/// `Sega_FILM.wiki` line 153 (16-bit FILM PCM is stored big-endian).
+/// `dst.len()` must equal `src.len() / 2`, and `src.len()` must be
+/// even.
+///
+/// 16-bit FILM PCM is documented as twos-complement on Saturn (the
+/// only platform observed shipping 16-bit FILM audio per the wiki's
+/// game list), so this helper performs only the big-endian → host
+/// conversion. A `convention` argument is intentionally absent — the
+/// wiki does not document a 16-bit sign/magnitude FILM variant.
+pub fn pcm_decode_16be_to_i16(src: &[u8], dst: &mut [i16]) -> Result<()> {
+    if src.len() % 2 != 0 {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: 16-bit BE source length must be even, got {}",
+            src.len(),
+        )));
+    }
+    let samples = src.len() / 2;
+    if dst.len() != samples {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: 16-bit decode length mismatch (src {} bytes ⇒ {} samples != dst {})",
+            src.len(),
+            samples,
+            dst.len(),
+        )));
+    }
+    for (i, pair) in src.chunks_exact(2).enumerate() {
+        dst[i] = i16::from_be_bytes([pair[0], pair[1]]);
+    }
+    Ok(())
+}
+
+/// Re-interleave one FILM stereo PCM chunk's 8-bit samples from the
+/// wire's L-then-R half-chunk layout (`Sega_FILM.wiki` lines 156–160)
+/// to the standard `L R L R …` interleave a typical PCM sink expects.
+/// `src.len()` must be even (one byte per channel-sample); `dst.len()`
+/// must equal `src.len()`.
+///
+/// The wire layout is:
+///
+/// ```text
+///   src = [ L0 L1 L2 … L(n-1) R0 R1 R2 … R(n-1) ]
+/// ```
+///
+/// The interleaved layout is:
+///
+/// ```text
+///   dst = [ L0 R0 L1 R1 L2 R2 … L(n-1) R(n-1) ]
+/// ```
+///
+/// Sample values are **not** transformed (no sign conversion); use
+/// [`pcm_decode_8bit`] first if a sign-magnitude→twos-complement step
+/// is also needed, then re-interleave the decoded `i8` slice.
+pub fn pcm_deinterleave_stereo_8bit(src: &[u8], dst: &mut [u8]) -> Result<()> {
+    if src.len() % 2 != 0 {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: stereo 8-bit chunk length must be even, got {}",
+            src.len(),
+        )));
+    }
+    if dst.len() != src.len() {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: stereo 8-bit interleave length mismatch (src {} != dst {})",
+            src.len(),
+            dst.len(),
+        )));
+    }
+    let per_channel = src.len() / 2;
+    let (left, right) = src.split_at(per_channel);
+    for i in 0..per_channel {
+        dst[2 * i] = left[i];
+        dst[2 * i + 1] = right[i];
+    }
+    Ok(())
+}
+
+/// 16-bit analog of [`pcm_deinterleave_stereo_8bit`]: re-interleave a
+/// FILM stereo PCM chunk's 16-bit big-endian samples from the wire's
+/// L-then-R half-chunk layout (per `Sega_FILM.wiki` line 153 for
+/// endianness + lines 156–160 for the L/R half-chunk split) into
+/// host-endian `L R L R …` [`i16`] pairs.
+///
+/// `src.len()` must be a non-zero multiple of 4 (two bytes per sample
+/// × two channels); `dst.len()` must equal `src.len() / 2`.
+///
+/// This is a one-shot helper that combines [`pcm_decode_16be_to_i16`]
+/// with the channel-deinterleave step: callers that need the
+/// big-endian decode without re-interleave should use
+/// `pcm_decode_16be_to_i16` directly on the L and R halves.
+pub fn pcm_deinterleave_stereo_16be(src: &[u8], dst: &mut [i16]) -> Result<()> {
+    if src.len() % 4 != 0 {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: stereo 16-bit BE chunk length must be a multiple of 4, got {}",
+            src.len(),
+        )));
+    }
+    let samples = src.len() / 2;
+    if dst.len() != samples {
+        return Err(CinepakError::invalid(format!(
+            "FILM PCM: stereo 16-bit deinterleave length mismatch (src {} bytes ⇒ {} samples != dst {})",
+            src.len(),
+            samples,
+            dst.len(),
+        )));
+    }
+    let per_channel_samples = samples / 2;
+    let per_channel_bytes = per_channel_samples * 2;
+    let (left_bytes, right_bytes) = src.split_at(per_channel_bytes);
+    for i in 0..per_channel_samples {
+        let l = i16::from_be_bytes([left_bytes[2 * i], left_bytes[2 * i + 1]]);
+        let r = i16::from_be_bytes([right_bytes[2 * i], right_bytes[2 * i + 1]]);
+        dst[2 * i] = l;
+        dst[2 * i + 1] = r;
+    }
+    Ok(())
+}
+
+impl FilmAudioFormat {
+    /// One-shot convenience: decode a single FILM audio chunk's PCM
+    /// payload to a `Vec<i16>` of host-endian, two's-complement,
+    /// channel-interleaved samples ready for a standard PCM sink.
+    ///
+    /// Dispatches per the [`LinearPcm`] discriminator:
+    ///
+    /// | `bits_per_sample` | `channels` | Pipeline                                           |
+    /// | ----------------- | ---------- | -------------------------------------------------- |
+    /// | 8                 | 1          | [`pcm_decode_8bit`] then sign-extend each `i8`     |
+    /// | 8                 | 2          | [`pcm_decode_8bit`] then sign-extend then re-interleave |
+    /// | 16                | 1          | [`pcm_decode_16be_to_i16`]                         |
+    /// | 16                | 2          | [`pcm_deinterleave_stereo_16be`]                   |
+    ///
+    /// Returns `None` for:
+    ///
+    /// - non-`LinearPcm` discriminators (callers route ADX ADPCM /
+    ///   Unknown elsewhere),
+    /// - unsupported `(bits_per_sample, channels)` combinations
+    ///   (only the four cells above are documented in the wiki),
+    /// - source-length / channel-count mismatches that would trip
+    ///   the underlying helpers' size invariants.
+    ///
+    /// The 16-bit path expands each output `i8` to `i16` via the
+    /// standard `i8 as i16` sign-extension; the resulting samples sit
+    /// in the bottom 8 bits of an `i16` (no scaling to the full
+    /// 16-bit range — that's a remixing decision left to the caller).
+    ///
+    /// [`LinearPcm`]: FilmAudioFormat::LinearPcm
+    pub fn decode_chunk_to_i16(&self, src: &[u8]) -> Option<Vec<i16>> {
+        let Self::LinearPcm {
+            channels,
+            bits_per_sample,
+            sign_convention,
+            ..
+        } = *self
+        else {
+            return None;
+        };
+        match (bits_per_sample, channels) {
+            (8, 1) => {
+                let mut tmp = vec![0i8; src.len()];
+                pcm_decode_8bit(src, sign_convention, &mut tmp).ok()?;
+                Some(tmp.into_iter().map(|s| s as i16).collect())
+            }
+            (8, 2) => {
+                if src.len() % 2 != 0 {
+                    return None;
+                }
+                let mut decoded = vec![0i8; src.len()];
+                pcm_decode_8bit(src, sign_convention, &mut decoded).ok()?;
+                let per_channel = decoded.len() / 2;
+                let mut out = vec![0i16; decoded.len()];
+                for i in 0..per_channel {
+                    out[2 * i] = decoded[i] as i16;
+                    out[2 * i + 1] = decoded[per_channel + i] as i16;
+                }
+                Some(out)
+            }
+            (16, 1) => {
+                if src.len() % 2 != 0 {
+                    return None;
+                }
+                let mut out = vec![0i16; src.len() / 2];
+                pcm_decode_16be_to_i16(src, &mut out).ok()?;
+                Some(out)
+            }
+            (16, 2) => {
+                if src.len() % 4 != 0 {
+                    return None;
+                }
+                let mut out = vec![0i16; src.len() / 2];
+                pcm_deinterleave_stereo_16be(src, &mut out).ok()?;
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Map a FILM version field to its documented PCM sign convention.
 /// ASCII version (any printable `[0-9a-zA-Z.]` four-byte stamp) →
 /// Saturn → twos-complement (wiki line 151). NULL or any non-ASCII

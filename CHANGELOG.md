@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 228 (FILM linear-PCM sample-data shaping helpers): new free
+  functions on the `film` module + a convenience accessor on
+  `FilmAudioFormat`, closing the natural follow-up to the round-221
+  audio classifier. Round 221 surfaced the metadata for FILM PCM
+  payloads — channels, bits-per-sample, sample rate, big-endian byte
+  order, twos-complement vs sign/magnitude convention — but left the
+  documented "consumer is responsible for re-interleaving before
+  passing to a typical PCM playback API" gap open. Round 228 closes
+  it. `pcm_sign_magnitude_to_i8(b: u8) -> i8` converts one
+  sign/magnitude byte to host two's-complement per
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 163–169
+  (`0x81` ⇒ `-1`, `0xFF` ⇒ `-127`; `0x80` "negative zero" collapses
+  to `0i8`). `pcm_decode_8bit(src, convention, dst)` decodes a slice
+  with either `TwosComplement` (byte-for-byte bitcast) or
+  `SignMagnitude` (per-byte rule) per wiki line 151 vs 162.
+  `pcm_decode_16be_to_i16(src, dst)` converts 16-bit big-endian PCM
+  to host `i16` per wiki line 153. `pcm_deinterleave_stereo_8bit(src,
+  dst)` and `pcm_deinterleave_stereo_16be(src, dst)` re-interleave
+  FILM's documented L-then-R half-chunk stereo layout (wiki lines
+  156–160) into standard `L R L R …` form; the 16-bit helper folds
+  in the big-endian decode in one pass. One-shot convenience:
+  `FilmAudioFormat::decode_chunk_to_i16(src) -> Option<Vec<i16>>`
+  dispatches on the `LinearPcm` discriminator across the four
+  documented `(bits_per_sample, channels)` combos (mono / stereo ×
+  8-bit / 16-bit), returning `None` for non-`LinearPcm` variants,
+  unsupported combos (`channels` not in `{1, 2}`, `bits_per_sample`
+  not in `{8, 16}`), and source-length / channel-count mismatches.
+  The 8-bit path sign-extends each `i8` to `i16` (no scaling to the
+  full 16-bit range — that's a remixing decision left to the
+  caller). 30 new tests in `tests/r228_film_pcm_shaping.rs` cover
+  the verbatim wiki examples (`0x81`/`0xFF`/`0x01`/`0x7F`), `0x00`
+  vs `0x80` "negative zero" collapse, total-function coverage of
+  every input byte, twos-complement bitcast vs sign-magnitude rule,
+  big-endian round-trip across the full `i16` range, channel
+  re-interleave correctness, sample preservation across the
+  re-shuffle, every length / size precondition (odd length,
+  non-multiple-of-four, dst-size mismatch), each
+  `FilmAudioFormat::decode_chunk_to_i16` dispatch path with both
+  Saturn and Sega CD sign-convention rules, the `None`-on-non-PCM
+  branch (`CriAdxAdpcm` / `Unknown` / `FilmAudioFormat::None`), the
+  `None`-on-unsupported-combo branch (4-channel, 24-bit), and empty
+  / zero-length inputs. Pure additive change — no demuxer / decoder
+  / encoder behaviour change, no Cargo.toml changes. PCM playback
+  (rate conversion, channel mixing, gain) and ADX ADPCM decoding
+  remain out of scope per `docs/video/cinepak/spec/00-scope.md`;
+  these helpers only re-shape the documented FILM wire bytes into
+  the format a generic PCM sink expects (twos-complement,
+  host-endian, channel-interleaved).
 - Round 221 (FILM container audio-format classifier): new
   `FilmAudioFormat` enum (`None` / `LinearPcm { channels,
   bits_per_sample, sample_rate_hz, endianness, sign_convention }` /

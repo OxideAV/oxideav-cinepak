@@ -77,8 +77,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::codebook::{
-    encode_full_chunk, encode_selective_chunk, Codebook, CodebookChunkKind, CodebookEntry,
-    PixelMode, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
+    encode_full_chunk, encode_header_only_chunk, encode_selective_chunk, Codebook,
+    CodebookChunkKind, CodebookEntry, PixelMode, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
 };
 use crate::error::{CinepakError, Result};
 use crate::header::{
@@ -322,6 +322,49 @@ pub struct EncoderOptions {
     /// Default `4`. Ignored when `kmeans_pp_init = false` or when the
     /// strip has a cross-frame seed.
     pub kmeans_pp_lloyd_iter: u8,
+    /// **Vintage decoder compatibility mode.**
+    ///
+    /// Two structural constraints from `Cinepak.wiki` line 33 — quoted in
+    /// `docs/video/cinepak/spec/01-frame-and-strip.md` §2.3 and
+    /// `02-codebooks.md` §2.2 / §3.4 — are enforced when `true`:
+    ///
+    /// 1. **Strip count ≤ 3.** Vintage Windows and MacOS players reject
+    ///    frames with more than 3 strips. The encoder rejects
+    ///    [`Self::strip_count`] > 3 in [`crate::EncoderOptions`] validation
+    ///    rather than silently clamping so the caller is aware their
+    ///    requested grid would not have been honoured.
+    /// 2. **Both V4 and V1 codebook chunks always present per strip, in
+    ///    strict V4-then-V1 order.** When the rolling-codebook /
+    ///    selective-update pipeline would have omitted a codebook chunk
+    ///    entirely on an inter strip (chunk-omission path, spec §3.4 —
+    ///    decoder inherits the previous codebook), this mode falls back
+    ///    to a **header-only chunk** (`chunk_size = 0x0004`, no payload)
+    ///    instead of no chunk at all. The decoder semantics are identical
+    ///    — header-only chunks signal "no replacement, reuse previous"
+    ///    on inter strips per spec §3.4 — but vintage MacOS players
+    ///    insist on seeing both chunk headers. Intra strips are already
+    ///    conformant (they always emit `0x2000`/`0x2400` then
+    ///    `0x2200`/`0x2600` full-replace chunks). The V4-then-V1
+    ///    ordering is enforced unconditionally by the chunk-emission
+    ///    helper pair and does not depend on this flag.
+    ///
+    /// FFmpeg 7.1.2's encoder analogue is `-skip_empty_cb 0` (the
+    /// **default**); `vintage_compat = true` matches that behaviour for
+    /// the chunk-omission constraint and additionally caps the strip
+    /// count where FFmpeg's `-max_strips` only soft-defaults to 3 with a
+    /// documented `1..32` range. Modern decoders (this crate's
+    /// [`crate::CinepakDecoder`] + FFmpeg 7.1.2) accept either form;
+    /// turn this knob on only when the produced stream must replay on a
+    /// vintage Windows or MacOS Cinepak player.
+    ///
+    /// Wire-size cost: every otherwise-omitted codebook chunk grows
+    /// from `0` bytes to `4` bytes (one chunk header). On a
+    /// chunk-omission-heavy multi-strip inter sequence this caps at
+    /// `2 × 4 × strips × inter_frames` extra bytes, typically <1% of
+    /// the total bitstream.
+    ///
+    /// Default `false`. Set to `true` for vintage-player target output.
+    pub vintage_compat: bool,
 }
 
 impl Default for EncoderOptions {
@@ -352,6 +395,9 @@ impl Default for EncoderOptions {
             // with 4 Lloyd refinement passes.
             kmeans_pp_init: true,
             kmeans_pp_lloyd_iter: 4,
+            // Vintage-decoder compatibility off by default — modern
+            // decoders accept the wire-cheaper chunk-omission path.
+            vintage_compat: false,
         }
     }
 }
@@ -428,6 +474,10 @@ impl EncoderOptions {
             // with 4 Lloyd refinement passes.
             kmeans_pp_init: true,
             kmeans_pp_lloyd_iter: 4,
+            // Vintage-decoder compatibility off by default — the
+            // quality-knob path optimises for byte budget, and modern
+            // decoders accept chunk-omitted bitstreams.
+            vintage_compat: false,
         }
     }
 }
@@ -4229,6 +4279,7 @@ fn emit_codebook_chunks_inter(
         selective_enabled,
         v4_used,
         force_full_v4,
+        opts.vintage_compat,
         out,
     );
     emit_codebook_chunk_one(
@@ -4240,6 +4291,7 @@ fn emit_codebook_chunks_inter(
         selective_enabled,
         v1_used,
         force_full_v1,
+        opts.vintage_compat,
         out,
     );
 }
@@ -4254,6 +4306,7 @@ fn emit_codebook_chunk_one(
     selective_enabled: bool,
     used: &[bool; 256],
     force_full: bool,
+    vintage_compat: bool,
     out: &mut Vec<u8>,
 ) {
     let entry_size = mode.entry_size();
@@ -4324,12 +4377,30 @@ fn emit_codebook_chunk_one(
         encode_full_chunk(kind_full, cb, n, out);
         roll.set(which, cb.clone(), n);
     } else if can_emit_none && none_size <= full_size {
-        // Omit chunk entirely. Decoder inherits prev codebook (spec §5).
+        // Inheritance path. Two wire forms with identical decoder
+        // semantics (spec 02-codebooks.md §3.4, both inherit the
+        // previous codebook):
+        //
+        // - **Omit chunk entirely** (0 bytes) — wire-cheapest; modern
+        //   decoders accept this. Used when `opts.vintage_compat` is
+        //   `false` (default).
+        // - **Header-only chunk** (`chunk_size = 0x0004`, 4 bytes) —
+        //   satisfies the vintage MacOS player's requirement that both
+        //   V4 and V1 codebook chunks are always present in a strip
+        //   even when no replacement is needed (Cinepak.wiki line 33,
+        //   spec 01-frame-and-strip.md §2.3 / 02-codebooks.md §2.2 /
+        //   §3.4). Used when `opts.vintage_compat = true`.
+        if vintage_compat {
+            encode_header_only_chunk(kind_full, out);
+        }
         // Roll-state update: codebook stays exactly as `prev` — the
         // slots not referenced by this strip's MBs may differ between
         // `cb` and `prev`, so we MUST record the decoder's actual
         // view (= `prev`) rather than our freshly-trained `cb` to
-        // keep cross-strip codebook tracking accurate.
+        // keep cross-strip codebook tracking accurate. (Header-only
+        // and chunk-omission are decoder-equivalent — both signal
+        // "inherit previous codebook" — so the roll-state update is
+        // identical for both wire forms.)
         let prev_cb = prev_matches.unwrap().clone();
         roll.set(which, prev_cb, n);
     } else if let Some(prev_cb) = prev_matches
@@ -4535,6 +4606,16 @@ fn validate_opts(opts: &EncoderOptions) -> Result<()> {
     }
     if opts.strip_count == 0 {
         return Err(CinepakError::other("encoder: strip_count must be ≥ 1"));
+    }
+    if opts.vintage_compat && opts.strip_count > 3 {
+        // Vintage Windows + MacOS players reject frames with more than
+        // 3 strips (Cinepak.wiki line 31, quoted in spec
+        // 01-frame-and-strip.md §2.3). The encoder rejects rather than
+        // silently clamping so the caller is aware their requested grid
+        // would not have been honoured.
+        return Err(CinepakError::other(
+            "encoder: vintage_compat = true requires strip_count ≤ 3",
+        ));
     }
     if !(opts.skip_threshold.is_finite() && opts.skip_threshold >= 0.0) {
         return Err(CinepakError::other(

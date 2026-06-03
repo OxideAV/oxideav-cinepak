@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 215 (vintage-decoder-compatible encoder mode): new
+  `EncoderOptions::vintage_compat: bool` (default `false`). When
+  `true`, enforces two structural constraints from `Cinepak.wiki`
+  line 33 quoted in `docs/video/cinepak/spec/01-frame-and-strip.md`
+  §2.3 and `02-codebooks.md` §2.2 / §3.4: (i) `validate_opts`
+  rejects `strip_count > 3` with a clear "vintage_compat requires
+  strip_count ≤ 3" message (vintage Windows + MacOS players reject
+  frames above the 3-strip ceiling); (ii) inter strips that would
+  otherwise chunk-omit (0 wire bytes, decoder inherits previous
+  codebook per spec §3.4) instead emit a **header-only chunk**
+  (`chunk_size = 0x0004`, 4 wire bytes) so each strip's chunk
+  stream always carries both V4 then V1 codebook chunks in strict
+  V4-then-V1 order — the shape vintage MacOS Cinepak players insist
+  on. Header-only and chunk-omitted forms are decoder-equivalent —
+  both signal "inherit previous codebook" — so a vintage-compat
+  encoded stream self-decodes to byte-identical pixels as the same
+  input encoded with the default path. The intra path is already
+  conformant (always emits V4-then-V1 full-replace per strip), so
+  the flag is a no-op on intra-only sequences. Wire-size overhead
+  caps at `2 × 4 × strips × inter_frames` bytes (one chunk header
+  per otherwise-omitted chunk × V4+V1 per strip). 9 new tests
+  cover the strip-count ceiling (accept-3 / reject-4 with vs
+  without the flag), the header-only chunk wire shape and
+  V4-then-V1 ordering on inter strips, the bounded wire-size
+  overhead, intra-path no-op equivalence, every-inter-strip
+  carries-two-chunks across a multi-strip frame, and the
+  decode-equivalence pixel check. Vintage support is encoder
+  policy, not a bitstream feature — output stays conformant
+  Cinepak in both modes.
 - Round 209 (depth-mode profiling extension): two new modes on
   `examples/profile_cinepak.rs` — `picker` sweeps the four public RGB
   encoder entry points (`encode_rgb24` baseline →

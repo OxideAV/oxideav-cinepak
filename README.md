@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -432,6 +432,39 @@ artefact's intent: persist a stable visual / numerical baseline that
 future encoder-optimisation rounds can A/B-compare their algorithmic
 tweaks against, without having to re-discover the capture recipe.
 
+Round 215 (vintage-decoder-compatible encoder mode) added
+**`EncoderOptions::vintage_compat: bool`** (default `false`) — closes
+the long-standing "produces conformant streams for vintage Windows /
+MacOS Cinepak players" gap. Two `Cinepak.wiki` line 33 structural
+constraints — quoted verbatim in `docs/video/cinepak/spec/01-frame-and-strip.md`
+§2.3 (strip count ≤ 3) and `02-codebooks.md` §2.2 + §3.4 (both V4 and V1
+codebook chunks always present per strip in strict V4-then-V1 order,
+even when the codebook is unchanged) — are enforced when set:
+`validate_opts` rejects `strip_count > 3` with a clear "vintage_compat
+requires strip_count ≤ 3" message (rather than silently clamping the
+caller's requested grid), and the rolling-codebook /
+selective-update inter path now falls back to a **header-only chunk**
+(`chunk_size = 0x0004`, 4 wire bytes) where the modern default
+chunk-omission path would have emitted 0 bytes. The intra path is
+already conformant — it always emits `0x2000`/`0x2400` then
+`0x2200`/`0x2600` full-replace chunks per strip — so the new flag is a
+no-op on intra-only sequences (wire-byte-identical to the default). On
+the chunk-omission-heavy multi-strip inter sequences where the gain
+matters, the wire-size overhead caps at `2 × 4 × strips × inter_frames`
+extra bytes (one chunk header per otherwise-omitted chunk, two chunks
+per strip), typically < 1 % of the bitstream. Decoder semantics are
+identical: header-only and chunk-omitted forms both signal "inherit
+previous codebook" per spec §3.4, so a vintage-compat-encoded stream
+self-decodes to byte-identical pixels as the same input encoded with
+the default path. 9 new tests cover the strip-count-3 ceiling
+(accept) + strip-count-4 rejection (with-vintage / without), the
+header-only chunk shape and V4-then-V1 ordering on inter strips, the
+bounded wire-size overhead, intra-path no-op equivalence, the
+multi-strip case where every inter strip carries exactly two
+codebook chunks, and the decode-equivalence pixel check. Vintage
+support is encoder policy, not a bitstream feature — the wire format
+is conformant Cinepak in both modes.
+
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
 
@@ -767,6 +800,32 @@ Encode side (rounds 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + r47-encoder-RDO + r4-LBG + r
   50.00 dB, larger wire); LCG-noise +0.88 dB; 128×96 gradient unchanged
   (default already optimal). Intra-only, stateless. `rdo_lambda = None`
   gives pure-distortion (smallest-error) ranking.
+- `EncoderOptions::vintage_compat` (round 215, default `false`) —
+  **vintage Windows / MacOS Cinepak player compatibility mode**.
+  Enforces the two `Cinepak.wiki` line 33 structural constraints
+  quoted in `docs/video/cinepak/spec/01-frame-and-strip.md` §2.3 +
+  `02-codebooks.md` §2.2 / §3.4: (i) `strip_count` is capped at `3`
+  (rejected with a clear error at `validate_opts` time rather than
+  silently clamped); (ii) inter strips that would otherwise
+  chunk-omit (decoder inherits previous codebook, 0 wire bytes per
+  spec §3.4) instead emit a **header-only chunk**
+  (`chunk_size = 0x0004`, 4 wire bytes) so each strip always carries
+  both V4 then V1 codebook chunks in strict V4-then-V1 order — the
+  shape vintage MacOS players insist on. The intra path is already
+  conformant (always emits `0x2000`/`0x2400` then `0x2200`/`0x2600`
+  full-replace per strip), so the flag is a no-op on intra-only
+  sequences. Wire-size overhead is bounded at
+  `2 × 4 × strips × inter_frames` bytes (one chunk header per
+  otherwise-omitted chunk × V4+V1 per strip). Header-only and
+  chunk-omitted forms are decoder-equivalent — both signal "inherit
+  previous codebook" per spec §3.4 — so a vintage-compat-encoded
+  stream self-decodes to byte-identical pixels as the same input
+  encoded with the default path. Set `vintage_compat = true` only
+  when the produced stream must replay on a vintage player; modern
+  decoders (including this crate's [`CinepakDecoder`] and FFmpeg
+  7.1.2) accept either form. Vintage support is encoder policy, not
+  a bitstream feature — output stays conformant Cinepak in both
+  modes.
 - RGB→YUV forward transform algebraically inverts the spec's decoder
   matrix; round-trips primaries `(255,0,0)` / `(0,255,0)` / `(0,0,255)`
   to within the codec's quantisation tolerance.

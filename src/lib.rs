@@ -66,7 +66,8 @@ pub use encoder::{
 };
 pub use error::{CinepakError, Result};
 pub use film::{
-    probe_film, CinepakVariant, Fdsc, FilmDemuxer, FilmHeader, SampleRecord, StabHeader,
+    probe_film, CinepakVariant, Fdsc, FilmAudioFormat, FilmDemuxer, FilmHeader, PcmEndianness,
+    PcmSignConvention, SampleRecord, StabHeader,
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 

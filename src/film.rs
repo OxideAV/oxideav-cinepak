@@ -206,6 +206,204 @@ impl Fdsc {
     pub fn is_standard_cinepak(&self) -> bool {
         &self.video_codec == b"cvid"
     }
+
+    /// `true` iff the FDSC declares an audio stream. Per
+    /// `Sega_FILM.wiki` line 82 ("The fields pertaining to audio
+    /// (channels, bits, compression, and sample rate) will all be 0
+    /// if there is no audio present in the file"), `has_audio()`
+    /// detects the all-zero sentinel — the abbreviated 20-byte FDSC
+    /// (early Sega CD variants, no audio fields) also reports `false`
+    /// because [`Fdsc::parse`] zero-fills the audio fields on the
+    /// abbreviated form.
+    pub fn has_audio(&self) -> bool {
+        self.audio_channels != 0
+            || self.audio_bits != 0
+            || self.audio_compression != 0
+            || self.audio_sample_rate != 0
+    }
+
+    /// Classify the audio stream this FDSC describes. Returns a
+    /// structured [`FilmAudioFormat`] per `Sega_FILM.wiki` lines
+    /// 147–169 — covers the linear-PCM payload encoding (byte order,
+    /// sign convention), the CRI ADX ADPCM variant (`audio_compression
+    /// = 2`, wiki line 149), the no-audio sentinel, and the unknown
+    /// `audio_compression` discriminator.
+    ///
+    /// `film_version` is the [`FilmHeader::version`] field — required
+    /// because the audio sign convention depends on the platform: per
+    /// wiki line 151 Saturn (ASCII version `'1.0X'`) stores signed
+    /// twos-complement PCM, while Sega CD (NULL version, wiki line
+    /// 162 + 224) stores sign/magnitude PCM. Callers who have a full
+    /// demuxer should prefer [`FilmDemuxer::audio_format`] which
+    /// threads the version through automatically.
+    pub fn audio_format(&self, film_version: &[u8; 4]) -> FilmAudioFormat {
+        if !self.has_audio() {
+            return FilmAudioFormat::None;
+        }
+        match self.audio_compression {
+            0 => {
+                // Linear PCM. Byte-order + sign-convention rules per
+                // wiki lines 151, 153, 162.
+                let endianness = match self.audio_bits {
+                    16 => PcmEndianness::BigEndian,
+                    _ => PcmEndianness::NotApplicable,
+                };
+                let sign = pcm_sign_convention_for(film_version);
+                FilmAudioFormat::LinearPcm {
+                    channels: self.audio_channels,
+                    bits_per_sample: self.audio_bits,
+                    sample_rate_hz: self.audio_sample_rate,
+                    endianness,
+                    sign_convention: sign,
+                }
+            }
+            2 => FilmAudioFormat::CriAdxAdpcm {
+                channels: self.audio_channels,
+                sample_rate_hz: self.audio_sample_rate,
+            },
+            other => FilmAudioFormat::Unknown {
+                channels: self.audio_channels,
+                bits_per_sample: self.audio_bits,
+                sample_rate_hz: self.audio_sample_rate,
+                compression: other,
+            },
+        }
+    }
+}
+
+/// Sign convention used for linear-PCM audio samples in a FILM file.
+///
+/// Per `Sega_FILM.wiki`:
+/// - Line 151: Saturn `.cpk` files store signed (twos-complement) PCM.
+/// - Line 162: Sega CD files store sign/magnitude PCM (bit 7 = sign,
+///   bits 6..0 = magnitude — so `0x81` = -1, `0xFF` = -127).
+///
+/// The convention is inferred from the [`FilmHeader::version`] field —
+/// ASCII versions like `'1.07'` / `'1.09'` are Saturn (twos-complement),
+/// NULL or non-ASCII versions are early Sega CD / 3DO (sign/magnitude
+/// is the documented Sega CD encoding; the 3DO Lemmings entry at wiki
+/// line 189 says "8-bit signed, monaural PCM" without explicitly
+/// specifying twos-complement vs sign/magnitude, but the same NULL-version
+/// detection rule classifies them as Sega-CD-era files).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcmSignConvention {
+    /// Two's complement signed integers (Saturn `'1.0X'` ASCII versions).
+    TwosComplement,
+    /// Sign/magnitude: bit 7 is the sign bit, bits 6..0 are the
+    /// magnitude. Only meaningful for 8-bit PCM per wiki line 162.
+    SignMagnitude,
+}
+
+/// Byte order used for multi-byte PCM samples. Per `Sega_FILM.wiki`
+/// line 153 ("16-bit audio data, the individual PCM samples are stored
+/// in big endian format"), 16-bit FILM PCM is big-endian. 8-bit PCM
+/// has no meaningful endianness, so the enum carries [`NotApplicable`]
+/// for that case.
+///
+/// [`NotApplicable`]: PcmEndianness::NotApplicable
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcmEndianness {
+    BigEndian,
+    NotApplicable,
+}
+
+/// Classified audio format for a FILM file's audio stream. Produced by
+/// [`Fdsc::audio_format`] / [`FilmDemuxer::audio_format`]. Mirrors the
+/// `audio_compression` discriminator in the FDSC chunk per
+/// `Sega_FILM.wiki` line 149 plus the linear-PCM encoding rules per
+/// wiki lines 151–162.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilmAudioFormat {
+    /// No audio stream. The FDSC's audio fields are all zero (wiki
+    /// line 82) or the FDSC is in the abbreviated 20-byte layout (wiki
+    /// line 178, audio fields omitted entirely).
+    None,
+    /// `audio_compression = 0` — linear PCM, with byte-order and
+    /// sign-convention rules per wiki lines 151–162. Stereo channel
+    /// layout in the **sample data** is non-interleaved per wiki line
+    /// 156–160 (first half left, second half right); the consumer is
+    /// responsible for re-interleaving before passing to a typical PCM
+    /// playback API.
+    LinearPcm {
+        channels: u8,
+        bits_per_sample: u8,
+        sample_rate_hz: u16,
+        endianness: PcmEndianness,
+        sign_convention: PcmSignConvention,
+    },
+    /// `audio_compression = 2` — CRI ADX ADPCM, out of scope for this
+    /// crate per `docs/video/cinepak/spec/00-scope.md` §2.3.
+    /// Surfaced so consumers can detect and route to a separate
+    /// decoder rather than treat the audio bytes as linear PCM.
+    CriAdxAdpcm { channels: u8, sample_rate_hz: u16 },
+    /// `audio_compression` is a value not documented in
+    /// `Sega_FILM.wiki` line 149. The raw fields are preserved so a
+    /// caller can log or route on the unknown discriminator.
+    Unknown {
+        channels: u8,
+        bits_per_sample: u8,
+        sample_rate_hz: u16,
+        compression: u8,
+    },
+}
+
+impl FilmAudioFormat {
+    /// Average PCM byte rate (bytes per second of decoded audio).
+    /// Only defined for [`FilmAudioFormat::LinearPcm`] — ADX ADPCM and
+    /// the Unknown discriminator return `None` because the wire
+    /// payload is not directly proportional to a wall-clock rate
+    /// without invoking the codec.
+    ///
+    /// Formula per wiki lines 75–77 + 156–160:
+    /// `channels × (bits_per_sample / 8) × sample_rate_hz`.
+    ///
+    /// Returns `None` when any field is zero (degenerate stream) or
+    /// when `bits_per_sample` isn't a multiple of 8.
+    pub fn byte_rate_bps(&self) -> Option<u64> {
+        match self {
+            Self::LinearPcm {
+                channels,
+                bits_per_sample,
+                sample_rate_hz,
+                ..
+            } => {
+                if *channels == 0 || *bits_per_sample == 0 || *sample_rate_hz == 0 {
+                    return None;
+                }
+                if bits_per_sample % 8 != 0 {
+                    return None;
+                }
+                let bytes_per_sample = (*bits_per_sample as u64) / 8;
+                Some(u64::from(*channels) * bytes_per_sample * u64::from(*sample_rate_hz))
+            }
+            _ => None,
+        }
+    }
+
+    /// `true` iff this is a [`FilmAudioFormat::LinearPcm`] payload —
+    /// the only audio format with a well-defined byte→sample mapping
+    /// in this crate. ADX ADPCM and Unknown return `false`; consumers
+    /// who want to route to a separate decoder should check this
+    /// first.
+    pub fn is_linear_pcm(&self) -> bool {
+        matches!(self, Self::LinearPcm { .. })
+    }
+}
+
+/// Map a FILM version field to its documented PCM sign convention.
+/// ASCII version (any printable `[0-9a-zA-Z.]` four-byte stamp) →
+/// Saturn → twos-complement (wiki line 151). NULL or any non-ASCII
+/// version → early Sega CD / 3DO → sign/magnitude (wiki line 162 + 224).
+fn pcm_sign_convention_for(version: &[u8; 4]) -> PcmSignConvention {
+    let ascii = version.iter().all(|b| {
+        let c = *b;
+        c.is_ascii_alphanumeric() || c == b'.'
+    });
+    if ascii {
+        PcmSignConvention::TwosComplement
+    } else {
+        PcmSignConvention::SignMagnitude
+    }
 }
 
 /// Sample Table (`STAB`) header (excluding the per-sample records).
@@ -265,6 +463,21 @@ impl SampleRecord {
         } else {
             Some(self.sample_info_2)
         }
+    }
+
+    /// Returns `true` for an audio sample whose `sample_info_2` is
+    /// exactly `1` per `Sega_FILM.wiki` line 116 ("For an audio chunk,
+    /// sample info 1 is all ones and sample info 2 is always 1"). A
+    /// non-1 `sample_info_2` on an audio record means the file is
+    /// malformed (the wiki specifies the value verbatim); we surface it
+    /// rather than silently accepting since downstream playback engines
+    /// rely on the field being a constant.
+    ///
+    /// Returns `false` for video records — they aren't audio at all,
+    /// and `sample_info_2` carries the video-only `next_frame_ticks`
+    /// meaning, not the audio `1` constant.
+    pub fn is_well_formed_audio(&self) -> bool {
+        self.is_audio() && self.sample_info_2 == 1
     }
 }
 
@@ -373,6 +586,66 @@ impl FilmDemuxer {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.is_audio())
+    }
+
+    /// Classify the audio stream's format using both the FDSC's audio
+    /// fields and the [`FilmHeader::version`] (required because the
+    /// PCM sign convention depends on the platform). Convenience
+    /// wrapper over [`Fdsc::audio_format`] that threads the version
+    /// automatically. See [`FilmAudioFormat`] for the discriminator
+    /// taxonomy.
+    pub fn audio_format(&self) -> FilmAudioFormat {
+        self.fdsc.audio_format(&self.film_header.version)
+    }
+
+    /// Total **audio** stream duration in seconds, computed from the
+    /// sum of audio `sample_length` fields divided by the linear-PCM
+    /// byte rate (see [`FilmAudioFormat::byte_rate_bps`]).
+    ///
+    /// Returns `None` when:
+    ///
+    /// - the file declares no audio (`has_audio() == false`),
+    /// - the audio compression is not linear PCM (the byte-to-sample
+    ///   mapping is codec-internal for ADX ADPCM),
+    /// - any of `channels` / `bits_per_sample` / `sample_rate_hz`
+    ///   would yield a zero byte rate,
+    /// - or the file contains no audio sample records at all.
+    ///
+    /// This is independent of the video timeline; for the **video**
+    /// duration use [`Self::duration_seconds`].
+    pub fn audio_duration_seconds(&self) -> Option<f64> {
+        let byte_rate = self.audio_format().byte_rate_bps()?;
+        if byte_rate == 0 {
+            return None;
+        }
+        let total_bytes: u64 = self
+            .audio_samples()
+            .map(|(_, s)| u64::from(s.sample_length))
+            .sum();
+        if total_bytes == 0 {
+            return None;
+        }
+        // `byte_rate` is u64 (max product = 255 channels × 8 B/sample ×
+        // 65535 Hz ≈ 1.3 × 10^8 — well within f64 exact integers).
+        Some(total_bytes as f64 / byte_rate as f64)
+    }
+
+    /// Validate every audio sample record's `sample_info_2 == 1` per
+    /// `Sega_FILM.wiki` line 116. Returns the index of the first
+    /// audio record whose `sample_info_2` is **not** 1, or `None` if
+    /// all audio records are well-formed (or there are no audio
+    /// records at all).
+    ///
+    /// Use as a defensive validation pass after [`Self::parse`] — the
+    /// wiki specifies the field's value verbatim, so a non-1 value
+    /// indicates either (a) a malformed file or (b) a producer that
+    /// silently broke the audio interleave contract; either case is
+    /// worth surfacing rather than silently routing the audio bytes
+    /// to a PCM decoder that assumes the constant.
+    pub fn first_malformed_audio_sample(&self) -> Option<usize> {
+        self.audio_samples()
+            .find(|(_, s)| !s.is_well_formed_audio())
+            .map(|(i, _)| i)
     }
 
     /// Returns just the video **keyframes**, in sample-table order.
@@ -915,5 +1188,323 @@ mod tests {
         assert_eq!(dem.duration_ticks(), Some(20));
         // duration_seconds short-circuits on zero base.
         assert_eq!(dem.duration_seconds(), None);
+    }
+
+    // ---- r221: audio-format classification ------------------------------
+
+    /// Patch the FDSC audio-field bytes of a `build_minimal_film()`
+    /// buffer in place. The FDSC starts at offset 16; per
+    /// `Sega_FILM.wiki` lines 74–77 the audio fields are:
+    ///   byte 21 = audio_channels
+    ///   byte 22 = audio_bits
+    ///   byte 23 = audio_compression
+    ///   bytes 24–25 = audio_sample_rate (BE u16)
+    fn patch_minimal_audio_fields(
+        bytes: &mut [u8],
+        channels: u8,
+        bits: u8,
+        compression: u8,
+        sample_rate: u16,
+    ) {
+        let fdsc_off = 16;
+        bytes[fdsc_off + 21] = channels;
+        bytes[fdsc_off + 22] = bits;
+        bytes[fdsc_off + 23] = compression;
+        bytes[fdsc_off + 24..fdsc_off + 26].copy_from_slice(&sample_rate.to_be_bytes());
+    }
+
+    /// Patch the FILM version field (offset 8..12) of a
+    /// `build_minimal_film()` buffer in place.
+    fn patch_film_version(bytes: &mut [u8], version: &[u8; 4]) {
+        bytes[8..12].copy_from_slice(version);
+    }
+
+    #[test]
+    fn has_audio_zero_fields() {
+        // Default `build_minimal_film()` builds an all-zero audio FDSC.
+        let bytes = build_minimal_film();
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert!(!dem.fdsc.has_audio());
+        assert_eq!(dem.audio_format(), FilmAudioFormat::None);
+        // No audio ⇒ no byte rate ⇒ no audio duration.
+        assert_eq!(dem.audio_format().byte_rate_bps(), None);
+        assert_eq!(dem.audio_duration_seconds(), None);
+        assert!(!dem.audio_format().is_linear_pcm());
+    }
+
+    #[test]
+    fn has_audio_any_field_set() {
+        // Setting any one of the four fields ⇒ has_audio() true.
+        for (chan, bits, comp, rate) in [
+            (1, 0, 0, 0u16),
+            (0, 8, 0, 0),
+            (0, 0, 2, 0),
+            (0, 0, 0, 22050),
+        ] {
+            let mut bytes = build_minimal_film();
+            patch_minimal_audio_fields(&mut bytes, chan, bits, comp, rate);
+            let dem = FilmDemuxer::parse(&bytes).unwrap();
+            assert!(
+                dem.fdsc.has_audio(),
+                "expected has_audio() for chan={chan} bits={bits} comp={comp} rate={rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_format_saturn_stereo_16bit_pcm() {
+        // Saturn ASCII version '1.07' with 16-bit stereo 44100 Hz PCM:
+        // wiki line 151 (signed twos-complement) + line 153 (big-endian).
+        let mut bytes = build_minimal_film();
+        patch_film_version(&mut bytes, b"1.07");
+        patch_minimal_audio_fields(&mut bytes, 2, 16, 0, 44100);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(
+            dem.audio_format(),
+            FilmAudioFormat::LinearPcm {
+                channels: 2,
+                bits_per_sample: 16,
+                sample_rate_hz: 44100,
+                endianness: PcmEndianness::BigEndian,
+                sign_convention: PcmSignConvention::TwosComplement,
+            }
+        );
+        // byte rate = 2 ch × 2 B × 44100 Hz = 176_400 B/s.
+        assert_eq!(dem.audio_format().byte_rate_bps(), Some(176_400));
+        assert!(dem.audio_format().is_linear_pcm());
+    }
+
+    #[test]
+    fn audio_format_saturn_8bit_pcm_endianness_not_applicable() {
+        // 8-bit PCM has no meaningful endianness per wiki line 153
+        // ("16-bit audio data, the individual PCM samples are stored
+        // in big endian"); the converse is that 8-bit data is just
+        // bytes.
+        let mut bytes = build_minimal_film();
+        patch_film_version(&mut bytes, b"1.09");
+        patch_minimal_audio_fields(&mut bytes, 1, 8, 0, 22050);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        let fmt = dem.audio_format();
+        match fmt {
+            FilmAudioFormat::LinearPcm {
+                endianness,
+                sign_convention,
+                ..
+            } => {
+                assert_eq!(endianness, PcmEndianness::NotApplicable);
+                assert_eq!(sign_convention, PcmSignConvention::TwosComplement);
+            }
+            _ => panic!("expected LinearPcm, got {fmt:?}"),
+        }
+        // byte rate = 1 × 1 × 22050 = 22050.
+        assert_eq!(fmt.byte_rate_bps(), Some(22050));
+    }
+
+    #[test]
+    fn audio_format_sega_cd_sign_magnitude_inferred_from_null_version() {
+        // NULL version + 8-bit PCM ⇒ Sega CD / 3DO era ⇒
+        // sign/magnitude per wiki line 162 + 224.
+        let mut bytes = build_minimal_film();
+        patch_film_version(&mut bytes, b"\x00\x00\x00\x00");
+        patch_minimal_audio_fields(&mut bytes, 1, 8, 0, 16000);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        match dem.audio_format() {
+            FilmAudioFormat::LinearPcm {
+                sign_convention, ..
+            } => assert_eq!(sign_convention, PcmSignConvention::SignMagnitude),
+            other => panic!("expected sign/magnitude LinearPcm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_format_cri_adx_adpcm_branch() {
+        // audio_compression = 2 ⇒ CRI ADX ADPCM per wiki line 149.
+        let mut bytes = build_minimal_film();
+        patch_minimal_audio_fields(&mut bytes, 2, 0, 2, 22050);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(
+            dem.audio_format(),
+            FilmAudioFormat::CriAdxAdpcm {
+                channels: 2,
+                sample_rate_hz: 22050,
+            }
+        );
+        // ADX byte rate is codec-internal; not a wall-clock proxy.
+        assert_eq!(dem.audio_format().byte_rate_bps(), None);
+        assert!(!dem.audio_format().is_linear_pcm());
+        // Audio duration also returns None for non-PCM compression.
+        assert_eq!(dem.audio_duration_seconds(), None);
+    }
+
+    #[test]
+    fn audio_format_unknown_compression_preserves_fields() {
+        // audio_compression discriminator not in {0, 2}. Surface as
+        // Unknown so caller can log / branch on it.
+        let mut bytes = build_minimal_film();
+        patch_minimal_audio_fields(&mut bytes, 1, 8, 7, 11025);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(
+            dem.audio_format(),
+            FilmAudioFormat::Unknown {
+                channels: 1,
+                bits_per_sample: 8,
+                sample_rate_hz: 11025,
+                compression: 7,
+            }
+        );
+        assert_eq!(dem.audio_format().byte_rate_bps(), None);
+    }
+
+    #[test]
+    fn byte_rate_returns_none_on_zero_or_non_multiple_of_8_bits() {
+        // A LinearPcm value with bits_per_sample = 12 (not 8/16) has
+        // no well-defined byte rate.
+        let fmt = FilmAudioFormat::LinearPcm {
+            channels: 2,
+            bits_per_sample: 12,
+            sample_rate_hz: 44100,
+            endianness: PcmEndianness::BigEndian,
+            sign_convention: PcmSignConvention::TwosComplement,
+        };
+        assert_eq!(fmt.byte_rate_bps(), None);
+        // Zero channels.
+        let fmt = FilmAudioFormat::LinearPcm {
+            channels: 0,
+            bits_per_sample: 16,
+            sample_rate_hz: 44100,
+            endianness: PcmEndianness::BigEndian,
+            sign_convention: PcmSignConvention::TwosComplement,
+        };
+        assert_eq!(fmt.byte_rate_bps(), None);
+        // Zero sample rate.
+        let fmt = FilmAudioFormat::LinearPcm {
+            channels: 2,
+            bits_per_sample: 16,
+            sample_rate_hz: 0,
+            endianness: PcmEndianness::BigEndian,
+            sign_convention: PcmSignConvention::TwosComplement,
+        };
+        assert_eq!(fmt.byte_rate_bps(), None);
+    }
+
+    #[test]
+    fn audio_duration_seconds_sums_audio_sample_lengths() {
+        // FILM with 2 audio records of 4096 B and 8192 B = 12288 B.
+        // At 8-bit mono 22050 Hz, byte_rate = 22050 B/s ⇒
+        // duration = 12288 / 22050 ≈ 0.5574 s.
+        let mut bytes =
+            build_film_with_records(&[[0, 4096, 0xFFFF_FFFF, 1], [4096, 8192, 0xFFFF_FFFF, 1]]);
+        // Patch FILM version + FDSC audio fields onto the canned
+        // build_film_with_records output (which leaves audio fields at 0).
+        patch_film_version(&mut bytes, b"1.09");
+        patch_minimal_audio_fields(&mut bytes, 1, 8, 0, 22050);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        let dur = dem.audio_duration_seconds().unwrap();
+        let expected = 12288.0 / 22050.0;
+        assert!(
+            (dur - expected).abs() < 1e-9,
+            "audio duration {dur} ≠ expected {expected}"
+        );
+    }
+
+    #[test]
+    fn audio_duration_seconds_returns_none_when_no_audio_records() {
+        // Audio declared in FDSC but no audio sample records.
+        let mut bytes = build_film_with_records(&[[0, 500, 0x00000000, 1]]);
+        patch_film_version(&mut bytes, b"1.07");
+        patch_minimal_audio_fields(&mut bytes, 1, 8, 0, 22050);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        // No audio sample rows → no audio duration.
+        assert_eq!(dem.audio_duration_seconds(), None);
+    }
+
+    #[test]
+    fn well_formed_audio_requires_sample_info_2_eq_one() {
+        // Wiki line 116: audio sample_info_2 must be exactly 1.
+        let ok = SampleRecord {
+            sample_offset: 0,
+            sample_length: 1024,
+            sample_info_1: 0xFFFF_FFFF,
+            sample_info_2: 1,
+        };
+        let bad = SampleRecord {
+            sample_offset: 0,
+            sample_length: 1024,
+            sample_info_1: 0xFFFF_FFFF,
+            sample_info_2: 7,
+        };
+        let video = SampleRecord {
+            sample_offset: 0,
+            sample_length: 1024,
+            sample_info_1: 0x00000000,
+            sample_info_2: 20,
+        };
+        assert!(ok.is_well_formed_audio());
+        assert!(!bad.is_well_formed_audio());
+        // Video record is NOT audio at all.
+        assert!(!video.is_well_formed_audio());
+    }
+
+    #[test]
+    fn first_malformed_audio_sample_pinpoints_offender() {
+        // 3 audio records, middle one has sample_info_2 = 2.
+        let bytes = build_film_with_records(&[
+            [0, 1024, 0xFFFF_FFFF, 1],
+            [1024, 1024, 0xFFFF_FFFF, 2],
+            [2048, 1024, 0xFFFF_FFFF, 1],
+        ]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(dem.first_malformed_audio_sample(), Some(1));
+
+        // All well-formed → None.
+        let bytes =
+            build_film_with_records(&[[0, 1024, 0xFFFF_FFFF, 1], [1024, 1024, 0xFFFF_FFFF, 1]]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(dem.first_malformed_audio_sample(), None);
+
+        // No audio at all → None (vacuously well-formed).
+        let bytes = build_film_with_records(&[[0, 500, 0x00000000, 20]]);
+        let dem = FilmDemuxer::parse(&bytes).unwrap();
+        assert_eq!(dem.first_malformed_audio_sample(), None);
+    }
+
+    #[test]
+    fn audio_format_unaffected_by_strip_count_or_video_fields() {
+        // The FDSC's `bits_per_pixel`, `height`, `width`,
+        // `video_codec` are irrelevant to the audio classifier — vary
+        // them and observe identical results.
+        let mut a = build_minimal_film();
+        patch_film_version(&mut a, b"1.07");
+        patch_minimal_audio_fields(&mut a, 2, 16, 0, 44100);
+        let mut b = a.clone();
+        // Patch the video FOURCC and bpp.
+        b[16 + 8..16 + 12].copy_from_slice(b"cvid"); // already cvid; no-op
+        b[16 + 20] = 16; // bpp 16 vs 24
+        let dem_a = FilmDemuxer::parse(&a).unwrap();
+        let dem_b = FilmDemuxer::parse(&b).unwrap();
+        assert_eq!(dem_a.audio_format(), dem_b.audio_format());
+    }
+
+    #[test]
+    fn abbreviated_fdsc_reports_no_audio() {
+        // The 0x14-byte abbreviated FDSC has no audio fields; parser
+        // zero-fills them and `has_audio()` reports false.
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FILM");
+        out.extend_from_slice(&((16 + 0x14 + 16) as u32).to_be_bytes());
+        out.extend_from_slice(b"\x00\x02\x00\x00");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"FDSC");
+        out.extend_from_slice(&0x14u32.to_be_bytes());
+        out.extend_from_slice(b"cvid");
+        out.extend_from_slice(&80u32.to_be_bytes());
+        out.extend_from_slice(&80u32.to_be_bytes());
+        out.extend_from_slice(b"STAB");
+        out.extend_from_slice(&16u32.to_be_bytes());
+        out.extend_from_slice(&30u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        let dem = FilmDemuxer::parse(&out).unwrap();
+        assert!(!dem.fdsc.has_audio());
+        assert_eq!(dem.audio_format(), FilmAudioFormat::None);
     }
 }

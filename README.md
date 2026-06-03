@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -465,6 +465,49 @@ codebook chunks, and the decode-equivalence pixel check. Vintage
 support is encoder policy, not a bitstream feature — the wire format
 is conformant Cinepak in both modes.
 
+Round 221 (FILM audio-format classifier) extended the Sega FILM
+demuxer with a structured audio-stream classifier. The FDSC chunk
+already exposed the four raw audio-metadata bytes
+(`audio_channels` / `audio_bits` / `audio_compression` /
+`audio_sample_rate`) per `Sega_FILM.wiki` lines 74–77, but
+consumers wanting to route the interleaved audio payload to a PCM
+sink had no first-class API to inspect the encoding rules
+documented in wiki lines 147–169 (linear-PCM byte order,
+sign convention, ADX ADPCM discriminator, no-audio sentinel).
+The new `FilmAudioFormat` enum (`None` /
+`LinearPcm { channels, bits_per_sample, sample_rate_hz,
+endianness, sign_convention }` / `CriAdxAdpcm { channels,
+sample_rate_hz }` / `Unknown { … }`) plus the `PcmEndianness`
+(`BigEndian` for 16-bit per wiki line 153, `NotApplicable` for
+8-bit) and `PcmSignConvention` (`TwosComplement` for Saturn
+ASCII versions per wiki line 151, `SignMagnitude` for Sega CD /
+3DO NULL versions per wiki line 162 + 224) discriminators
+surface the platform-dependent encoding rules from the wire
+metadata alone. Convenience: `Fdsc::has_audio()` /
+`Fdsc::audio_format(&film_version)` /
+`FilmDemuxer::audio_format()` /
+`FilmDemuxer::audio_duration_seconds()` (sum of audio-sample
+`sample_length` ÷ linear-PCM byte rate; returns `None` for
+non-PCM compression or zero-rate fields) /
+`FilmAudioFormat::byte_rate_bps()` (defined only for
+`LinearPcm` with `bits_per_sample` a non-zero multiple of 8) /
+`FilmAudioFormat::is_linear_pcm()`. Defensive validation:
+`SampleRecord::is_well_formed_audio()` enforces wiki line 116's
+"audio sample_info_2 is always 1" verbatim, and
+`FilmDemuxer::first_malformed_audio_sample()` returns the index
+of the first offender (or `None` if all audio rows are
+well-formed). 14 new tests cover the no-audio sentinel + any-
+field-set detection, Saturn 16-bit stereo big-endian
+twos-complement, Saturn 8-bit `NotApplicable`-endianness, Sega CD
+NULL-version sign/magnitude inference, the ADX ADPCM branch, the
+unknown-compression preservation, byte-rate edge cases
+(zero fields, non-multiple-of-8 bits), audio-duration summation
++ no-records / non-PCM fallback to `None`, the `sample_info_2`
+validator, the first-malformed pinpoint, the audio classifier's
+independence from video FDSC fields, and the abbreviated-FDSC
+no-audio rule. Pure additive change to the FILM demuxer — no
+encoder / decoder touches, no Cargo.toml changes.
+
 The previous on-disk history is preserved on the `old` branch; it is
 **not** an input for this rebuild.
 
@@ -845,6 +888,24 @@ Container side (round 2):
   `DeviantSaturn` for ASCII `1.0X` versions, `DeviantLemmings3do`
   for NULL versions, `OutOfScope` for `'sega'` / `'Seg4'`
   Cinepak-for-Sega.
+- `Fdsc::has_audio` / `Fdsc::audio_format(version)` /
+  `FilmDemuxer::audio_format` / `audio_duration_seconds` /
+  `FilmAudioFormat` (`None` / `LinearPcm { … }` / `CriAdxAdpcm { … }`
+  / `Unknown { … }`) / `FilmAudioFormat::byte_rate_bps` /
+  `FilmAudioFormat::is_linear_pcm` / `PcmEndianness`
+  (`BigEndian` per wiki line 153 for 16-bit, `NotApplicable` for
+  8-bit) / `PcmSignConvention` (`TwosComplement` for Saturn
+  ASCII versions per wiki line 151, `SignMagnitude` for Sega CD /
+  3DO NULL versions per wiki line 162 + 224) /
+  `SampleRecord::is_well_formed_audio` /
+  `FilmDemuxer::first_malformed_audio_sample` (round 221) —
+  structured audio-stream classifier per `Sega_FILM.wiki` lines
+  147–169 + 116. Audio codec decoding stays out of scope for this
+  crate (linear PCM and CRI ADX ADPCM are separate concerns), but
+  these helpers give consumers the wire metadata they need to
+  route the bytes pulled out via `audio_samples()` to a
+  PCM / ADPCM sink with the correct byte order, sign convention,
+  and byte rate.
 - `FilmDemuxer::audio_samples` / `keyframes` /
   `seek_keyframe_for_tick(target_ticks)` / `duration_ticks` /
   `duration_seconds` + `SampleRecord::next_frame_ticks` (round 187)

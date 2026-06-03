@@ -8,6 +8,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 221 (FILM container audio-format classifier): new
+  `FilmAudioFormat` enum (`None` / `LinearPcm { channels,
+  bits_per_sample, sample_rate_hz, endianness, sign_convention }` /
+  `CriAdxAdpcm { channels, sample_rate_hz }` / `Unknown { … }`),
+  `PcmEndianness` (`BigEndian` for 16-bit per `Sega_FILM.wiki` line
+  153, `NotApplicable` for 8-bit), and `PcmSignConvention`
+  (`TwosComplement` for Saturn ASCII versions per wiki line 151,
+  `SignMagnitude` for Sega CD / 3DO NULL versions per wiki line 162
+  + 224) classify the FDSC audio fields per
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 147–169.
+  Accessors: `Fdsc::has_audio()` / `Fdsc::audio_format(&version)` /
+  `FilmDemuxer::audio_format()` /
+  `FilmDemuxer::audio_duration_seconds()` (sum of audio-sample
+  `sample_length` ÷ linear-PCM byte rate; returns `None` for non-PCM
+  compression or any zero-rate field) /
+  `FilmAudioFormat::byte_rate_bps()` (defined for `LinearPcm` with
+  `bits_per_sample` a non-zero multiple of 8) /
+  `FilmAudioFormat::is_linear_pcm()`. Defensive validation:
+  `SampleRecord::is_well_formed_audio()` enforces wiki line 116's
+  "audio sample_info_2 is always 1" verbatim; companion
+  `FilmDemuxer::first_malformed_audio_sample()` returns the index of
+  the first offender (or `None` if all audio rows are well-formed).
+  14 new tests cover the no-audio sentinel + any-field-set
+  detection, Saturn 16-bit stereo big-endian twos-complement, Saturn
+  8-bit `NotApplicable`-endianness, Sega CD NULL-version
+  sign/magnitude inference, the ADX ADPCM branch, the
+  unknown-compression preservation, byte-rate edge cases (zero
+  fields, non-multiple-of-8 bits), audio-duration summation +
+  no-records / non-PCM fallback to `None`, the `sample_info_2`
+  validator, the first-malformed pinpoint, the classifier's
+  independence from video FDSC fields, and the abbreviated-FDSC
+  no-audio rule. Audio codec decoding (PCM playback, ADX ADPCM
+  decompression) stays out of scope for this crate per
+  `docs/video/cinepak/spec/00-scope.md`; the new helpers surface
+  the wire metadata so consumers can route the bytes returned from
+  `FilmDemuxer::audio_samples()` to a PCM / ADPCM sink with the
+  correct byte order, sign convention, and byte rate. Pure additive
+  change — no encoder / decoder touches, no Cargo.toml changes.
 - Round 215 (vintage-decoder-compatible encoder mode): new
   `EncoderOptions::vintage_compat: bool` (default `false`). When
   `true`, enforces two structural constraints from `Cinepak.wiki`

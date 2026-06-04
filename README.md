@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1084,7 +1084,7 @@ mode-dispatch hoist. All 66 + 8 + 3 + … synth-decode / encoder /
 roundtrip tests stay bit-exact; the optimisation is purely a hot-path
 rewrite, not a behavioural change.
 
-## Fuzz harness (rounds 148 + 175 + 181 + 192 + 196)
+## Fuzz harness (rounds 148 + 175 + 181 + 192 + 196 + 234)
 
 Round 148 added a `cargo-fuzz` harness under `fuzz/` covering the
 four user-reachable parse / decode entry points on the public API.
@@ -1105,7 +1105,14 @@ inter-frame state machine (rolling V1/V4 codebooks +
 selective-update inheritance across `decode_frame` calls +
 `0x3100` skip-MB copies from the prior frame's reconstructed
 raster) was never exercised by the single-frame `decode_frame`
-target since it instantiates a fresh `CinepakDecoder` per input:
+target since it instantiates a fresh `CinepakDecoder` per input.
+Round 234 added a ninth target driving the round-228 FILM PCM
+shaping helpers (`pcm_decode_8bit`, `pcm_decode_16be_to_i16`,
+`pcm_deinterleave_stereo_8bit`, `pcm_deinterleave_stereo_16be`,
+`pcm_sign_magnitude_to_i8`) plus the `FilmAudioFormat::decode_chunk_to_i16`
+dispatcher — these surfaces consume STAB-indexed audio sample
+bytes, a wire surface the `film_demuxer_parse` target exits before
+reaching and the `decode_frame` family doesn't touch:
 
 | Target | Surface |
 |--------|---------|
@@ -1117,6 +1124,7 @@ target since it instantiates a fresh `CinepakDecoder` per input:
 | `codebook_chunk_apply` | `codebook::apply_codebook_chunk{,_with}` — eight chunk-kind family (V4 vs V1 × full-replace vs selective-update × 12-bit-YUV vs 8-bit-grayscale) parsed directly (round 181) |
 | `decode_vector_chunk` | `vector::decode_vector_chunk` — three vector codes (`0x3200` V1-only, `0x3000` mixed intra, `0x3100` inter with skip codes + selector-bit straddle) parsed directly (round 192) |
 | `decode_multi_frame` | `CinepakDecoder::decode_frame` driven over a length-prefixed sequence (up to 8 frames per input) on a single decoder instance — rolling V1/V4 codebooks, selective-update inheritance across `decode_frame` calls, `0x3100` skip-MB copy from `prev_frame`, intra-after-inter inheritance wipe, `reset()` (round 196) |
+| `film_pcm_decode` | `pcm_decode_8bit` / `pcm_decode_16be_to_i16` / `pcm_deinterleave_stereo_8bit` / `pcm_deinterleave_stereo_16be` / `pcm_sign_magnitude_to_i8` + `FilmAudioFormat::decode_chunk_to_i16` — FILM linear-PCM sample-data shaping across `(8, 1)` / `(8, 2)` / `(16, 1)` / `(16, 2)` LinearPcm cells, both sign conventions, and the `None`-on-unsupported-combo arm (round 234) |
 
 `decode_frame`, `decode_deviant_frame`, and `decode_multi_frame`
 all peek at the wire `width`/`height` (bytes 4..8) and short-circuit
@@ -1128,9 +1136,11 @@ structural parse harnesses cap raw input at 64 KiB. The
 the per-chunk arithmetic decides whether the payload is well-formed.
 `decode_multi_frame` additionally caps the per-input frame count at
 8 so the wall-time per fuzz iteration stays comparable to the
-single-frame target's. `.github/workflows/fuzz.yml` is a thin shim
-around the org-level reusable fuzz workflow with the daily budget
-split evenly across the eight targets.
+single-frame target's. `film_pcm_decode` caps its raw input at the
+same 64 KiB budget so the worst-case `Vec<i16>` allocation from a
+16-bit decode tops out at ~128 KiB. `.github/workflows/fuzz.yml` is
+a thin shim around the org-level reusable fuzz workflow with the
+daily budget split evenly across the nine targets.
 
 Round 196 also seeds `corpus/decode_multi_frame/` with two
 encoder-round-tripped streams (intra + 1 inter, intra + 2 inters)

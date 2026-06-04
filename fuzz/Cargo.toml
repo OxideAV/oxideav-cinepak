@@ -83,3 +83,10 @@ path = "fuzz_targets/decode_multi_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "film_pcm_decode"
+path = "fuzz_targets/film_pcm_decode.rs"
+test = false
+doc = false
+bench = false

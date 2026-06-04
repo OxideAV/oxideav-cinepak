@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 234 (FILM PCM-shaping fuzz target): new `film_pcm_decode`
+  libFuzzer harness under `fuzz/fuzz_targets/film_pcm_decode.rs`
+  driving panic-free coverage across the round-228 PCM helpers —
+  `pcm_sign_magnitude_to_i8`, `pcm_decode_8bit` (both
+  `TwosComplement` and `SignMagnitude` conventions, exact-length and
+  off-by-one destination buffers), `pcm_decode_16be_to_i16`,
+  `pcm_deinterleave_stereo_8bit`, `pcm_deinterleave_stereo_16be`,
+  plus the `FilmAudioFormat::decode_chunk_to_i16` dispatcher across
+  `(8, 1)` / `(8, 2)` / `(16, 1)` / `(16, 2)` LinearPcm cells and
+  the `None`-on-unsupported-combo arm (channels ∈ {3, 4}), and the
+  early-return path on the non-LinearPcm `FilmAudioFormat::None`
+  discriminator. The harness threads one fuzz input through seven
+  entry points so a single mutation that exposes a size-arithmetic
+  or sign-extension boundary case improves coverage across the
+  whole shaping surface in one iteration. Defence-in-depth raw-input
+  cap of 64 KiB matches the sibling targets; every helper allocates
+  proportional to input length so worst-case destination buffers are
+  bounded at 64 KiB (8-bit paths) / 128 KiB (16-bit `Vec<i16>`
+  paths). Closes the natural follow-up to the round-228 helper
+  landing — the `film_demuxer_parse` target covers the container
+  parse but exits before any audio payload reaches the helpers; the
+  `decode_frame` family targets the video bitstream only. Local
+  9-second smoke run: 1.5M libFuzzer iterations, 427 coverage
+  points, 1310 features, 178-unit corpus, zero panics. Pure additive
+  change — no `src/` behaviour change, no Cargo.toml `[package]`
+  changes; only the fuzz sub-package's `[[bin]]` table gains a new
+  entry.
 - Round 228 (FILM linear-PCM sample-data shaping helpers): new free
   functions on the `film` module + a convenience accessor on
   `FilmAudioFormat`, closing the natural follow-up to the round-221

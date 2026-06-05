@@ -8,6 +8,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 240 (typed strip-header iterator): new `header::FrameStrips`
+  iterator at `src/header.rs` implementing
+  `docs/video/cinepak/spec/01-frame-and-strip.md` §3 decoder
+  algorithm steps 2.1–2.4 for the spec-standard (non-deviant)
+  frame layout. `FrameStrips::new(bytes)` parses the 10-byte
+  frame header (spec §1) and trims the buffer to `frame_length`;
+  `Iterator::next` yields a `Result<StripEntry>` per strip, where
+  `StripEntry` carries the 0-based strip index, the resolved
+  `StripHeader` (with the spec §2.2 y-coordinate sentinel rule
+  applied against a private `prev_y_bottom` accumulator), and a
+  zero-copy `&[u8]` slice covering the strip's chunk-stream
+  payload (`strip_size - 12` bytes that follow the 12-byte strip
+  header). The iterator is read-only — it does not touch
+  codebooks, vector chunks, or pixels — so container code
+  (e.g. AVI consumers probing per-strip sizes) and validators /
+  fuzz harnesses can enumerate strip-level metadata without
+  dragging the VQ machinery into scope. Error semantics: one-shot
+  fuse on the first malformed strip (`Some(Err(_))` once, then
+  `None`); construction rejects buffers shorter than
+  `frame_length`. Public accessors: `header() -> &FrameHeader`,
+  `remaining() -> u16`, `size_hint() -> (usize, Some(usize))`.
+  Deviant streams (Sega FILM Saturn `'cvid'` + Lemmings 3DO
+  6-byte prefix per
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines
+  125–143 and 189) are not in this iterator's scope; those
+  continue to use `CinepakDecoder::decode_deviant_frame`.
+  Coverage: 10 new tests under `header::tests` (3-strip sentinel
+  walk, first-strip literal-coordinate exemption, `O1`
+  single-strip pattern, payload-slice length + content contract,
+  spec §3 sum-of-payload-lengths invariant, frame-length
+  buffer-short rejection at construction time, strip-header
+  truncation fuse, strip-size overrun fuse). Pure additive
+  change — no behaviour change to the existing decoder, encoder,
+  or FILM demuxer code paths.
 - Round 234 (FILM PCM-shaping fuzz target): new `film_pcm_decode`
   libFuzzer harness under `fuzz/fuzz_targets/film_pcm_decode.rs`
   driving panic-free coverage across the round-228 PCM helpers —

@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1200,3 +1200,43 @@ fixed with regression unit tests in `src/decoder.rs`:
 
 After both fixes a follow-up 90-second `decode_frame` run hits ~19.7M
 executions with no further crashes.
+
+Round 240 added a **`FrameStrips<'a>` strip-header iterator** at
+`header::FrameStrips`, implementing steps 2.1–2.4 of the
+`docs/video/cinepak/spec/01-frame-and-strip.md` §3 decoder
+algorithm for the spec-standard (non-deviant) frame layout. The
+iterator yields a `Result<StripEntry>` per strip, where
+`StripEntry` carries the 0-based strip index, the resolved
+`StripHeader` (with the spec §2.2 y-coordinate sentinel rule
+applied against a private `prev_y_bottom` accumulator), and a
+zero-copy `&[u8]` slice covering the strip's chunk-stream
+payload (the `strip_size - 12` bytes that follow the 12-byte
+strip header). The iterator is read-only: it does not touch
+codebooks, vector chunks, or pixels — useful for container code
+that wants to enumerate strip-level rectangles + payload
+boundaries (e.g. an AVI consumer probing per-strip sizes) and
+for validators / fuzz harnesses that need to bound per-strip
+mutation independently. Error semantics are one-shot fuse: on
+the first malformed strip the iterator yields `Some(Err(_))`
+once and then `None` for every subsequent call, so callers do
+not need to track an external "is fused" flag. Construction
+(`FrameStrips::new(bytes)`) rejects buffers shorter than the
+declared `frame_length`; `header()` and `remaining()` /
+`size_hint()` accessors round out the typed surface. Coverage:
+10 new tests under `header::tests` exercise the spec §2.2
+sentinel rule across a synthetic 3-strip frame, the first-strip
+literal-coordinate exemption, the `O1` single-strip pattern,
+the payload-slice contract (length + content), the spec §3
+"sum of payload lengths" invariant (`Σ payload_len ==
+frame_length - 10 - 12·strip_count`), strip-header truncation
+fuse, and strip-size-overrun fuse. Deviant streams (Sega FILM
+Saturn `'cvid'` + Lemmings 3DO 6-byte prefix per
+`docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 125–143
+and 189) are not in this iterator's scope — those carry an
+extra header prefix and/or short `frame_length` that the
+standard §1 frame header does not describe; the existing
+`CinepakDecoder::decode_deviant_frame` continues to own that
+path. Pure additive change — no behaviour change to the
+existing decoder, encoder, or FILM demuxer code paths; the
+iterator is a new layer over the same `FrameHeader::parse` and
+`RawStripHeader::parse` primitives the decoder already calls.

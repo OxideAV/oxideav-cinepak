@@ -395,6 +395,242 @@ pub fn encode_selective_chunk(
     }
 }
 
+/// Vector-chunk identifier, classified from a 16-bit big-endian id.
+///
+/// Wire codes per spec §2 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`:
+///
+/// | Code     | Variant              |
+/// | -------- | -------------------- |
+/// | `0x3000` | [`VectorChunkKind::IntraMixed`] |
+/// | `0x3100` | [`VectorChunkKind::InterWithSkip`] |
+/// | `0x3200` | [`VectorChunkKind::IntraV1Only`] |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorChunkKind {
+    /// `0x3000` — intra packing, mixed V1 / V4 macroblocks; flag word
+    /// bits select per-MB coding mode. Legal on intra strips and on
+    /// inter strips when the encoder fully recodes.
+    IntraMixed,
+    /// `0x3100` — inter packing with skip codes; flag word bits select
+    /// among V1 / V4 / SKIP per MB. Legal on inter strips only.
+    InterWithSkip,
+    /// `0x3200` — intra packing, V1-only; one byte per macroblock, no
+    /// flag word.
+    IntraV1Only,
+}
+
+impl VectorChunkKind {
+    /// Recognise a 16-bit big-endian chunk-id; returns `None` if the
+    /// id doesn't belong to the vector chunk family (`0x3000` /
+    /// `0x3100` / `0x3200`).
+    pub fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x3000 => Some(Self::IntraMixed),
+            0x3100 => Some(Self::InterWithSkip),
+            0x3200 => Some(Self::IntraV1Only),
+            _ => None,
+        }
+    }
+
+    /// 16-bit big-endian chunk-id for this variant.
+    pub fn to_id(self) -> u16 {
+        match self {
+            Self::IntraMixed => 0x3000,
+            Self::InterWithSkip => 0x3100,
+            Self::IntraV1Only => 0x3200,
+        }
+    }
+}
+
+/// Classified chunk-id for any chunk that may appear inside a strip's
+/// chunk stream. Codebook chunks (`0x20xx`–`0x27xx`) classify to
+/// [`StripChunkKind::Codebook`]; vector chunks (`0x3000` / `0x3100` /
+/// `0x3200`) classify to [`StripChunkKind::Vector`].
+///
+/// Reference: spec §1 + §2 of
+/// `docs/video/cinepak/spec/02-codebooks.md`; vector codes per
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` §2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripChunkKind {
+    /// Codebook chunk (V4 / V1, full / selective, 12-bit / grayscale).
+    Codebook(CodebookChunkKind),
+    /// Vector chunk (`0x3000` / `0x3100` / `0x3200`).
+    Vector(VectorChunkKind),
+}
+
+impl StripChunkKind {
+    /// Recognise a 16-bit big-endian chunk-id; returns `None` if the
+    /// id is neither a codebook nor a vector chunk code.
+    pub fn from_id(id: u16) -> Option<Self> {
+        if let Some(c) = CodebookChunkKind::from_id(id) {
+            return Some(Self::Codebook(c));
+        }
+        if let Some(v) = VectorChunkKind::from_id(id) {
+            return Some(Self::Vector(v));
+        }
+        None
+    }
+
+    /// 16-bit big-endian chunk-id for this variant.
+    pub fn to_id(self) -> u16 {
+        match self {
+            Self::Codebook(c) => c.to_id(),
+            Self::Vector(v) => v.to_id(),
+        }
+    }
+}
+
+/// A single chunk yielded by [`StripChunks`].
+///
+/// `kind` is the classified chunk-id, `raw_id` is the original 16-bit
+/// big-endian value (preserved so callers can grep / log the wire byte
+/// even when classification succeeded), and `payload` is the
+/// `chunk_size - 4` bytes following the 4-byte chunk header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripChunkEntry<'a> {
+    /// 0-based chunk index within the strip payload.
+    pub index: u16,
+    /// Classified chunk kind.
+    pub kind: StripChunkKind,
+    /// Raw 16-bit big-endian chunk-id (== `kind.to_id()` on the happy
+    /// path).
+    pub raw_id: u16,
+    /// Declared `chunk_size` (inclusive of the 4-byte chunk header).
+    pub declared_size: u16,
+    /// Chunk payload bytes — `chunk_size - 4` bytes following the
+    /// 4-byte chunk header.
+    pub payload: &'a [u8],
+}
+
+/// Iterator over the chunks inside a strip's payload.
+///
+/// Wire-format reference: spec §1 + §2 of
+/// `docs/video/cinepak/spec/02-codebooks.md` (common chunk header +
+/// codebook chunk taxonomy) and spec §2 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` (vector
+/// chunk taxonomy).
+///
+/// The iterator walks a strip-payload byte slice — the
+/// `strip_size - 12` bytes following the 12-byte strip header,
+/// equivalently `StripEntry::payload` from
+/// [`crate::header::FrameStrips`] — and yields one
+/// [`StripChunkEntry`] per declared chunk. Each chunk is identified
+/// by its 4-byte `(chunk_id, chunk_size)` header; the iterator
+/// advances by `chunk_size` bytes after each yield.
+///
+/// The iterator is read-only and **content-agnostic**: it walks
+/// chunk boundaries by `chunk_size` arithmetic alone, leaving
+/// [`apply_codebook_chunk`] and the vector chunk decoder out of the
+/// call path. Callers who want to enumerate the chunk-level
+/// structure of a strip — validators, fuzz harnesses
+/// that need per-chunk boundaries, or wire-format introspection
+/// tools — can take this single dependency in place of the full
+/// codebook + vector decode stack.
+///
+/// ### Error semantics
+///
+/// `next()` returns `Some(Err(_))` once on the first malformed chunk
+/// (truncated header, `chunk_size < 4`, payload overrunning the
+/// strip, or an unrecognised `chunk_id`), then `None` on every
+/// subsequent call — the iterator **fuses** itself on error.
+#[derive(Debug)]
+pub struct StripChunks<'a> {
+    /// Strip-payload slice. The iterator only ever reads within this
+    /// slice.
+    payload: &'a [u8],
+    /// Byte offset of the next chunk header within `payload`.
+    cursor: usize,
+    /// 0-based index of the next chunk to yield.
+    next_index: u16,
+    /// One-shot fuse — set when an error is yielded so subsequent
+    /// `next()` calls return `None`.
+    fused: bool,
+}
+
+impl<'a> StripChunks<'a> {
+    /// Build a chunk iterator over the strip payload `payload`.
+    ///
+    /// `payload` is the `strip_size - 12` bytes that follow the
+    /// 12-byte strip header — i.e. the chunk-stream area of a single
+    /// strip.
+    pub fn new(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            cursor: 0,
+            next_index: 0,
+            fused: false,
+        }
+    }
+
+    /// Byte offset of the next chunk header within the payload. Useful
+    /// for error reporting when integrating with a higher-level frame
+    /// walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl<'a> Iterator for StripChunks<'a> {
+    type Item = Result<StripChunkEntry<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
+        if self.cursor >= self.payload.len() {
+            return None;
+        }
+        let remaining = self.payload.len() - self.cursor;
+        if remaining < CHUNK_HEADER_SIZE {
+            self.fused = true;
+            return Some(Err(CinepakError::invalid(format!(
+                "strip chunk {} header truncated: need {} bytes, have {}",
+                self.next_index, CHUNK_HEADER_SIZE, remaining
+            ))));
+        }
+        let raw_id = u16::from_be_bytes([self.payload[self.cursor], self.payload[self.cursor + 1]]);
+        let chunk_size =
+            u16::from_be_bytes([self.payload[self.cursor + 2], self.payload[self.cursor + 3]]);
+        let cs = chunk_size as usize;
+        if cs < CHUNK_HEADER_SIZE {
+            self.fused = true;
+            return Some(Err(CinepakError::invalid(format!(
+                "strip chunk {} chunk_size {chunk_size} < 4 (own header size)",
+                self.next_index
+            ))));
+        }
+        if cs > remaining {
+            self.fused = true;
+            return Some(Err(CinepakError::invalid(format!(
+                "strip chunk {} (0x{raw_id:04x}) declared size {chunk_size} overruns strip payload (have {remaining})",
+                self.next_index
+            ))));
+        }
+        let kind = match StripChunkKind::from_id(raw_id) {
+            Some(k) => k,
+            None => {
+                self.fused = true;
+                return Some(Err(CinepakError::invalid(format!(
+                    "strip chunk {} unknown chunk_id 0x{raw_id:04x}",
+                    self.next_index
+                ))));
+            }
+        };
+        let payload_start = self.cursor + CHUNK_HEADER_SIZE;
+        let payload_end = self.cursor + cs;
+        let entry = StripChunkEntry {
+            index: self.next_index,
+            kind,
+            raw_id,
+            declared_size: chunk_size,
+            payload: &self.payload[payload_start..payload_end],
+        };
+        self.cursor = payload_end;
+        self.next_index += 1;
+        Some(Ok(entry))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +873,257 @@ mod tests {
         apply_codebook_chunk(kind, payload, &mut out).unwrap();
         assert_eq!(out.entries[0], cb.entries[0]);
         assert_eq!(out.entries[1], cb.entries[1]);
+    }
+
+    /// Vector chunk id classification — three legal codes plus
+    /// negatives.
+    #[test]
+    fn vector_chunk_kind_classification() {
+        assert_eq!(
+            VectorChunkKind::from_id(0x3000),
+            Some(VectorChunkKind::IntraMixed)
+        );
+        assert_eq!(
+            VectorChunkKind::from_id(0x3100),
+            Some(VectorChunkKind::InterWithSkip)
+        );
+        assert_eq!(
+            VectorChunkKind::from_id(0x3200),
+            Some(VectorChunkKind::IntraV1Only)
+        );
+        // Codebook codes (0x20xx-0x27xx) belong to a different family.
+        assert_eq!(VectorChunkKind::from_id(0x2000), None);
+        // Reserved 0x3xxx codes outside {0x3000, 0x3100, 0x3200}.
+        assert_eq!(VectorChunkKind::from_id(0x3300), None);
+        // Roundtrip.
+        for k in [
+            VectorChunkKind::IntraMixed,
+            VectorChunkKind::InterWithSkip,
+            VectorChunkKind::IntraV1Only,
+        ] {
+            assert_eq!(VectorChunkKind::from_id(k.to_id()), Some(k));
+        }
+    }
+
+    /// Strip chunk classification dispatches to codebook vs vector
+    /// family based on the high byte.
+    #[test]
+    fn strip_chunk_kind_dispatches() {
+        let k = StripChunkKind::from_id(0x2000).unwrap();
+        assert!(matches!(k, StripChunkKind::Codebook(_)));
+        let k = StripChunkKind::from_id(0x2700).unwrap();
+        assert!(matches!(k, StripChunkKind::Codebook(_)));
+        let k = StripChunkKind::from_id(0x3000).unwrap();
+        assert_eq!(k, StripChunkKind::Vector(VectorChunkKind::IntraMixed));
+        let k = StripChunkKind::from_id(0x3100).unwrap();
+        assert_eq!(k, StripChunkKind::Vector(VectorChunkKind::InterWithSkip));
+        let k = StripChunkKind::from_id(0x3200).unwrap();
+        assert_eq!(k, StripChunkKind::Vector(VectorChunkKind::IntraV1Only));
+        // Strip-id codes (0x10xx / 0x11xx) belong to the strip-header
+        // layer, one level up from the chunk-id family.
+        assert_eq!(StripChunkKind::from_id(0x1000), None);
+        assert_eq!(StripChunkKind::from_id(0x1100), None);
+        // High-byte 0x4x is outside the defined chunk-id grid.
+        assert_eq!(StripChunkKind::from_id(0x4000), None);
+        // Roundtrip is stable.
+        for raw in [0x2000, 0x2300, 0x2700, 0x3000, 0x3100, 0x3200] {
+            let k = StripChunkKind::from_id(raw).unwrap();
+            assert_eq!(k.to_id(), raw);
+        }
+    }
+
+    /// Empty strip payload yields zero chunks immediately.
+    #[test]
+    fn strip_chunks_empty_payload_yields_none() {
+        let mut it = StripChunks::new(&[]);
+        assert!(it.next().is_none());
+        assert_eq!(it.cursor(), 0);
+    }
+
+    /// Spec §3.4 fixture `T4`: a strip on an inter frame carries two
+    /// header-only codebook chunks (`0x2000 size=4`, `0x2200 size=4`)
+    /// followed by an inter vector chunk. The iterator walks all three
+    /// using only the chunk-header sizing rule.
+    #[test]
+    fn strip_chunks_walks_t4_inter_reuse_pattern() {
+        // Build: 0x2000 size=4 | 0x2200 size=4 | 0x3100 size=8 (4 bytes
+        // of fake vector payload).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]);
+        buf.extend_from_slice(&[0x22, 0x00, 0x00, 0x04]);
+        buf.extend_from_slice(&[0x31, 0x00, 0x00, 0x08]);
+        buf.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let mut it = StripChunks::new(&buf);
+        let c0 = it.next().unwrap().unwrap();
+        assert_eq!(c0.index, 0);
+        assert_eq!(c0.raw_id, 0x2000);
+        assert_eq!(c0.declared_size, 4);
+        assert_eq!(c0.payload.len(), 0);
+        let cbk = match c0.kind {
+            StripChunkKind::Codebook(c) => c,
+            _ => panic!("expected codebook chunk"),
+        };
+        assert_eq!(cbk.which, WhichCodebook::V4);
+        assert_eq!(cbk.style, UpdateStyle::Full);
+
+        let c1 = it.next().unwrap().unwrap();
+        assert_eq!(c1.index, 1);
+        assert_eq!(c1.raw_id, 0x2200);
+        let cbk = match c1.kind {
+            StripChunkKind::Codebook(c) => c,
+            _ => panic!("expected codebook chunk"),
+        };
+        assert_eq!(cbk.which, WhichCodebook::V1);
+
+        let c2 = it.next().unwrap().unwrap();
+        assert_eq!(c2.index, 2);
+        assert_eq!(c2.raw_id, 0x3100);
+        assert_eq!(c2.declared_size, 8);
+        assert_eq!(c2.payload, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            c2.kind,
+            StripChunkKind::Vector(VectorChunkKind::InterWithSkip)
+        );
+
+        assert!(it.next().is_none());
+        // Cursor sits at end of payload.
+        assert_eq!(it.cursor(), buf.len());
+    }
+
+    /// Spec §1 fixture `T1a` exact byte layout: 0x2200 size=10 with a
+    /// 6-byte V1 entry payload, followed by a 0x3200 V1-only vector
+    /// chunk. The iterator slices the V1 entry bytes for the caller.
+    #[test]
+    fn strip_chunks_yields_t1a_v1_entry_bytes() {
+        let mut buf = Vec::new();
+        // 0x2000 header-only (a solid colour collapses the V4 codebook
+        // to zero entries).
+        buf.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]);
+        // 0x2200 with one 6-byte entry: 48 48 48 48 db 5a.
+        buf.extend_from_slice(&[0x22, 0x00, 0x00, 0x0a]);
+        buf.extend_from_slice(&[0x48, 0x48, 0x48, 0x48, 0xdb, 0x5a]);
+        // 0x3200 V1-only with a single-byte index payload.
+        buf.extend_from_slice(&[0x32, 0x00, 0x00, 0x05, 0x00]);
+
+        let chunks: Vec<_> = StripChunks::new(&buf).map(|r| r.unwrap()).collect();
+        assert_eq!(chunks.len(), 3);
+        // V4 header-only.
+        assert_eq!(chunks[0].raw_id, 0x2000);
+        assert_eq!(chunks[0].payload.len(), 0);
+        // V1 entry — payload is exactly the 6 entry bytes.
+        assert_eq!(chunks[1].raw_id, 0x2200);
+        assert_eq!(chunks[1].payload, &[0x48, 0x48, 0x48, 0x48, 0xdb, 0x5a]);
+        // 0x3200 V1-only vector chunk; payload is one byte = MB index.
+        assert_eq!(chunks[2].raw_id, 0x3200);
+        assert_eq!(chunks[2].payload, &[0x00]);
+        assert_eq!(
+            chunks[2].kind,
+            StripChunkKind::Vector(VectorChunkKind::IntraV1Only)
+        );
+    }
+
+    /// Sum of declared sizes across all chunks equals the payload
+    /// length on a well-formed strip — spec §1 invariant
+    /// (`Σ chunk_size == strip_size − 12`).
+    #[test]
+    fn strip_chunks_sizes_total_to_payload_invariant() {
+        // Three chunks of sizes 4, 10, 8 → total 22 bytes.
+        let mut buf = vec![
+            0x20, 0x00, 0x00, 0x04, // header-only
+            0x22, 0x00, 0x00, 0x0a, // 0x2200 size=10
+        ];
+        buf.extend_from_slice(&[0x48, 0x48, 0x48, 0x48, 0xdb, 0x5a]);
+        buf.extend_from_slice(&[
+            0x31, 0x00, 0x00, 0x08, // 0x3100 size=8
+            0x01, 0x02, 0x03, 0x04, // 4-byte payload
+        ]);
+        let total: usize = StripChunks::new(&buf)
+            .map(|r| r.unwrap().declared_size as usize)
+            .sum();
+        assert_eq!(total, buf.len());
+        assert_eq!(total, 22);
+    }
+
+    /// Truncated chunk header: payload ends mid-header.
+    #[test]
+    fn strip_chunks_fuses_on_truncated_header() {
+        // Only 3 bytes — short of the 4-byte chunk header.
+        let buf = [0x20, 0x00, 0x00];
+        let mut it = StripChunks::new(&buf);
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+        // Fused — repeat call still None.
+        assert!(it.next().is_none());
+    }
+
+    /// `chunk_size` smaller than the 4-byte header itself is illegal.
+    #[test]
+    fn strip_chunks_rejects_chunk_size_below_header() {
+        // 0x2000 chunk with chunk_size=3 (impossible — own header is 4).
+        let buf = [0x20, 0x00, 0x00, 0x03, 0xff];
+        let mut it = StripChunks::new(&buf);
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// `chunk_size` overruns the strip payload — must err and fuse.
+    #[test]
+    fn strip_chunks_fuses_on_payload_overrun() {
+        // 0x2000 declares 16-byte chunk but only 4 bytes follow the
+        // header.
+        let buf = [
+            0x20, 0x00, 0x00, 0x10, // chunk size = 16
+            0xaa, 0xbb, 0xcc, 0xdd, // 4 trailing bytes only
+        ];
+        let mut it = StripChunks::new(&buf);
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// Unknown chunk id (high byte outside `0x20..=0x27` and not
+    /// `0x30`/`0x31`/`0x32`) is rejected.
+    #[test]
+    fn strip_chunks_rejects_unknown_chunk_id() {
+        // 0x4000 with chunk_size=4 — header parses but the id is
+        // undefined.
+        let buf = [0x40, 0x00, 0x00, 0x04];
+        let mut it = StripChunks::new(&buf);
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// Partial walk: the first two chunks succeed, the third is
+    /// truncated. The iterator yields two `Ok` then one `Err`, then
+    /// fuses.
+    #[test]
+    fn strip_chunks_partial_walk_then_fuse() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]); // ok
+        buf.extend_from_slice(&[0x22, 0x00, 0x00, 0x04]); // ok
+        buf.extend_from_slice(&[0x31, 0x00, 0x00, 0x10]); // declares 16 but only 4 bytes follow
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+
+        let mut it = StripChunks::new(&buf);
+        assert!(it.next().unwrap().is_ok());
+        assert!(it.next().unwrap().is_ok());
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// Cursor reports current offset before and after each yield.
+    #[test]
+    fn strip_chunks_cursor_tracks_offset() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]); // 4 B
+        buf.extend_from_slice(&[0x22, 0x00, 0x00, 0x0a]); // 10 B
+        buf.extend_from_slice(&[0x48, 0x48, 0x48, 0x48, 0xdb, 0x5a]);
+        let mut it = StripChunks::new(&buf);
+        assert_eq!(it.cursor(), 0);
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 4);
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 14);
+        assert!(it.next().is_none());
     }
 }

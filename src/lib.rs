@@ -56,6 +56,7 @@ pub mod registry;
 pub const CODEC_ID_STR: &str = "cinepak";
 
 // Standalone, framework-free re-exports.
+pub use codebook::{StripChunkEntry, StripChunkKind, StripChunks, VectorChunkKind};
 pub use decoder::{CinepakDecoder, DeviantConfig};
 pub use encoder::{
     encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter, encode_gray8_round7, encode_rgb24,

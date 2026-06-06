@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1240,3 +1240,47 @@ path. Pure additive change — no behaviour change to the
 existing decoder, encoder, or FILM demuxer code paths; the
 iterator is a new layer over the same `FrameHeader::parse` and
 `RawStripHeader::parse` primitives the decoder already calls.
+
+Round 243 added the next layer down — a **`StripChunks<'a>`
+chunk-stream iterator** at `codebook::StripChunks` implementing
+spec §1 + §2 of `docs/video/cinepak/spec/02-codebooks.md` (common
+4-byte chunk header + codebook chunk taxonomy) plus spec §2 of
+`docs/video/cinepak/spec/03-vectors-and-macroblocks.md` (vector
+chunk taxonomy `0x3000` / `0x3100` / `0x3200`). `StripChunks::new`
+takes a strip-payload slice — the `strip_size - 12` bytes that
+follow the 12-byte strip header, equivalently the
+`StripEntry::payload` slice from r240's `FrameStrips` — and yields
+one `Result<StripChunkEntry>` per declared chunk. Each entry
+carries the 0-based chunk index, the classified `StripChunkKind`
+(codebook vs vector via a new `StripChunkKind::from_id` dispatch),
+the raw 16-bit big-endian `chunk_id`, the declared `chunk_size`,
+and a zero-copy `&[u8]` slice covering the `chunk_size - 4`
+payload bytes. Two new classification types pair this with the
+existing `CodebookChunkKind`: `VectorChunkKind` (enumerates
+`IntraMixed` / `InterWithSkip` / `IntraV1Only` with bidirectional
+`from_id` / `to_id`) and `StripChunkKind` (sum of
+`CodebookChunkKind` + `VectorChunkKind`). The iterator is
+read-only and content-agnostic — it walks chunk boundaries by
+`chunk_size` arithmetic alone, leaving `apply_codebook_chunk` and
+the vector chunk decoder out of the call path — so validators,
+fuzz harnesses, and wire-format introspection tools can take this
+single dependency in place of the full codebook + vector decode
+stack. Error semantics are the same one-shot fuse pattern as
+r240: a malformed chunk yields `Some(Err(_))` once and then
+`None` for every subsequent call, covering truncated header,
+`chunk_size < 4`, payload overrun, and unrecognised `chunk_id`
+cases. Coverage: 13 new tests under `codebook::tests` exercise
+`VectorChunkKind` classification + roundtrip, `StripChunkKind`
+dispatch across the codebook / vector grid, the spec §3.4
+fixture `T4` natural inter-reuse pattern (two header-only
+codebook chunks + inter vector chunk), the spec §3.1 fixture
+`T1a` byte-exact V1 entry slice (`48 48 48 48 db 5a`) paired
+with a `0x3200` V1-only vector chunk, the spec §1
+`Σ declared_size == payload.len()` invariant, all four fuse
+paths, and a partial-walk case where two `Ok` chunks land before
+the third errors. New crate-root exports: `StripChunks`,
+`StripChunkEntry`, `StripChunkKind`, `VectorChunkKind`. Pure
+additive change — the existing `decode_strip_chunks` inline
+walk inside `decoder.rs` continues to drive the decoder's hot
+path; r243 is a layered surface for callers that want to grep
+the chunk stream without the codebook + vector decode dependency.

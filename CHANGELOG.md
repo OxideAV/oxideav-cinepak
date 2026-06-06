@@ -8,6 +8,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 243 (typed strip-chunk-stream iterator): new
+  `codebook::StripChunks` iterator at `src/codebook.rs` implementing
+  spec §1 + §2 of `docs/video/cinepak/spec/02-codebooks.md` (common
+  4-byte chunk header + codebook chunk taxonomy) plus spec §2 of
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` (vector
+  chunk taxonomy `0x3000` / `0x3100` / `0x3200`). `StripChunks::new`
+  takes a strip-payload byte slice — the `strip_size - 12` bytes
+  that follow the 12-byte strip header, equivalently the
+  `StripEntry::payload` slice from the round-240 `FrameStrips`
+  iterator — and yields one `Result<StripChunkEntry>` per declared
+  chunk. Each `StripChunkEntry` carries the 0-based chunk index, the
+  classified `StripChunkKind` (codebook vs vector via the new
+  `StripChunkKind::from_id` dispatch), the raw 16-bit big-endian
+  `chunk_id`, the declared `chunk_size`, and a zero-copy `&[u8]`
+  slice covering the `chunk_size - 4` payload bytes. New types
+  `VectorChunkKind` (enumerates `IntraMixed` / `InterWithSkip` /
+  `IntraV1Only` with bidirectional `from_id` / `to_id`) and
+  `StripChunkKind` (sum of `CodebookChunkKind` + `VectorChunkKind`)
+  pair this with the existing `CodebookChunkKind` so the chunk
+  layer matches the structural depth of the round-240 strip layer.
+  Iterator semantics: one-shot fuse on the first malformed chunk
+  (truncated 4-byte header, `chunk_size < 4`, payload overrunning
+  the strip, or an unrecognised `chunk_id`), then `None` on every
+  subsequent call. The iterator is read-only and
+  content-agnostic — `apply_codebook_chunk` and the vector chunk
+  decoder are left out of the call path — so validators, fuzz
+  harnesses that want per-chunk boundaries, and wire-format
+  introspection tools can take this single dependency in place of
+  the full codebook + vector decode stack. Tests at
+  `src/codebook.rs::tests` (13 added) cover: `VectorChunkKind`
+  classification + roundtrip; `StripChunkKind` dispatch across the
+  full codebook / vector grid; empty-payload happy path; spec §3.4
+  fixture `T4` (two header-only codebook chunks + inter vector
+  chunk in the natural inter-reuse pattern); spec §3.1 fixture
+  `T1a` byte-exact V1 entry slice (`48 48 48 48 db 5a`) +
+  `0x3200` V1-only vector chunk pairing; `Σ declared_size ==
+  payload.len()` invariant; truncated header, `chunk_size < 4`,
+  payload overrun, unrecognised id fuse paths; and a
+  partial-walk-then-fuse case that yields two `Ok` chunks before
+  the third errors. New public exports from the crate root:
+  `StripChunks`, `StripChunkEntry`, `StripChunkKind`,
+  `VectorChunkKind`.
+
 - Round 240 (typed strip-header iterator): new `header::FrameStrips`
   iterator at `src/header.rs` implementing
   `docs/video/cinepak/spec/01-frame-and-strip.md` §3 decoder

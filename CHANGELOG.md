@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 250 (typed `0x3000` per-macroblock walker): new
+  `vector::MixedIntraMacroblocks` iterator at `src/vector.rs`
+  implementing spec §3.2 of
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` — the
+  mixed-intra vector chunk is a sequence of one-or-more groups,
+  each starting with a 4-byte big-endian flag word whose 32 bits
+  (scanned MSB-first) classify per-macroblock coding mode as V1
+  (bit clear ⇒ 1 index byte) or V4 (bit set ⇒ 4 index bytes); a
+  group covers exactly 32 macroblocks unless the strip's
+  macroblock count is exhausted before 32.
+  `MixedIntraMacroblocks::new(payload, mb_count)` returns a
+  read-only iterator that classifies each group's flag word into
+  an inline 32-entry buffer and reads the per-MB index bytes from
+  the payload, yielding one `MixedIntraEntry { index, kind }` per
+  macroblock where `kind` is `MixedIntraMb::V1(u8)` or
+  `MixedIntraMb::V4([u8; 4])` matching the spec §3.2 selector
+  semantics. The §3.2 mirror of round-246's `V1OnlyMacroblocks`:
+  a `StripChunkEntry::payload` from round-243's `StripChunks`
+  whose `kind` resolves to `VectorChunkKind::IntraMixed` feeds
+  straight into `MixedIntraMacroblocks::new`, completing the
+  per-MB typed surface for the two intra vector-chunk codes
+  (`0x3200` / `0x3000`). The walker is read-only and
+  content-agnostic — codebook expansion (spec §§4–5) and pixel
+  writes stay in `decoder::decode_strip_chunks`'s hot path.
+  `cursor()`, `remaining()`, `mb_count()`, and `payload()`
+  accessors round out the typed surface; `Iterator::size_hint`
+  reports the exact remaining count based on `mb_count`. Unlike
+  the round-246 V1-only walker, per-group byte sizes depend on
+  the in-group V1/V4 mix so length-consistency can only be
+  checked during the walk: truncation (mid-flag-word /
+  mid-V1-index / mid-V4-index) is reported per-yield as
+  `Some(Err(_))` and the iterator fuses to `None` afterwards.
+  Tests at `src/vector.rs::tests` (12 added) exercise: spec §3.2
+  fixture `Y9` (all-V4 16-MB strip, flag word `0xffff0000`,
+  4-byte V4 quadruples in scan order), spec §3.2 fixture `Y12`
+  (checkerboard V1/V4, flag word `0x5a5a0000`), spec §3.2
+  fixture `Y14` (two `0xffffffff` flag-word groups across 64-MB
+  strip, exercising the group-refill path), an all-V1 happy
+  path (flag word `0x00000000`), empty-strip
+  (`mb_count == 0`), the three truncation-fuse paths,
+  `size_hint` exactness, the `cursor`/`remaining` per-yield
+  advance contract, a cross-check against
+  `decode_vector_chunk(0x3000, …)` for the `Y12` fixture, and
+  a group-boundary stress at exactly 32 MBs (33-MB strip
+  forces two flag words). New public exports from the crate
+  root: `MixedIntraEntry`, `MixedIntraMacroblocks`,
+  `MixedIntraMb`.
+
 - Round 246 (typed `0x3200` per-macroblock walker): new
   `vector::V1OnlyMacroblocks` iterator at `src/vector.rs`
   implementing spec §3.1 of

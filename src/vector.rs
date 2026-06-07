@@ -378,6 +378,277 @@ impl<'a> ExactSizeIterator for V1OnlyMacroblocks<'a> {
     }
 }
 
+// ---------- MixedIntraMacroblocks iterator (typed §3.2 walker) -----------
+
+/// One macroblock yielded by [`MixedIntraMacroblocks`].
+///
+/// `0x3000` payloads encode each macroblock as either a single V1
+/// codebook index byte or a four-byte V4 codebook index quadruple,
+/// classified by a per-group flag word (spec §3.2 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`). The
+/// per-entry [`MixedIntraEntry::kind`] selector preserves that
+/// distinction alongside the 0-based scan-order index (spec §1.1) so
+/// callers can correlate each wire byte / wire quadruple with its
+/// macroblock position without recomputing the group-boundary
+/// arithmetic externally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixedIntraEntry {
+    /// 0-based macroblock index in scan order (spec §1.1).
+    pub index: u16,
+    /// Per-macroblock V1 / V4 classification with the corresponding
+    /// codebook index bytes copied out of the chunk payload.
+    pub kind: MixedIntraMb,
+}
+
+/// Per-macroblock V1 / V4 classification yielded by
+/// [`MixedIntraMacroblocks`].
+///
+/// `0x3000` flag-word bits select per-MB coding mode: bit `0` ⇒ V1
+/// (1 index byte), bit `1` ⇒ V4 (4 index bytes); spec §3.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixedIntraMb {
+    /// V1-coded macroblock — single codebook index byte.
+    V1(u8),
+    /// V4-coded macroblock — four codebook indices in row-major
+    /// 2×2-subblock scan order `(top-left, top-right, bottom-left,
+    /// bottom-right)`; spec §5.
+    V4([u8; 4]),
+}
+
+/// Iterator over the macroblock entries inside a `0x3000` mixed-intra
+/// vector-chunk payload.
+///
+/// Wire-format reference: spec §3.2 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`. A
+/// `0x3000` payload is a sequence of one or more **groups**, each
+/// starting with a 4-byte big-endian flag word. Each of the flag
+/// word's 32 bits, scanned MSB-first, classifies one macroblock as
+/// either V1 (bit clear) or V4 (bit set); the index bytes for the
+/// group's macroblocks follow the flag word in scan order (one byte
+/// per V1, four bytes per V4). A group covers exactly 32 macroblocks
+/// unless the strip's macroblock count is exhausted before 32.
+///
+/// This iterator is the §3.2 mirror of round-246's
+/// [`V1OnlyMacroblocks`] — given a [`crate::codebook::StripChunkEntry`]
+/// whose `kind` resolves to [`crate::codebook::VectorChunkKind::IntraMixed`],
+/// a caller can take that entry's `payload` slice and walk it
+/// macroblock-by-macroblock without invoking the codebook + vector
+/// decode stack of [`decode_vector_chunk`].
+///
+/// Read-only and content-agnostic — the iterator does not consult
+/// codebook entries, perform V1 / V4 macroblock expansion (spec
+/// §§4–5), or touch pixel data. Useful for:
+///
+/// - validators / wire-format introspection tools that want to
+///   correlate each `0x3000` payload byte with its macroblock scan
+///   position and V1 / V4 classification;
+/// - fuzz harnesses that need a typed per-macroblock surface to
+///   classify malformed-vs-well-formed payloads;
+/// - container code (Sega FILM, AVI sub-stream) that wants to walk a
+///   strip's macroblock-level coverage without pulling in the full
+///   codec dependency.
+///
+/// ### Construction
+///
+/// [`MixedIntraMacroblocks::new`] performs no eager length check —
+/// the spec §3.2 per-group byte size depends on the in-group V1 /
+/// V4 mix, so payload-vs-`mb_count` consistency can only be
+/// confirmed during the walk. The iterator therefore reports
+/// truncation per-yield as `Some(Err(_))` and self-fuses afterwards
+/// (subsequent `next()` calls return `None`).
+///
+/// ### Iterator semantics
+///
+/// `next()` yields one [`MixedIntraEntry`] per macroblock until
+/// `mb_count` are yielded or the payload is exhausted / malformed.
+/// On error the iterator emits `Some(Err(_))` exactly once and then
+/// fuses to `None`. [`Iterator::size_hint`] reports `(remaining,
+/// Some(remaining))` based on the original `mb_count`.
+#[derive(Debug)]
+pub struct MixedIntraMacroblocks<'a> {
+    /// Chunk payload slice (chunk_size - 4 bytes following the 4-byte
+    /// chunk header).
+    payload: &'a [u8],
+    /// Total macroblock count for the strip; recorded for
+    /// [`Self::mb_count`] reporting and `size_hint` arithmetic.
+    mb_count: usize,
+    /// Byte offset of the next payload read within `payload`. The next
+    /// read may be a 4-byte flag word (at a group boundary) or an
+    /// index byte / quadruple within the current group.
+    cursor: usize,
+    /// 0-based index of the next macroblock to yield (equivalently,
+    /// the count of macroblocks already yielded).
+    next_mb: usize,
+    /// Per-group V1/V4 classification buffer, populated from the
+    /// latest flag word in scan order at MSB-first bit positions
+    /// `[0, group_kinds_len)`. `group_kinds[i]` = `true` ⇒ V4,
+    /// `false` ⇒ V1; spec §3.2.
+    group_kinds: [bool; 32],
+    /// Number of valid entries in [`Self::group_kinds`] for the
+    /// current group — equals `(mb_count - next_mb).min(32)` at the
+    /// moment the flag word was loaded.
+    group_kinds_len: u8,
+    /// Index of the next entry to consume from
+    /// [`Self::group_kinds`] within the current group.
+    group_cursor: u8,
+    /// One-shot fuse — set when an error is yielded so subsequent
+    /// `next()` calls return `None`.
+    fused: bool,
+}
+
+impl<'a> MixedIntraMacroblocks<'a> {
+    /// Build a mixed-intra macroblock iterator over the chunk payload
+    /// `payload` for a strip of `mb_count` macroblocks.
+    ///
+    /// `payload` is the `chunk_size - 4` bytes that follow the 4-byte
+    /// `(chunk_id, chunk_size)` chunk header — equivalently the
+    /// `payload` field of a [`crate::codebook::StripChunkEntry`] whose
+    /// `kind` resolves to [`crate::codebook::VectorChunkKind::IntraMixed`].
+    ///
+    /// No eager length check is performed; per-group byte sizes
+    /// depend on the V1 / V4 mix within the group. Truncation is
+    /// reported per-yield as `Some(Err(_))` and the iterator fuses
+    /// to `None` afterwards.
+    pub fn new(payload: &'a [u8], mb_count: usize) -> Self {
+        Self {
+            payload,
+            mb_count,
+            cursor: 0,
+            next_mb: 0,
+            group_kinds: [false; 32],
+            group_kinds_len: 0,
+            group_cursor: 0,
+            fused: false,
+        }
+    }
+
+    /// Byte offset of the next payload read within the payload slice.
+    /// Useful for error reporting when this iterator is composed
+    /// inside a higher-level frame walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Number of macroblocks yet to be yielded.
+    pub fn remaining(&self) -> usize {
+        self.mb_count.saturating_sub(self.next_mb)
+    }
+
+    /// Total macroblock count for the strip (the value passed to
+    /// [`Self::new`]).
+    pub fn mb_count(&self) -> usize {
+        self.mb_count
+    }
+
+    /// Underlying chunk payload slice — useful for byte-level
+    /// validators and round-trip checks.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// Read a 4-byte big-endian flag word at the current cursor and
+    /// classify up to 32 macroblocks (or fewer, when the strip's
+    /// macroblock count is exhausted before 32) into
+    /// [`Self::group_kinds`]. Advances `self.cursor` by 4.
+    fn load_next_group(&mut self) -> Result<()> {
+        if self.payload.len() - self.cursor < 4 {
+            return Err(CinepakError::invalid(format!(
+                "0x3000 truncated mid-flag-word at byte {}/{}",
+                self.cursor,
+                self.payload.len()
+            )));
+        }
+        let flag = u32::from_be_bytes([
+            self.payload[self.cursor],
+            self.payload[self.cursor + 1],
+            self.payload[self.cursor + 2],
+            self.payload[self.cursor + 3],
+        ]);
+        self.cursor += 4;
+        // Classify up to 32 macroblocks (or fewer if the strip's
+        // macroblock count is exhausted before 32 — spec §3.2: "A
+        // group covers exactly 32 macroblocks unless the strip's
+        // macroblock count is exhausted before 32.")
+        let group_size = (self.mb_count - self.next_mb).min(32);
+        for bit_pos in 0..group_size {
+            let mask = 1u32 << (31 - bit_pos);
+            self.group_kinds[bit_pos] = flag & mask != 0;
+        }
+        self.group_kinds_len = group_size as u8;
+        self.group_cursor = 0;
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for MixedIntraMacroblocks<'a> {
+    type Item = Result<MixedIntraEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
+        if self.next_mb >= self.mb_count {
+            return None;
+        }
+        // Refill the per-group classification buffer at every group
+        // boundary.
+        if self.group_cursor >= self.group_kinds_len {
+            if let Err(e) = self.load_next_group() {
+                self.fused = true;
+                return Some(Err(e));
+            }
+        }
+        let is_v4 = self.group_kinds[self.group_cursor as usize];
+        self.group_cursor += 1;
+        let kind = if is_v4 {
+            if self.payload.len() - self.cursor < 4 {
+                self.fused = true;
+                return Some(Err(CinepakError::invalid(format!(
+                    "0x3000 truncated mid-V4-index at byte {}/{} (mb {})",
+                    self.cursor,
+                    self.payload.len(),
+                    self.next_mb
+                ))));
+            }
+            let idx = [
+                self.payload[self.cursor],
+                self.payload[self.cursor + 1],
+                self.payload[self.cursor + 2],
+                self.payload[self.cursor + 3],
+            ];
+            self.cursor += 4;
+            MixedIntraMb::V4(idx)
+        } else {
+            if self.payload.len() - self.cursor < 1 {
+                self.fused = true;
+                return Some(Err(CinepakError::invalid(format!(
+                    "0x3000 truncated mid-V1-index at byte {}/{} (mb {})",
+                    self.cursor,
+                    self.payload.len(),
+                    self.next_mb
+                ))));
+            }
+            let idx = self.payload[self.cursor];
+            self.cursor += 1;
+            MixedIntraMb::V1(idx)
+        };
+        let entry = MixedIntraEntry {
+            index: self.next_mb as u16,
+            kind,
+        };
+        self.next_mb += 1;
+        Some(Ok(entry))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.fused {
+            return (0, Some(0));
+        }
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
 // ---------- Encoders (used by self-roundtrip tests) ----------------------
 
 /// Encode a `0x3200` V1-only intra vector chunk's payload (no header).
@@ -862,5 +1133,280 @@ mod tests {
         // strip, but the index field itself is just `MB_count - 1`.
         assert_eq!(entries[63].index, 63);
         assert_eq!(entries[63].codebook_index, 63);
+    }
+
+    // ---------- MixedIntraMacroblocks iterator (r250) ------------------
+
+    /// Spec §3.2 fixture `Y9` — 16-MB strip, every macroblock V4. Top
+    /// 16 bits of the flag word are `0xffff` (set), low 16 unused.
+    /// The iterator yields 16 V4-classified entries in scan order.
+    #[test]
+    fn mixed_intra_iter_y9_all_v4() {
+        let mut payload = vec![0xff, 0xff, 0x00, 0x00];
+        for i in 0..16 {
+            payload.extend_from_slice(&[i as u8, i as u8 + 1, i as u8 + 2, i as u8 + 3]);
+        }
+        let entries: Vec<_> = MixedIntraMacroblocks::new(&payload, 16)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 16);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            assert_eq!(
+                e.kind,
+                MixedIntraMb::V4([i as u8, i as u8 + 1, i as u8 + 2, i as u8 + 3]),
+            );
+        }
+    }
+
+    /// Spec §3.2 fixture `Y12` — 16-MB strip, checkerboard V1/V4 with
+    /// flag-word top 16 bits = `0x5a5a`. 8 V1 + 8 V4 in row-major
+    /// scan order.
+    #[test]
+    fn mixed_intra_iter_y12_checkerboard() {
+        let mut payload = vec![0x5a, 0x5a, 0x00, 0x00];
+        let bits = [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0];
+        for (i, &b) in bits.iter().enumerate() {
+            if b == 0 {
+                payload.push(i as u8);
+            } else {
+                payload.extend_from_slice(&[i as u8, 0xa0, 0xb0, 0xc0]);
+            }
+        }
+        let entries: Vec<_> = MixedIntraMacroblocks::new(&payload, 16)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 16);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            match (bits[i], e.kind) {
+                (0, MixedIntraMb::V1(idx)) => assert_eq!(idx, i as u8),
+                (1, MixedIntraMb::V4(idx)) => assert_eq!(idx, [i as u8, 0xa0, 0xb0, 0xc0]),
+                _ => panic!("mismatch at {i}: {:?}", e.kind),
+            }
+        }
+    }
+
+    /// Spec §3.2 fixture `Y14` — 64-MB strip, every macroblock V4.
+    /// Two flag words of `0xffffffff`, 32 V4 entries per group.
+    /// Exercises the group-refill path.
+    #[test]
+    fn mixed_intra_iter_y14_two_groups_all_v4() {
+        let mut payload = vec![0xff, 0xff, 0xff, 0xff];
+        for i in 0..32u8 {
+            payload.extend_from_slice(&[
+                i,
+                i.wrapping_add(1),
+                i.wrapping_add(2),
+                i.wrapping_add(3),
+            ]);
+        }
+        payload.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        for i in 32..64u8 {
+            payload.extend_from_slice(&[
+                i,
+                i.wrapping_add(1),
+                i.wrapping_add(2),
+                i.wrapping_add(3),
+            ]);
+        }
+        let entries: Vec<_> = MixedIntraMacroblocks::new(&payload, 64)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 64);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            let b = i as u8;
+            assert_eq!(
+                e.kind,
+                MixedIntraMb::V4([b, b.wrapping_add(1), b.wrapping_add(2), b.wrapping_add(3)]),
+            );
+        }
+    }
+
+    /// All-V1 mixed-intra 16-MB strip: flag word `0x00000000`, 16
+    /// V1 index bytes follow. Payload `4 + 16 = 20` bytes.
+    #[test]
+    fn mixed_intra_iter_all_v1() {
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&(0u8..16).collect::<Vec<_>>());
+        let entries: Vec<_> = MixedIntraMacroblocks::new(&payload, 16)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 16);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            assert_eq!(e.kind, MixedIntraMb::V1(i as u8));
+        }
+    }
+
+    /// Empty strip (`mb_count == 0`) is the trivial happy path: no
+    /// flag word is read, the iterator yields nothing.
+    #[test]
+    fn mixed_intra_iter_empty_strip() {
+        let payload: Vec<u8> = Vec::new();
+        let mut it = MixedIntraMacroblocks::new(&payload, 0);
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining(), 0);
+        assert_eq!(it.mb_count(), 0);
+    }
+
+    /// Truncated flag word (only 3 bytes of payload) is reported on
+    /// the first `next()` and the iterator fuses afterwards.
+    #[test]
+    fn mixed_intra_iter_truncated_flag_word_fuses() {
+        let payload = vec![0xff, 0xff, 0xff]; // 3 bytes — short of 4-byte flag word
+        let mut it = MixedIntraMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3000") && msg.contains("flag-word"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none(), "iterator must fuse on first error");
+        assert!(it.next().is_none(), "fuse must hold across calls");
+    }
+
+    /// Truncated V1 index byte after the flag word is reported and
+    /// the iterator fuses.
+    #[test]
+    fn mixed_intra_iter_truncated_v1_index_fuses() {
+        // Flag word 0x00000000 ⇒ all V1; but provide zero V1 index
+        // bytes after the flag word. mb_count = 1 ⇒ 1 V1 index byte
+        // is expected; payload is short.
+        let payload = vec![0x00, 0x00, 0x00, 0x00];
+        let mut it = MixedIntraMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3000") && msg.contains("V1-index"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none());
+    }
+
+    /// Truncated V4 index quadruple after the flag word is reported
+    /// and the iterator fuses.
+    #[test]
+    fn mixed_intra_iter_truncated_v4_index_fuses() {
+        // Flag word top bit set ⇒ MB 0 is V4; provide 0 of the 4
+        // expected index bytes.
+        let payload = vec![0x80, 0x00, 0x00, 0x00];
+        let mut it = MixedIntraMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3000") && msg.contains("V4-index"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none());
+    }
+
+    /// `size_hint` reports `(remaining, Some(remaining))` based on
+    /// the configured `mb_count` and advances in lock-step with
+    /// `next()`.
+    #[test]
+    fn mixed_intra_iter_size_hint_tracks_mb_count() {
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&(0u8..16).collect::<Vec<_>>());
+        let mut it = MixedIntraMacroblocks::new(&payload, 16);
+        assert_eq!(it.size_hint(), (16, Some(16)));
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.size_hint(), (15, Some(15)));
+        for _ in 0..15 {
+            let _ = it.next().unwrap().unwrap();
+        }
+        assert_eq!(it.size_hint(), (0, Some(0)));
+        assert!(it.next().is_none());
+    }
+
+    /// `cursor` and `remaining` accessors advance after each yield.
+    /// Mixed payload of 4-byte flag + V1 (1B) + V4 (4B) + V1 (1B) + V1
+    /// (1B) for the first 4 MBs of a 4-MB strip.
+    #[test]
+    fn mixed_intra_iter_cursor_advances() {
+        // Flag word: bit 31=0 (V1), bit 30=1 (V4), bit 29=0 (V1),
+        // bit 28=0 (V1) ⇒ top 4 bits = 0b0100 ⇒ flag word
+        // 0x40000000.
+        let payload = vec![
+            0x40, 0x00, 0x00, 0x00, //
+            0xaa, // MB0 V1 idx
+            0x01, 0x02, 0x03, 0x04, // MB1 V4 idx
+            0xbb, // MB2 V1 idx
+            0xcc, // MB3 V1 idx
+        ];
+        let mut it = MixedIntraMacroblocks::new(&payload, 4);
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining(), 4);
+        let e0 = it.next().unwrap().unwrap();
+        assert_eq!(e0.kind, MixedIntraMb::V1(0xaa));
+        // cursor advanced 4 (flag) + 1 (V1) = 5
+        assert_eq!(it.cursor(), 5);
+        assert_eq!(it.remaining(), 3);
+        let e1 = it.next().unwrap().unwrap();
+        assert_eq!(e1.kind, MixedIntraMb::V4([0x01, 0x02, 0x03, 0x04]));
+        assert_eq!(it.cursor(), 9);
+        let e2 = it.next().unwrap().unwrap();
+        assert_eq!(e2.kind, MixedIntraMb::V1(0xbb));
+        let e3 = it.next().unwrap().unwrap();
+        assert_eq!(e3.kind, MixedIntraMb::V1(0xcc));
+        assert!(it.next().is_none());
+        assert_eq!(it.cursor(), 11);
+        assert_eq!(it.remaining(), 0);
+    }
+
+    /// Cross-check against `decode_vector_chunk(0x3000, …)`: for the
+    /// `Y12` checkerboard fixture both APIs yield equivalent
+    /// per-macroblock classifications and index bytes.
+    #[test]
+    fn mixed_intra_iter_matches_decode_vector_chunk() {
+        // Reuse Y12 payload from above.
+        let mut payload = vec![0x5a, 0x5a, 0x00, 0x00];
+        let bits = [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0];
+        for (i, &b) in bits.iter().enumerate() {
+            if b == 0 {
+                payload.push(i as u8);
+            } else {
+                payload.extend_from_slice(&[i as u8, 0xa0, 0xb0, 0xc0]);
+            }
+        }
+        let bulk = decode_vector_chunk(VECTOR_CHUNK_INTRA, &payload, 16).unwrap();
+        let typed: Vec<_> = MixedIntraMacroblocks::new(&payload, 16)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(bulk.len(), typed.len());
+        for (i, (b, e)) in bulk.iter().zip(typed.iter()).enumerate() {
+            assert_eq!(e.index, i as u16, "index mismatch at {i}");
+            match (b, e.kind) {
+                (Mb::V1(bx), MixedIntraMb::V1(ex)) => assert_eq!(*bx, ex, "V1 idx at {i}"),
+                (Mb::V4(bx), MixedIntraMb::V4(ex)) => assert_eq!(*bx, ex, "V4 idx at {i}"),
+                _ => panic!("kind mismatch at {i}: bulk {:?}, typed {:?}", b, e.kind),
+            }
+        }
+    }
+
+    /// Group-boundary stress: a 33-MB strip forces a second flag word
+    /// after exactly 32 macroblocks. Mixing V1 / V4 around the
+    /// boundary exercises the refill path.
+    #[test]
+    fn mixed_intra_iter_group_boundary_at_32() {
+        // Group 0: 32 MBs, all V1 (flag word 0x00000000), 32 idx
+        // bytes follow.
+        // Group 1: 1 MB, V4 (flag word top bit 1, rest don't care),
+        // 4 idx bytes follow.
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&(0u8..32).collect::<Vec<_>>());
+        payload.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        let entries: Vec<_> = MixedIntraMacroblocks::new(&payload, 33)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 33);
+        for (i, entry) in entries.iter().enumerate().take(32) {
+            assert_eq!(entry.kind, MixedIntraMb::V1(i as u8));
+        }
+        assert_eq!(entries[32].kind, MixedIntraMb::V4([0x10, 0x20, 0x30, 0x40]));
     }
 }

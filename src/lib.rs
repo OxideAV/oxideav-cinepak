@@ -73,7 +73,9 @@ pub use film::{
     StabHeader,
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
-pub use vector::{V1MacroblockEntry, V1OnlyMacroblocks};
+pub use vector::{
+    MixedIntraEntry, MixedIntraMacroblocks, MixedIntraMb, V1MacroblockEntry, V1OnlyMacroblocks,
+};
 
 // Framework-integrated re-exports.
 #[cfg(feature = "registry")]

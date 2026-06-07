@@ -8,6 +8,61 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 253 (typed `0x3100` per-macroblock walker): new
+  `vector::InterMacroblocks` iterator at `src/vector.rs`
+  implementing spec §3.3 of
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` — the
+  inter-with-skip vector chunk encodes each macroblock as a 1- or
+  2-bit variable-length code packed MSB-first into the flag-word
+  stream (`0` ⇒ SKIP, `10` ⇒ V1, `11` ⇒ V4); codes can straddle a
+  flag-word boundary, in which case the V1 / V4 selector bit is
+  read from the **next** flag word's MSB and the deferred
+  macroblock's index bytes belong to that next group's index data
+  block (spec §3.3 step 3 + step 5, the `pending_set` rule).
+  `InterMacroblocks::new(payload, mb_count)` returns a read-only
+  iterator that walks one group at a time — loading the flag
+  word, classifying up to 33 macroblocks (one resolved-pending
+  entry + up to 32 fresh codes) into an internal scan-order
+  buffer, reading the group's index data from the payload, then
+  yielding one `InterEntry { index, kind }` per macroblock where
+  `kind` is `InterMb::Skip` / `InterMb::V1(u8)` /
+  `InterMb::V4([u8; 4])` matching the spec §3.3 grammar. The
+  §3.3 sibling of round-246's `V1OnlyMacroblocks` (§3.1) and
+  round-250's `MixedIntraMacroblocks` (§3.2): a
+  `StripChunkEntry::payload` from round-243's `StripChunks`
+  whose `kind` resolves to `VectorChunkKind::InterWithSkip` feeds
+  straight into `InterMacroblocks::new`, completing the per-MB
+  typed surface across all three vector-chunk codes (`0x3200` /
+  `0x3000` / `0x3100`). The walker is read-only and
+  content-agnostic — codebook expansion (spec §§4–5) and SKIP
+  semantics (spec §6, "reuse the previous frame's reconstructed
+  block") stay in `decoder::decode_strip_chunks`'s hot path.
+  `cursor()`, `remaining()`, `mb_count()`, and `payload()`
+  accessors round out the typed surface; `Iterator::size_hint`
+  reports the exact remaining count based on `mb_count`. Like
+  the round-250 mixed-intra walker, per-group byte sizes depend
+  on the in-group SKIP / V1 / V4 mix and the `pending_set` state
+  so length-consistency can only be checked during the walk:
+  truncation (mid-flag-word / mid-V1-index / mid-V4-index) is
+  reported per-yield as `Some(Err(_))` and the iterator fuses to
+  `None` afterwards. A dangling `pending_set` after the final
+  macroblock yields a per-yield error as well. Tests at
+  `src/vector.rs::tests` (12 added) exercise: spec §3.3 fixture
+  `Y8` (16-MB strip, 1 V1 update + 15 SKIPs, flag word
+  `0x80000000`, 5-byte payload), spec §3.3 fixture `Y10` (32-MB
+  strip, 2-flag-word layout exercising the group-refill path on
+  the 32-MB boundary), an all-SKIP 32-MB strip (single 4-byte
+  flag word, no index data), a single V4 update + 14 SKIPs (rich
+  V4-vs-SKIP mix), empty-strip (`mb_count == 0`), the three
+  truncation-fuse paths, `size_hint` exactness, the `cursor`
+  per-yield advance contract, a cross-check against
+  `decode_vector_chunk(0x3100, …)` for a 64-MB mixed-mix payload
+  that forces multiple selector-spillover boundaries, and an
+  explicit `pending_set` straddle stress (31 SKIPs + V1 + SKIP)
+  that crosses the 32-bit flag-word boundary inside the V1's
+  `10` code. New public exports from the crate root: `InterEntry`,
+  `InterMacroblocks`, `InterMb`.
+
 - Round 250 (typed `0x3000` per-macroblock walker): new
   `vector::MixedIntraMacroblocks` iterator at `src/vector.rs`
   implementing spec §3.2 of

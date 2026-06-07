@@ -74,7 +74,8 @@ pub use film::{
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 pub use vector::{
-    MixedIntraEntry, MixedIntraMacroblocks, MixedIntraMb, V1MacroblockEntry, V1OnlyMacroblocks,
+    InterEntry, InterMacroblocks, InterMb, MixedIntraEntry, MixedIntraMacroblocks, MixedIntraMb,
+    V1MacroblockEntry, V1OnlyMacroblocks,
 };
 
 // Framework-integrated re-exports.

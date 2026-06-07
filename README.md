@@ -1365,3 +1365,60 @@ group-boundary stress at exactly 32 MBs (33-MB strip forces a
 second flag word). New crate-root exports: `MixedIntraEntry`,
 `MixedIntraMacroblocks`, `MixedIntraMb`. Pure additive
 change.
+
+Round 253 closed the typed per-MB walker surface with the
+**spec §3.3 inter sibling** of r246 + r250 — a typed
+**`InterMacroblocks<'a>` per-macroblock walker** at
+`vector::InterMacroblocks` for the `0x3100` inter-with-skip
+vector chunk. Wire-grammar reference: spec §3.3 of
+`docs/video/cinepak/spec/03-vectors-and-macroblocks.md`. Each
+macroblock is encoded as a 1- or 2-bit variable-length code
+packed MSB-first into the flag-word stream: `0` ⇒ SKIP (reuse
+the previous frame's reconstructed 4×4 block at the same pixel
+position; spec §6), `10` ⇒ V1 (1 index byte follows in the
+group's index data), `11` ⇒ V4 (4 index bytes follow). Codes
+can straddle a flag-word boundary: when a flag word ends on a
+lone `1` (a "set" indicator), the V1 / V4 selector bit is read
+from the **next** flag word's MSB and the deferred macroblock's
+index bytes belong to that next group's index data block (spec
+§3.3 steps 3 + 5, the `pending_set` rule).
+`InterMacroblocks::new(payload, mb_count)` returns an iterator
+that walks one group at a time — loading the flag word,
+classifying up to 33 macroblocks (one resolved-pending entry +
+up to 32 fresh codes) into an internal scan-order buffer,
+reading the group's index data from the payload, then yielding
+one `InterEntry { index, kind }` per macroblock where `kind`
+is `InterMb::Skip` / `InterMb::V1(u8)` / `InterMb::V4([u8; 4])`
+matching the spec §3.3 grammar. Intended composition mirrors
+r246 and r250: a `StripChunkEntry::payload` slice from r243
+whose `kind` resolves to `VectorChunkKind::InterWithSkip` feeds
+straight into `InterMacroblocks::new`, completing the per-MB
+typed surface across all three vector-chunk codes (`0x3200` /
+`0x3000` / `0x3100`). Like r250, per-group byte sizes depend
+on the in-group SKIP / V1 / V4 mix and the `pending_set` state
+so length-consistency can only be checked during the walk;
+truncation (mid-flag-word / mid-V1-index / mid-V4-index) is
+reported per-yield as `Some(Err(_))` and the iterator fuses to
+`None` afterwards. A dangling `pending_set` after the final
+macroblock surfaces a per-yield error as well. Coverage: 12
+new tests under `vector::tests` exercise spec §3.3 fixture
+`Y8` (16-MB strip, 1 V1 update + 15 SKIPs, flag word
+`0x80000000`, 5-byte payload), `Y10` (32-MB strip, 2-flag-word
+layout exercising the 32-MB group-refill path), an all-SKIP
+32-MB strip (single 4-byte flag word, no index data), a single
+V4 update + 14 SKIPs (rich V4-vs-SKIP mix), empty-strip
+(`mb_count == 0`), the three truncation-fuse paths,
+`size_hint` exactness, the `cursor` per-yield advance contract,
+a cross-check against `decode_vector_chunk(0x3100, …)` for a
+64-MB mixed-mix payload that forces multiple
+selector-spillover boundaries, and an explicit `pending_set`
+straddle stress (31 SKIPs + V1 + SKIP) that crosses the 32-bit
+flag-word boundary inside the V1's `10` code. New crate-root
+exports: `InterEntry`, `InterMacroblocks`, `InterMb`. Pure
+additive change — the existing `decode_vector_chunk` continues
+to own the bulk per-chunk decode, `decode_strip_chunks` continues
+to drive the decoder's hot path; r253 is the typed layered
+surface for validators / fuzz harnesses / wire-format
+introspection tools that want to walk the macroblock-level
+coverage of the inter vector-chunk code without the codebook
++ V1/V4-expansion + SKIP-reconstruction dependency.

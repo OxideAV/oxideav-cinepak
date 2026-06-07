@@ -649,6 +649,390 @@ impl<'a> Iterator for MixedIntraMacroblocks<'a> {
     }
 }
 
+// ---------- InterMacroblocks iterator (typed §3.3 walker) ----------------
+
+/// One macroblock yielded by [`InterMacroblocks`].
+///
+/// `0x3100` payloads encode each macroblock as a variable-length code
+/// packed into the flag-word stream (spec §3.3 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`): `0` ⇒
+/// SKIP (reuse the previous frame's reconstructed 4×4 block at the
+/// same pixel position; spec §6), `10` ⇒ V1 (one codebook index byte
+/// follows in the current group's index data), `11` ⇒ V4 (four
+/// codebook index bytes follow). The per-entry [`InterEntry::kind`]
+/// selector preserves that distinction alongside the 0-based
+/// scan-order index (spec §1.1) so callers can correlate each wire
+/// byte / wire quadruple with its macroblock position without
+/// recomputing the per-group bit-packing arithmetic externally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterEntry {
+    /// 0-based macroblock index in scan order (spec §1.1).
+    pub index: u16,
+    /// Per-macroblock SKIP / V1 / V4 classification with the
+    /// corresponding codebook index bytes copied out of the chunk
+    /// payload (none for SKIP).
+    pub kind: InterMb,
+}
+
+/// Per-macroblock VLC classification yielded by [`InterMacroblocks`].
+///
+/// `0x3100` codes (spec §3.3):
+///
+/// | Code | Variant   | Index bytes |
+/// | ---- | --------- | ----------- |
+/// | `0`  | [`Skip`]  | 0           |
+/// | `10` | [`V1`]    | 1           |
+/// | `11` | [`V4`]    | 4           |
+///
+/// [`Skip`]: InterMb::Skip
+/// [`V1`]: InterMb::V1
+/// [`V4`]: InterMb::V4
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterMb {
+    /// SKIP — reuse the previous frame's reconstructed macroblock at
+    /// the same pixel position (spec §6). No index bytes.
+    Skip,
+    /// V1-coded — single codebook index byte.
+    V1(u8),
+    /// V4-coded — four codebook indices in row-major scan order
+    /// `(top-left, top-right, bottom-left, bottom-right)`; spec §5.
+    V4([u8; 4]),
+}
+
+/// Iterator over the macroblock entries inside a `0x3100` inter
+/// vector-chunk payload.
+///
+/// Wire-format reference: spec §3.3 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`. A
+/// `0x3100` payload is a sequence of one or more **groups**, each
+/// starting with a 4-byte big-endian flag word followed by the
+/// group's interleaved index data. Each macroblock in the group is
+/// represented by a 1- or 2-bit VLC code packed into the flag word's
+/// 32 bits, scanned MSB-first: `0` ⇒ SKIP, `10` ⇒ V1, `11` ⇒ V4.
+/// Codes can straddle a flag-word boundary: when the current flag
+/// word has exactly 1 bit remaining and that bit is `1` (a "set"
+/// indicator), the selector bit (V1 vs. V4) is read from the *next*
+/// flag word's MSB before any further macroblock codes are decoded
+/// from it (spec §3.3 step 3, the "`pending_set`" rule). The index
+/// bytes for a macroblock whose selector straddles a group boundary
+/// belong to the **next** group's index data (spec §3.3 step 5).
+///
+/// This iterator is the §3.3 sibling of round-246's
+/// [`V1OnlyMacroblocks`] and round-250's
+/// [`MixedIntraMacroblocks`] — given a
+/// [`crate::codebook::StripChunkEntry`] whose `kind` resolves to
+/// [`crate::codebook::VectorChunkKind::InterWithSkip`], a caller can
+/// take that entry's `payload` slice and walk it macroblock-by-
+/// macroblock without invoking the codebook + vector decode stack of
+/// [`decode_vector_chunk`].
+///
+/// Read-only and content-agnostic — the iterator does not consult
+/// codebook entries, perform V1 / V4 macroblock expansion (spec
+/// §§4–5), apply the SKIP semantics (spec §6, "reuse the previous
+/// frame's reconstructed block"), or touch pixel data. Useful for:
+///
+/// - validators / wire-format introspection tools that want to
+///   correlate each `0x3100` payload byte with its macroblock scan
+///   position and SKIP / V1 / V4 classification;
+/// - fuzz harnesses that need a typed per-macroblock surface to
+///   classify malformed-vs-well-formed payloads;
+/// - container code (Sega FILM, AVI sub-stream) that wants to walk a
+///   strip's macroblock-level coverage without pulling in the full
+///   codec dependency.
+///
+/// ### Construction
+///
+/// [`InterMacroblocks::new`] performs no eager length check — the
+/// spec §3.3 per-group byte size depends on the SKIP / V1 / V4 mix
+/// in the group, the in-flight `pending_set` state, and on whether
+/// `mb_count` is reached mid-group, so payload-vs-`mb_count`
+/// consistency can only be confirmed during the walk. The iterator
+/// therefore reports truncation per-yield as `Some(Err(_))` and
+/// self-fuses afterwards (subsequent `next()` calls return `None`).
+/// A trailing dangling `pending_set` after the final macroblock is
+/// also reported as an error on the next `next()` call.
+///
+/// ### Iterator semantics
+///
+/// `next()` yields one [`InterEntry`] per macroblock until
+/// `mb_count` are yielded or the payload is exhausted / malformed.
+/// To accommodate the spec §3.3 step 5 "index bytes follow with the
+/// selector's group" rule, the iterator buffers a whole group's
+/// classifications + index data internally on every group boundary
+/// crossing — `next()` reads the next flag word, classifies the
+/// group's macroblocks (resolving any pending selector from the
+/// previous group), reads the group's index data, and then yields
+/// from the per-group buffer in scan order. On error the iterator
+/// emits `Some(Err(_))` exactly once and then fuses to `None`.
+/// [`Iterator::size_hint`] reports `(remaining, Some(remaining))`
+/// based on the original `mb_count`.
+#[derive(Debug)]
+pub struct InterMacroblocks<'a> {
+    /// Chunk payload slice (chunk_size - 4 bytes following the 4-byte
+    /// chunk header).
+    payload: &'a [u8],
+    /// Total macroblock count for the strip; recorded for
+    /// [`Self::mb_count`] reporting and `size_hint` arithmetic.
+    mb_count: usize,
+    /// Byte offset of the next payload read within `payload`. The next
+    /// read may be a 4-byte flag word (at a group boundary) or an
+    /// index byte / quadruple within the current group.
+    cursor: usize,
+    /// 0-based index of the next macroblock to yield (equivalently,
+    /// the count of macroblocks already yielded).
+    next_mb: usize,
+    /// Per-group entry buffer, populated by [`Self::load_next_group`]
+    /// with the macroblocks whose index data is collected from the
+    /// **current** group's index data block. Valid entries occupy
+    /// positions `[group_cursor, group_len)`.
+    group_buf: [InterMb; 33],
+    /// Number of valid entries in [`Self::group_buf`] for the current
+    /// group. A group covers at most 32 macroblock codes, but a
+    /// macroblock whose selector resolves a previous group's
+    /// `pending_set` is the first entry of *this* group's buffer, so
+    /// 33 is the upper bound (one resolved-pending + 32 fresh codes).
+    group_len: u8,
+    /// Index of the next entry to yield from [`Self::group_buf`].
+    group_cursor: u8,
+    /// When true, the previous flag word ended on a leading `1`; the
+    /// next flag word's MSB carries the V1 / V4 selector for the
+    /// deferred macroblock (spec §3.3 step 3).
+    pending_set: bool,
+    /// One-shot fuse — set when an error is yielded so subsequent
+    /// `next()` calls return `None`.
+    fused: bool,
+}
+
+impl<'a> InterMacroblocks<'a> {
+    /// Build an inter macroblock iterator over the chunk payload
+    /// `payload` for a strip of `mb_count` macroblocks.
+    ///
+    /// `payload` is the `chunk_size - 4` bytes that follow the 4-byte
+    /// `(chunk_id, chunk_size)` chunk header — equivalently the
+    /// `payload` field of a [`crate::codebook::StripChunkEntry`] whose
+    /// `kind` resolves to [`crate::codebook::VectorChunkKind::InterWithSkip`].
+    ///
+    /// No eager length check is performed; the spec §3.3 per-group
+    /// byte size depends on the SKIP / V1 / V4 mix and on the
+    /// in-flight `pending_set` state. Truncation is reported per-yield
+    /// as `Some(Err(_))` and the iterator fuses to `None` afterwards.
+    pub fn new(payload: &'a [u8], mb_count: usize) -> Self {
+        Self {
+            payload,
+            mb_count,
+            cursor: 0,
+            next_mb: 0,
+            group_buf: [InterMb::Skip; 33],
+            group_len: 0,
+            group_cursor: 0,
+            pending_set: false,
+            fused: false,
+        }
+    }
+
+    /// Byte offset of the next payload read within the payload slice.
+    /// Useful for error reporting when this iterator is composed
+    /// inside a higher-level frame walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Number of macroblocks yet to be yielded.
+    pub fn remaining(&self) -> usize {
+        self.mb_count.saturating_sub(self.next_mb)
+    }
+
+    /// Total macroblock count for the strip (the value passed to
+    /// [`Self::new`]).
+    pub fn mb_count(&self) -> usize {
+        self.mb_count
+    }
+
+    /// Underlying chunk payload slice — useful for byte-level
+    /// validators and round-trip checks.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// Read one 4-byte big-endian flag word at the current cursor,
+    /// classify up to 33 macroblocks (one resolved-pending entry from
+    /// the previous group's leading `1` + up to 32 fresh codes from
+    /// this flag word) into [`Self::group_buf`], read the group's
+    /// index data from the payload, and reset
+    /// [`Self::group_cursor`] to 0. Advances `self.cursor` past the
+    /// flag word and the group's index data.
+    fn load_next_group(&mut self) -> Result<()> {
+        if self.payload.len() - self.cursor < 4 {
+            return Err(CinepakError::invalid(format!(
+                "0x3100 truncated mid-flag-word at byte {}/{}",
+                self.cursor,
+                self.payload.len()
+            )));
+        }
+        let flag = u32::from_be_bytes([
+            self.payload[self.cursor],
+            self.payload[self.cursor + 1],
+            self.payload[self.cursor + 2],
+            self.payload[self.cursor + 3],
+        ]);
+        self.cursor += 4;
+
+        // Classification phase: walk the flag word's bits MSB-first
+        // and collect SKIP / V1 / V4 markers (without index bytes
+        // yet) into `self.group_buf`.
+        let mut group_len: usize = 0;
+        let mut bit: u32 = 0;
+
+        // Step 1: resolve any pending selector from the previous
+        // group. The deferred macroblock's index bytes belong to
+        // **this** group's index data (spec §3.3 step 5).
+        if self.pending_set {
+            // The pending mb counts toward this iteration's yields,
+            // so we must have room for it.
+            if self.next_mb + group_len >= self.mb_count {
+                // Pending selector with no macroblock left to consume
+                // it — this is a malformed payload.
+                return Err(CinepakError::invalid(
+                    "0x3100 pending selector but mb_count reached",
+                ));
+            }
+            let mask = 1u32 << (31 - bit);
+            bit += 1;
+            let is_v4 = flag & mask != 0;
+            self.group_buf[group_len] = if is_v4 {
+                InterMb::V4([0, 0, 0, 0])
+            } else {
+                InterMb::V1(0)
+            };
+            group_len += 1;
+            self.pending_set = false;
+        }
+
+        // Step 2: decode further codes from this flag word until
+        // either mb_count is reached, the bits run out, or a leading
+        // `1` falls at the last bit (deferring its selector to the
+        // next flag word).
+        while self.next_mb + group_len < self.mb_count && bit < 32 {
+            let mask = 1u32 << (31 - bit);
+            bit += 1;
+            if flag & mask == 0 {
+                // SKIP — no index bytes.
+                self.group_buf[group_len] = InterMb::Skip;
+                group_len += 1;
+                continue;
+            }
+            // Leading `1` — need one more bit for the V1/V4 selector.
+            if bit >= 32 {
+                // Selector bit spills into the next flag word; the
+                // mb is deferred to the next iteration's step 1 and
+                // its index bytes will be read with **that** group's
+                // index data block (spec §3.3 step 5).
+                self.pending_set = true;
+                break;
+            }
+            let sel_mask = 1u32 << (31 - bit);
+            bit += 1;
+            let is_v4 = flag & sel_mask != 0;
+            self.group_buf[group_len] = if is_v4 {
+                InterMb::V4([0, 0, 0, 0])
+            } else {
+                InterMb::V1(0)
+            };
+            group_len += 1;
+        }
+
+        // Step 3: read this group's index data — 1 byte per V1 mb,
+        // 4 bytes per V4 mb, in scan order. SKIPs consume no bytes.
+        for slot in self.group_buf.iter_mut().take(group_len) {
+            match slot {
+                InterMb::Skip => {}
+                InterMb::V1(idx) => {
+                    if self.payload.len() - self.cursor < 1 {
+                        return Err(CinepakError::invalid(format!(
+                            "0x3100 truncated mid-V1-index at byte {}/{}",
+                            self.cursor,
+                            self.payload.len()
+                        )));
+                    }
+                    *idx = self.payload[self.cursor];
+                    self.cursor += 1;
+                }
+                InterMb::V4(idx) => {
+                    if self.payload.len() - self.cursor < 4 {
+                        return Err(CinepakError::invalid(format!(
+                            "0x3100 truncated mid-V4-index at byte {}/{}",
+                            self.cursor,
+                            self.payload.len()
+                        )));
+                    }
+                    idx.copy_from_slice(&self.payload[self.cursor..self.cursor + 4]);
+                    self.cursor += 4;
+                }
+            }
+        }
+
+        self.group_len = group_len as u8;
+        self.group_cursor = 0;
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for InterMacroblocks<'a> {
+    type Item = Result<InterEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
+        if self.next_mb >= self.mb_count {
+            // After consuming every macroblock, a leftover
+            // `pending_set` is a malformed-payload signal (the spec
+            // §3.3 step 3 deferral expects another flag word).
+            if self.pending_set {
+                self.fused = true;
+                self.pending_set = false;
+                return Some(Err(CinepakError::invalid(
+                    "0x3100 ended with a dangling pending selector",
+                )));
+            }
+            return None;
+        }
+        // Refill the per-group buffer at every group boundary.
+        if self.group_cursor >= self.group_len {
+            if let Err(e) = self.load_next_group() {
+                self.fused = true;
+                return Some(Err(e));
+            }
+            if self.group_len == 0 {
+                // load_next_group did not classify any macroblock
+                // (e.g. all 32 bits consumed by a single straddled
+                // pending-then-defer). Without progress the iterator
+                // would loop forever; flag the payload as malformed.
+                self.fused = true;
+                return Some(Err(CinepakError::invalid(
+                    "0x3100 flag word made no decoding progress",
+                )));
+            }
+        }
+        let kind = self.group_buf[self.group_cursor as usize];
+        self.group_cursor += 1;
+        let entry = InterEntry {
+            index: self.next_mb as u16,
+            kind,
+        };
+        self.next_mb += 1;
+        Some(Ok(entry))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.fused {
+            return (0, Some(0));
+        }
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
 // ---------- Encoders (used by self-roundtrip tests) ----------------------
 
 /// Encode a `0x3200` V1-only intra vector chunk's payload (no header).
@@ -1408,5 +1792,279 @@ mod tests {
             assert_eq!(entry.kind, MixedIntraMb::V1(i as u8));
         }
         assert_eq!(entries[32].kind, MixedIntraMb::V4([0x10, 0x20, 0x30, 0x40]));
+    }
+
+    // ---------- InterMacroblocks iterator (r253) -----------------------
+
+    /// Spec §3.3 fixture `Y8` — 16-MB strip, single V1 update + 15
+    /// skips, payload 5 bytes (one flag word `0x80000000` + one V1
+    /// byte). Bit 31 = `1` ⇒ leading `1`; bit 30 = `0` ⇒ V1 selector
+    /// (MB 0 V1); bits 29..15 = `0` × 15 ⇒ 15 SKIPs (MBs 1..15). The
+    /// remaining 15 unused bits are padding because mb_count = 16.
+    #[test]
+    fn inter_iter_y8_one_v1_plus_skips() {
+        let payload = vec![0x80, 0x00, 0x00, 0x00, 0x42];
+        let entries: Vec<_> = InterMacroblocks::new(&payload, 16)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 16);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[0].kind, InterMb::V1(0x42));
+        for (i, e) in entries.iter().enumerate().skip(1) {
+            assert_eq!(e.index, i as u16);
+            assert_eq!(e.kind, InterMb::Skip);
+        }
+    }
+
+    /// Spec §3.3 fixture `Y10` — 32-MB strip, single V1 update + 31
+    /// skips, payload 9 bytes. Flag-word 0 = `0x80000000` encodes
+    /// `10` (V1) + `0` × 30 (30 SKIPs) → 31 macroblock codes in 32
+    /// bits, all bits used. Index data after FW0: 1 V1 byte.
+    /// Flag-word 1 = `0x00000000` encodes a single `0` (1 SKIP for
+    /// MB 31) and 31 bits of padding. Index data after FW1: 0 bytes.
+    #[test]
+    fn inter_iter_y10_two_groups() {
+        let payload = vec![
+            0x80, 0x00, 0x00, 0x00, // FW0
+            0x77, // V1 idx for MB 0
+            0x00, 0x00, 0x00, 0x00, // FW1
+        ];
+        let entries: Vec<_> = InterMacroblocks::new(&payload, 32)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 32);
+        assert_eq!(entries[0].kind, InterMb::V1(0x77));
+        for e in entries.iter().skip(1) {
+            assert_eq!(e.kind, InterMb::Skip);
+        }
+    }
+
+    /// All-skip 32-MB strip: a single flag word `0x00000000` encodes
+    /// 32 SKIPs with no index data. Payload is exactly 4 bytes.
+    #[test]
+    fn inter_iter_all_skip_32() {
+        let payload = vec![0x00, 0x00, 0x00, 0x00];
+        let entries: Vec<_> = InterMacroblocks::new(&payload, 32)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 32);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            assert_eq!(e.kind, InterMb::Skip);
+        }
+    }
+
+    /// Single V4 update + skips: flag word starts `11` (V4) followed
+    /// by SKIPs. Indices come after the flag word as 4 bytes for the
+    /// V4 mb.
+    #[test]
+    fn inter_iter_one_v4_plus_skips() {
+        // bit 31=1, bit 30=1, then 14 zeroes ⇒ codes: V4, then 14
+        // SKIPs ⇒ 15 macroblocks in the first 16 bits. The remaining
+        // 16 bits are padding for mb_count = 15.
+        let payload = vec![
+            0xc0, 0x00, 0x00, 0x00, //
+            0xde, 0xad, 0xbe, 0xef, // V4 idx for MB 0
+        ];
+        let entries: Vec<_> = InterMacroblocks::new(&payload, 15)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 15);
+        assert_eq!(entries[0].kind, InterMb::V4([0xde, 0xad, 0xbe, 0xef]));
+        for e in entries.iter().skip(1) {
+            assert_eq!(e.kind, InterMb::Skip);
+        }
+    }
+
+    /// Empty strip (`mb_count == 0`) is the trivial happy path: no
+    /// flag word is read, the iterator yields nothing.
+    #[test]
+    fn inter_iter_empty_strip() {
+        let payload: Vec<u8> = Vec::new();
+        let mut it = InterMacroblocks::new(&payload, 0);
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining(), 0);
+        assert_eq!(it.mb_count(), 0);
+    }
+
+    /// Truncated flag word (only 3 bytes of payload) is reported on
+    /// the first `next()` and the iterator fuses afterwards.
+    #[test]
+    fn inter_iter_truncated_flag_word_fuses() {
+        let payload = vec![0xff, 0xff, 0xff]; // 3 bytes — short of 4-byte flag word
+        let mut it = InterMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3100") && msg.contains("flag-word"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none(), "iterator must fuse on first error");
+        assert!(it.next().is_none(), "fuse must hold across calls");
+    }
+
+    /// Truncated V1 index after the flag word is reported and the
+    /// iterator fuses.
+    #[test]
+    fn inter_iter_truncated_v1_index_fuses() {
+        // Flag word `10` followed by SKIPs ⇒ MB 0 is V1; but
+        // payload provides 0 V1 index bytes after the flag word.
+        let payload = vec![0x80, 0x00, 0x00, 0x00];
+        let mut it = InterMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3100") && msg.contains("V1-index"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none());
+    }
+
+    /// Truncated V4 index after the flag word is reported and the
+    /// iterator fuses.
+    #[test]
+    fn inter_iter_truncated_v4_index_fuses() {
+        // Flag word `11` followed by SKIPs ⇒ MB 0 is V4; but payload
+        // provides 0 of the 4 expected V4 index bytes.
+        let payload = vec![0xc0, 0x00, 0x00, 0x00];
+        let mut it = InterMacroblocks::new(&payload, 1);
+        let err = it.next().unwrap().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3100") && msg.contains("V4-index"),
+            "unexpected error message: {msg}"
+        );
+        assert!(it.next().is_none());
+    }
+
+    /// `size_hint` reports `(remaining, Some(remaining))` based on
+    /// the configured `mb_count` and advances in lock-step with
+    /// `next()`.
+    #[test]
+    fn inter_iter_size_hint_tracks_mb_count() {
+        let payload = vec![0x00, 0x00, 0x00, 0x00]; // 32 SKIPs
+        let mut it = InterMacroblocks::new(&payload, 32);
+        assert_eq!(it.size_hint(), (32, Some(32)));
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.size_hint(), (31, Some(31)));
+        for _ in 0..31 {
+            let _ = it.next().unwrap().unwrap();
+        }
+        assert_eq!(it.size_hint(), (0, Some(0)));
+        assert!(it.next().is_none());
+    }
+
+    /// `cursor` accessor advances past flag-word + index bytes as
+    /// the walk progresses. Single-group fixture mirrors the §3.3
+    /// `Y8` shape but with both a V1 and a V4 update for richer
+    /// cursor checks.
+    #[test]
+    fn inter_iter_cursor_advances() {
+        // Bits MSB-first:
+        //   1, 0 → V1 (MB0)
+        //   1, 1 → V4 (MB1)
+        //   0    → SKIP (MB2)
+        //   0    → SKIP (MB3)
+        //   then 24 zero bits (padding; mb_count = 4 so unused)
+        // Flag-word bits: 1 0 1 1  0 0 0 0 ... ⇒ 0xb0000000.
+        let payload = vec![
+            0xb0, 0x00, 0x00, 0x00, //
+            0xaa, // MB0 V1 idx
+            0x01, 0x02, 0x03, 0x04, // MB1 V4 idx
+        ];
+        let mut it = InterMacroblocks::new(&payload, 4);
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining(), 4);
+        // First yield loads the whole group + index bytes, so the
+        // cursor jumps to the end (4 + 1 + 4 = 9 bytes) on the very
+        // first call.
+        let e0 = it.next().unwrap().unwrap();
+        assert_eq!(e0.kind, InterMb::V1(0xaa));
+        assert_eq!(it.cursor(), 9);
+        let e1 = it.next().unwrap().unwrap();
+        assert_eq!(e1.kind, InterMb::V4([0x01, 0x02, 0x03, 0x04]));
+        let e2 = it.next().unwrap().unwrap();
+        assert_eq!(e2.kind, InterMb::Skip);
+        let e3 = it.next().unwrap().unwrap();
+        assert_eq!(e3.kind, InterMb::Skip);
+        assert!(it.next().is_none());
+        assert_eq!(it.remaining(), 0);
+    }
+
+    /// Cross-check against `decode_vector_chunk(0x3100, …)`: for a
+    /// 64-MB inter payload (mix of SKIP / V1 / V4 with selector
+    /// straddle), both APIs yield equivalent per-macroblock
+    /// classifications and index bytes.
+    #[test]
+    fn inter_iter_matches_decode_vector_chunk() {
+        // Build a mb list whose encode-decode round-trips through
+        // `encode_inter_payload`. The mix is the same as
+        // `roundtrip_inter_64mb` — i % 5 cycles SKIP / V1 / V4 /
+        // SKIP / V1 — which forces selector spillover at multiple
+        // group boundaries.
+        let mut mbs: Vec<Mb> = Vec::new();
+        for i in 0..64 {
+            mbs.push(match i % 5 {
+                0 => Mb::Skip,
+                1 => Mb::V1(i as u8),
+                2 => Mb::V4([i as u8, i as u8 + 1, i as u8 + 2, i as u8 + 3]),
+                3 => Mb::Skip,
+                4 => Mb::V1((i * 2) as u8),
+                _ => unreachable!(),
+            });
+        }
+        let mut buf = Vec::new();
+        encode_inter_payload(&mbs, &mut buf).unwrap();
+        let bulk = decode_vector_chunk(VECTOR_CHUNK_INTER, &buf, mbs.len()).unwrap();
+        let typed: Vec<_> = InterMacroblocks::new(&buf, mbs.len())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(bulk.len(), typed.len());
+        for (i, (b, e)) in bulk.iter().zip(typed.iter()).enumerate() {
+            assert_eq!(e.index, i as u16, "index mismatch at {i}");
+            match (b, e.kind) {
+                (Mb::Skip, InterMb::Skip) => {}
+                (Mb::V1(bx), InterMb::V1(ex)) => assert_eq!(*bx, ex, "V1 idx at {i}"),
+                (Mb::V4(bx), InterMb::V4(ex)) => assert_eq!(*bx, ex, "V4 idx at {i}"),
+                _ => panic!("kind mismatch at {i}: bulk {:?}, typed {:?}", b, e.kind),
+            }
+        }
+    }
+
+    /// Selector-straddle stress: a flag word that ends on a lone `1`
+    /// (set indicator) forces the V1/V4 selector to come from the
+    /// next flag word's MSB, and the deferred macroblock's index
+    /// bytes go into the *next* group's index data block. Exercise
+    /// this by encoding 32 SKIPs followed by one V1 update — the
+    /// 33rd code (the `10` for the V1) straddles the boundary.
+    ///
+    /// This fixture is the `Y8`-style fixture extended one bit past
+    /// 32: it precisely exercises the `pending_set` path in
+    /// `load_next_group`.
+    #[test]
+    fn inter_iter_selector_straddles_group_boundary() {
+        // Build the mb list and encode it with the proven encoder,
+        // then decode with both paths and compare. This isolates the
+        // straddle to a single explicit boundary crossing.
+        let mut mbs = vec![Mb::Skip; 31];
+        mbs.push(Mb::V1(0xbe));
+        mbs.push(Mb::Skip);
+        let mut buf = Vec::new();
+        encode_inter_payload(&mbs, &mut buf).unwrap();
+        let typed: Vec<_> = InterMacroblocks::new(&buf, mbs.len())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let bulk = decode_vector_chunk(VECTOR_CHUNK_INTER, &buf, mbs.len()).unwrap();
+        assert_eq!(typed.len(), mbs.len());
+        for (i, (b, e)) in bulk.iter().zip(typed.iter()).enumerate() {
+            match (b, e.kind) {
+                (Mb::Skip, InterMb::Skip) => {}
+                (Mb::V1(bx), InterMb::V1(ex)) => assert_eq!(*bx, ex, "V1 idx at {i}"),
+                (Mb::V4(bx), InterMb::V4(ex)) => assert_eq!(*bx, ex, "V4 idx at {i}"),
+                _ => panic!("mismatch at {i}: bulk {:?}, typed {:?}", b, e.kind),
+            }
+        }
     }
 }

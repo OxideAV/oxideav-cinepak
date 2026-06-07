@@ -8,6 +8,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 246 (typed `0x3200` per-macroblock walker): new
+  `vector::V1OnlyMacroblocks` iterator at `src/vector.rs`
+  implementing spec §3.1 of
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` — the
+  V1-only vector chunk has no flag word, exactly `mb_count`
+  payload bytes, each byte a V1 codebook index for one macroblock
+  in row-major scan order per spec §1.1.
+  `V1OnlyMacroblocks::new(payload, mb_count)` verifies the spec
+  §3.1 length-equality invariant up-front (`payload.len() ==
+  mb_count`); the resulting iterator is infallible and yields
+  exactly `mb_count` `V1MacroblockEntry { index, codebook_index }`
+  values before returning `None`. Intended composition: a
+  `StripChunkEntry::payload` from round-243's `StripChunks`
+  whose `kind` resolves to `VectorChunkKind::IntraV1Only` feeds
+  straight into `V1OnlyMacroblocks::new`, so the chunk-stream
+  layer (r243) and the per-macroblock layer (r246) share a
+  zero-copy contract. The walker is read-only and
+  content-agnostic — codebook expansion (spec §4) and pixel
+  writes stay in `decoder::decode_strip_chunks`'s hot path.
+  `cursor()`, `remaining()`, `mb_count()`, and `payload()`
+  accessors round out the typed surface; `Iterator::size_hint`
+  and `ExactSizeIterator::len` both report the exact remaining
+  count. Tests at `src/vector.rs::tests` (10 added) exercise:
+  scan-order index emission, the spec §3.1 fixture `Y6`
+  (16-MB strip → 16-byte payload, per-MB-distinct indices), the
+  spec §3.1 fixture `Y11` worked example (64-MB strip →
+  64-byte payload), an empty-strip happy path
+  (`mb_count == 0`), payload-shorter-than-`mb_count` +
+  payload-longer-than-`mb_count` rejection at construction,
+  `size_hint` exactness through full consumption,
+  `ExactSizeIterator::len` honesty, the `cursor` / `remaining`
+  advance lock-step contract, and a cross-check that the
+  iterator yields the same V1 codebook indices as
+  `decode_vector_chunk(0x3200, payload, mb_count)`. New public
+  exports from the crate root: `V1MacroblockEntry`,
+  `V1OnlyMacroblocks`.
+
 - Round 243 (typed strip-chunk-stream iterator): new
   `codebook::StripChunks` iterator at `src/codebook.rs` implementing
   spec §1 + §2 of `docs/video/cinepak/spec/02-codebooks.md` (common

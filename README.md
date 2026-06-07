@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1284,3 +1284,45 @@ additive change — the existing `decode_strip_chunks` inline
 walk inside `decoder.rs` continues to drive the decoder's hot
 path; r243 is a layered surface for callers that want to grep
 the chunk stream without the codebook + vector decode dependency.
+
+Round 246 added the **next layer below r243** — a typed
+**`V1OnlyMacroblocks<'a>` per-macroblock walker** at
+`vector::V1OnlyMacroblocks`, implementing spec §3.1 of
+`docs/video/cinepak/spec/03-vectors-and-macroblocks.md` (the
+`0x3200` V1-only vector chunk: no flag word, one byte per
+macroblock, each byte a V1 codebook index in row-major scan
+order per spec §1.1). `V1OnlyMacroblocks::new(payload, mb_count)`
+checks the spec §3.1 length-equality invariant
+(`payload.len() == mb_count`) up-front; the resulting iterator
+is then infallible — yields exactly `mb_count`
+`V1MacroblockEntry { index, codebook_index }` values and then
+`None`. The intended composition is to take a
+`StripChunkEntry::payload` slice from r243 whose `kind`
+resolves to `VectorChunkKind::IntraV1Only` and feed it
+straight into `V1OnlyMacroblocks::new`, so the chunk-stream
+layer and the per-macroblock layer share a zero-copy contract.
+The walker is read-only and content-agnostic — codebook
+expansion (spec §4) and pixel writes stay in
+`decoder::decode_strip_chunks`'s hot path. `cursor()`,
+`remaining()`, `mb_count()`, and `payload()` accessors round
+out the typed surface; `Iterator::size_hint` and
+`ExactSizeIterator::len` both report the exact remaining
+count. Coverage: 10 new tests under `vector::tests` exercise
+scan-order index emission, the spec §3.1 fixture `Y6`
+(16-MB strip → 16-byte payload, per-MB-distinct indices), the
+spec §3.1 fixture `Y11` worked example (64-MB strip → 64-byte
+payload), an empty-strip happy path (`mb_count == 0`),
+payload-shorter-than-`mb_count` + payload-longer-than-
+`mb_count` rejection at construction, `size_hint` exactness
+through full consumption, `ExactSizeIterator::len` honesty,
+the `cursor` / `remaining` advance lock-step contract, and a
+cross-check that the iterator yields the same V1 codebook
+indices as `decode_vector_chunk(0x3200, payload, mb_count)`.
+New crate-root exports: `V1MacroblockEntry`, `V1OnlyMacroblocks`.
+Pure additive change — `decode_vector_chunk` continues to own
+the bulk per-chunk decode for `0x3000` / `0x3100` / `0x3200`;
+r246 is a typed layered surface for callers (validators, fuzz
+harnesses, wire-format introspection tools) that want to walk
+the macroblock-level coverage of the simplest of the three
+vector-chunk codes without the codebook + V1-expansion
+dependency.

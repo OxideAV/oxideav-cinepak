@@ -216,6 +216,168 @@ fn decode_inter(payload: &[u8], mb_count: usize) -> Result<Vec<Mb>> {
     Ok(out)
 }
 
+// ---------- V1OnlyMacroblocks iterator (typed §3.1 walker) ---------------
+
+/// One macroblock yielded by [`V1OnlyMacroblocks`].
+///
+/// `0x3200` payloads are the simplest of the three vector-chunk codes
+/// (spec §3.1 of `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`):
+/// no flag word, one byte per macroblock, each byte a V1 codebook
+/// index. `V1MacroblockEntry` exposes the 0-based macroblock scan-order
+/// index (spec §1.1) alongside the codebook index byte so callers can
+/// correlate the wire byte with its macroblock position without
+/// recomputing the count externally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V1MacroblockEntry {
+    /// 0-based macroblock index in scan order (spec §1.1).
+    pub index: u16,
+    /// V1 codebook index byte for this macroblock — the single payload
+    /// byte at offset `index` within the chunk payload.
+    pub codebook_index: u8,
+}
+
+/// Iterator over the macroblock entries inside a `0x3200` V1-only
+/// vector-chunk payload.
+///
+/// Wire-format reference: spec §3.1 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`. A
+/// `0x3200` chunk's payload is exactly `mb_count` bytes, each byte a
+/// V1 codebook index for one macroblock in row-major scan order (spec
+/// §1.1). There is no flag word.
+///
+/// This iterator is the next layer below the round-243
+/// [`crate::codebook::StripChunks`] chunk-stream iterator for the
+/// simplest of the three vector-chunk codes — given a
+/// [`crate::codebook::StripChunkEntry`] whose `kind` resolves to
+/// [`crate::codebook::VectorChunkKind::IntraV1Only`], a caller can
+/// take that entry's `payload` slice and walk it macroblock-by-
+/// macroblock without invoking the codebook + vector decode stack of
+/// [`decode_vector_chunk`].
+///
+/// Read-only and content-agnostic — the iterator does not consult
+/// codebook entries, perform V1 macroblock expansion (spec §4), or
+/// touch pixel data. Useful for:
+///
+/// - validators / wire-format introspection tools that want to
+///   correlate each `0x3200` payload byte with its macroblock scan
+///   position;
+/// - fuzz harnesses that need a typed per-macroblock surface to
+///   classify malformed-vs-well-formed payloads;
+/// - container code (Sega FILM, AVI sub-stream) that wants to walk a
+///   strip's macroblock-level coverage without pulling in the full
+///   codec dependency.
+///
+/// ### Construction
+///
+/// [`V1OnlyMacroblocks::new`] verifies the spec §3.1
+/// `payload.len() == mb_count` invariant and returns an error
+/// otherwise; the resulting iterator is infallible thereafter —
+/// `next()` yields `Some(Ok(_))` exactly `mb_count` times and then
+/// `None`.
+///
+/// ### Iterator semantics
+///
+/// `next()` yields one [`V1MacroblockEntry`] per byte of the payload
+/// until exhaustion. [`Iterator::size_hint`] reports the exact
+/// remaining count; [`ExactSizeIterator`] is implemented so callers
+/// can call [`Iterator::len`] without consuming the iterator.
+#[derive(Debug)]
+pub struct V1OnlyMacroblocks<'a> {
+    /// Chunk payload slice; length equals `mb_count` after the §3.1
+    /// length-equality check in [`V1OnlyMacroblocks::new`].
+    payload: &'a [u8],
+    /// Total macroblock count for the strip; recorded for
+    /// [`Self::mb_count`] reporting and `size_hint` arithmetic.
+    mb_count: usize,
+    /// Byte offset of the next macroblock entry within `payload`.
+    /// Equivalently, the 0-based index of the next macroblock to
+    /// yield.
+    cursor: usize,
+}
+
+impl<'a> V1OnlyMacroblocks<'a> {
+    /// Build a V1-only macroblock iterator over the chunk payload
+    /// `payload` for a strip of `mb_count` macroblocks.
+    ///
+    /// `payload` is the `chunk_size - 4` bytes that follow the 4-byte
+    /// `(chunk_id, chunk_size)` chunk header — equivalently the
+    /// `payload` field of a [`crate::codebook::StripChunkEntry`] whose
+    /// `kind` resolves to [`crate::codebook::VectorChunkKind::IntraV1Only`].
+    ///
+    /// Returns an error when the spec §3.1 invariant
+    /// `payload.len() == mb_count` is violated (payload shorter or
+    /// longer than `mb_count` bytes); on the happy path the resulting
+    /// iterator is infallible.
+    pub fn new(payload: &'a [u8], mb_count: usize) -> Result<Self> {
+        if payload.len() != mb_count {
+            return Err(CinepakError::invalid(format!(
+                "0x3200 payload len {} != mb_count {mb_count}",
+                payload.len()
+            )));
+        }
+        Ok(Self {
+            payload,
+            mb_count,
+            cursor: 0,
+        })
+    }
+
+    /// Byte offset of the next macroblock entry within the payload.
+    /// Equivalently, the 0-based index of the next macroblock to
+    /// yield. Useful for error reporting when this iterator is
+    /// composed inside a higher-level frame walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Number of macroblocks yet to be yielded.
+    pub fn remaining(&self) -> usize {
+        self.mb_count.saturating_sub(self.cursor)
+    }
+
+    /// Total macroblock count for the strip (the value passed to
+    /// [`Self::new`]; equivalently the payload length).
+    pub fn mb_count(&self) -> usize {
+        self.mb_count
+    }
+
+    /// Underlying chunk payload slice — useful for byte-level
+    /// validators and round-trip checks.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+impl<'a> Iterator for V1OnlyMacroblocks<'a> {
+    type Item = Result<V1MacroblockEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.mb_count {
+            return None;
+        }
+        // §3.1 length-equality invariant is upheld by `new`: payload
+        // is exactly `mb_count` bytes long, so the indexed access
+        // here is always in-bounds while `cursor < mb_count`.
+        let entry = V1MacroblockEntry {
+            index: self.cursor as u16,
+            codebook_index: self.payload[self.cursor],
+        };
+        self.cursor += 1;
+        Some(Ok(entry))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for V1OnlyMacroblocks<'a> {
+    fn len(&self) -> usize {
+        self.remaining()
+    }
+}
+
 // ---------- Encoders (used by self-roundtrip tests) ----------------------
 
 /// Encode a `0x3200` V1-only intra vector chunk's payload (no header).
@@ -553,5 +715,152 @@ mod tests {
         assert_eq!(buf.len(), 4);
         let out = decode_vector_chunk(VECTOR_CHUNK_INTER, &buf, 32).unwrap();
         assert_eq!(out, mbs);
+    }
+
+    // ---------- V1OnlyMacroblocks iterator (r246) ----------------------
+
+    /// Spec §3.1 — V1-only chunk payload is exactly `mb_count` bytes;
+    /// the iterator yields each codebook index in scan order.
+    #[test]
+    fn v1only_iter_yields_indices_in_scan_order() {
+        let payload: Vec<u8> = (0..16).collect();
+        let it = V1OnlyMacroblocks::new(&payload, 16).unwrap();
+        let entries: Vec<_> = it.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 16);
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.index, i as u16);
+            assert_eq!(e.codebook_index, i as u8);
+        }
+    }
+
+    /// Spec §3.1 fixture `Y6` worked example — single 16-MB strip,
+    /// payload byte-per-MB with per-MB-distinct codebook indices.
+    #[test]
+    fn v1only_iter_y6_fixture() {
+        // Y6 payload pattern: indices 0..16 in row-major scan order.
+        let payload: Vec<u8> = (0..16).collect();
+        let it = V1OnlyMacroblocks::new(&payload, 16).unwrap();
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.mb_count(), 16);
+        assert_eq!(it.payload(), &payload[..]);
+
+        let mut it = V1OnlyMacroblocks::new(&payload, 16).unwrap();
+        let first = it.next().unwrap().unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(first.codebook_index, 0);
+        assert_eq!(it.cursor(), 1);
+    }
+
+    /// Spec §3.1 — empty strip (mb_count = 0) is a happy path with
+    /// zero yields.
+    #[test]
+    fn v1only_iter_empty_strip() {
+        let payload: Vec<u8> = Vec::new();
+        let mut it = V1OnlyMacroblocks::new(&payload, 0).unwrap();
+        assert!(it.next().is_none());
+        // Still none on subsequent calls.
+        assert!(it.next().is_none());
+    }
+
+    /// Spec §3.1 — `payload.len() != mb_count` (payload short) is
+    /// rejected at construction.
+    #[test]
+    fn v1only_iter_rejects_payload_short() {
+        let payload: Vec<u8> = vec![0, 1, 2]; // 3 bytes
+        let err = V1OnlyMacroblocks::new(&payload, 8).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3200") && msg.contains("payload"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Spec §3.1 — `payload.len() != mb_count` (payload long) is
+    /// rejected at construction.
+    #[test]
+    fn v1only_iter_rejects_payload_long() {
+        let payload: Vec<u8> = (0..20).collect(); // 20 bytes for 16 mbs
+        let err = V1OnlyMacroblocks::new(&payload, 16).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0x3200") && msg.contains("payload"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// `size_hint` reports the exact remaining count at every step.
+    #[test]
+    fn v1only_iter_size_hint_is_exact() {
+        let payload: Vec<u8> = (0..16).collect();
+        let mut it = V1OnlyMacroblocks::new(&payload, 16).unwrap();
+        assert_eq!(it.size_hint(), (16, Some(16)));
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.size_hint(), (15, Some(15)));
+        for _ in 0..15 {
+            let _ = it.next().unwrap().unwrap();
+        }
+        assert_eq!(it.size_hint(), (0, Some(0)));
+        assert!(it.next().is_none());
+    }
+
+    /// `ExactSizeIterator` implementation reports the right length.
+    #[test]
+    fn v1only_iter_exact_size() {
+        let payload: Vec<u8> = (0..16).collect();
+        let it = V1OnlyMacroblocks::new(&payload, 16).unwrap();
+        assert_eq!(it.len(), 16);
+    }
+
+    /// `cursor()` and `remaining()` accessors advance in lock-step
+    /// with `next()`.
+    #[test]
+    fn v1only_iter_cursor_and_remaining() {
+        let payload: Vec<u8> = (0..8).collect();
+        let mut it = V1OnlyMacroblocks::new(&payload, 8).unwrap();
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining(), 8);
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 1);
+        assert_eq!(it.remaining(), 7);
+        let _ = it.next().unwrap().unwrap();
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 3);
+        assert_eq!(it.remaining(), 5);
+    }
+
+    /// Cross-check against `decode_vector_chunk(0x3200, …)`: the
+    /// iterator yields the same codebook indices as the bulk decoder.
+    #[test]
+    fn v1only_iter_matches_decode_vector_chunk() {
+        let payload: Vec<u8> = vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+        let bulk = decode_vector_chunk(VECTOR_CHUNK_V1_ONLY, &payload, 8).unwrap();
+        let iter: Vec<_> = V1OnlyMacroblocks::new(&payload, 8)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(bulk.len(), iter.len());
+        for (i, (b, e)) in bulk.iter().zip(iter.iter()).enumerate() {
+            match b {
+                Mb::V1(idx) => assert_eq!(*idx, e.codebook_index, "mismatch at {i}"),
+                _ => panic!("expected V1 for 0x3200 chunk at {i}, got {:?}", b),
+            }
+        }
+    }
+
+    /// Spec §3.1 fixture `Y11` — 64-MB strip → 64-byte payload.
+    #[test]
+    fn v1only_iter_y11_fixture_64mb() {
+        // Y11 reference: 32×32 frame → 64 macroblocks → 64-byte payload.
+        let payload: Vec<u8> = (0..64).collect();
+        let entries: Vec<_> = V1OnlyMacroblocks::new(&payload, 64)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 64);
+        // Last entry's index matches the spec §1.1 row-major scan
+        // order: index 63 maps to (row=15, col=3) for a 4-MB-wide
+        // strip, but the index field itself is just `MB_count - 1`.
+        assert_eq!(entries[63].index, 63);
+        assert_eq!(entries[63].codebook_index, 63);
     }
 }

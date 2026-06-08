@@ -8,6 +8,58 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 261 (typed STAB sample-records walker): new
+  `film::Samples` iterator at `src/film.rs` that walks a STAB
+  sample-records byte slice and yields one
+  `film::SampleRecordEntry { index, record, kind }` per 16-byte
+  row in wire order. Wire-format reference: `Sega_FILM.wiki` lines
+  84-116 (`docs/video/cinepak/reference/wiki/Sega_FILM.wiki`).
+  `Samples::new(records)` takes the `num_entries * 16` bytes that
+  follow the 16-byte STAB chunk header — equivalently the suffix
+  of the FILM header buffer starting at offset
+  `FILM_HEADER_MIN_SIZE + fdsc_len + 16` — and rejects misaligned
+  lengths (must be a multiple of `SAMPLE_RECORD_SIZE = 16`) up
+  front. The iterator is read-only, content-agnostic, and
+  `ExactSizeIterator + FusedIterator` — every 16-byte record
+  decodes to a valid `SampleRecord` + `SampleKind` by construction
+  so no per-yield error surface is needed. Companion enum
+  `film::SampleKind` classifies each record into
+  `Audio { well_formed }` / `VideoKeyframe { timestamp_ticks,
+  next_frame_ticks }` / `VideoInter { timestamp_ticks,
+  next_frame_ticks }` per `sample_info_1 == 0xFFFFFFFF` (audio
+  sentinel, line 102), top-bit clear ⇒ keyframe (line 104), low
+  31 bits = timestamp (line 116), `sample_info_2` = next-frame
+  ticks for video (line 116) / well-formedness constant `1` for
+  audio (line 116). `SampleKind::from_record(rec)` is the
+  standalone classification surface the iterator re-uses; the
+  enum also exposes `is_audio()` / `is_keyframe()` / `is_video()`
+  predicate accessors. Accessors `remaining()`, `cursor()`,
+  `next_index()`, `records_bytes()` round out the typed surface.
+  The container-side analogue to r240 / r243 / r246 / r250 /
+  r253 / r256: with this iterator the read-only typed surface now
+  covers every Cinepak wire layer from FILM container-table
+  (`Samples`) → strip (`FrameStrips`) → chunk (`StripChunks`) →
+  per-MB / per-slot (`V1OnlyMacroblocks` / `MixedIntraMacroblocks`
+  / `InterMacroblocks` / `CodebookEntries`). Callers who already
+  hold the STAB records slice — partial-header streamers, custom
+  demuxers that share STAB parsing with sister formats, container
+  validators that want per-record granularity without the
+  `FilmDemuxer::parse` round-trip — can drive a typed per-sample
+  loop with one dependency. The existing
+  `FilmDemuxer::video_samples` / `audio_samples` / `keyframes`
+  helpers stay as in-place predicate-filter shortcuts; `Samples`
+  is the per-record typed primitive that sits behind them.
+  New public exports: `Samples`, `SampleKind`,
+  `SampleRecordEntry`, `SAMPLE_RECORD_SIZE`. 17 new lib tests
+  (165 → 182). Wall: `docs/video/cinepak/reference/wiki/Sega_FILM.wiki`
+  (lines 84-116 — STAB record layout + `sample_info_1` keyframe-bit
+  + timestamp semantics + audio sentinel + `sample_info_2`
+  well-formedness), already-shipped public surface (`SampleRecord`,
+  `SampleRecord::is_audio`, `SampleRecord::is_keyframe`,
+  `SampleRecord::is_well_formed_audio`, `SampleRecord::timestamp_ticks`,
+  `SampleRecord::next_frame_ticks`, `FilmDemuxer::parse`,
+  `build_minimal_film` test helper). No external library source,
+  no web search, no GH issues opened.
 - Round 256 (typed codebook-chunk-payload entry walker): new
   `codebook::CodebookEntries` iterator at `src/codebook.rs`
   implementing spec §3 (full-replacement chunks `0x2000` /

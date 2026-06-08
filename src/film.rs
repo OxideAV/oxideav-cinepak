@@ -762,6 +762,262 @@ impl SampleRecord {
     }
 }
 
+/// Size of one STAB sample record on the wire, in bytes.
+pub const SAMPLE_RECORD_SIZE: usize = 16;
+
+/// Classified kind of a single STAB sample record.
+///
+/// Derived from [`SampleRecord::is_audio`] +
+/// [`SampleRecord::is_keyframe`] per `Sega_FILM.wiki` lines 102-116
+/// (`docs/video/cinepak/reference/wiki/Sega_FILM.wiki`):
+///
+/// - `sample_info_1 == 0xFFFFFFFF` ⇒ audio sample (codec data routed
+///   to the audio path; not Cinepak).
+/// - top bit of `sample_info_1` clear (and not audio) ⇒ video
+///   **keyframe** ("intra" / "I-frame"). Lower 31 bits are the
+///   absolute timestamp in `STAB.base_frequency` ticks.
+/// - top bit of `sample_info_1` set (and not audio) ⇒ video **inter**
+///   frame (predicted from the previously-reconstructed frame).
+///   Lower 31 bits are the timestamp.
+///
+/// Carries the per-kind metadata already classified so callers can
+/// pattern-match without re-walking the bit fields of
+/// `sample_info_1` / `sample_info_2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleKind {
+    /// Audio sample (`sample_info_1 == 0xFFFFFFFF`).
+    ///
+    /// `well_formed` carries the result of
+    /// [`SampleRecord::is_well_formed_audio`] — `true` iff
+    /// `sample_info_2 == 1` per `Sega_FILM.wiki` line 116. A `false`
+    /// here flags a malformed audio interleave that downstream PCM
+    /// decoders should refuse rather than silently process.
+    Audio { well_formed: bool },
+    /// Video keyframe (intra-coded). `timestamp_ticks` is the
+    /// absolute frame timestamp in `STAB.base_frequency` ticks;
+    /// `next_frame_ticks` is the tick count until the next frame
+    /// renders (`sample_info_2`).
+    VideoKeyframe {
+        timestamp_ticks: u32,
+        next_frame_ticks: u32,
+    },
+    /// Video inter frame (predicted from the previous frame). Same
+    /// fields as [`SampleKind::VideoKeyframe`].
+    VideoInter {
+        timestamp_ticks: u32,
+        next_frame_ticks: u32,
+    },
+}
+
+impl SampleKind {
+    /// Classify a raw [`SampleRecord`] into the typed enum.
+    pub fn from_record(rec: SampleRecord) -> Self {
+        if rec.is_audio() {
+            SampleKind::Audio {
+                well_formed: rec.is_well_formed_audio(),
+            }
+        } else {
+            // Lower 31 bits = timestamp, top bit = inter flag.
+            let ts = rec.sample_info_1 & 0x7FFF_FFFF;
+            let next = rec.sample_info_2;
+            if (rec.sample_info_1 & 0x8000_0000) == 0 {
+                SampleKind::VideoKeyframe {
+                    timestamp_ticks: ts,
+                    next_frame_ticks: next,
+                }
+            } else {
+                SampleKind::VideoInter {
+                    timestamp_ticks: ts,
+                    next_frame_ticks: next,
+                }
+            }
+        }
+    }
+
+    /// `true` for [`SampleKind::Audio`].
+    pub fn is_audio(&self) -> bool {
+        matches!(self, SampleKind::Audio { .. })
+    }
+
+    /// `true` for [`SampleKind::VideoKeyframe`].
+    pub fn is_keyframe(&self) -> bool {
+        matches!(self, SampleKind::VideoKeyframe { .. })
+    }
+
+    /// `true` for [`SampleKind::VideoKeyframe`] or
+    /// [`SampleKind::VideoInter`].
+    pub fn is_video(&self) -> bool {
+        matches!(
+            self,
+            SampleKind::VideoKeyframe { .. } | SampleKind::VideoInter { .. }
+        )
+    }
+}
+
+/// A single STAB record yielded by [`Samples`], carrying the raw
+/// 16-byte [`SampleRecord`] alongside its already-classified
+/// [`SampleKind`] and 0-based index within the record table.
+///
+/// Reference: `Sega_FILM.wiki` lines 84-116
+/// (`docs/video/cinepak/reference/wiki/Sega_FILM.wiki`) — STAB chunk
+/// layout and `sample_info_1` / `sample_info_2` semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleRecordEntry {
+    /// 0-based record index within the STAB sample table.
+    pub index: u32,
+    /// Raw 16-byte sample record, untouched from the wire.
+    pub record: SampleRecord,
+    /// Classified kind (audio / video keyframe / video inter) with
+    /// per-kind metadata extracted (timestamp + next-frame ticks for
+    /// video; well-formedness for audio).
+    pub kind: SampleKind,
+}
+
+/// Iterator over the per-record contents of a STAB sample-record
+/// byte slice.
+///
+/// Wire-format reference: `Sega_FILM.wiki` lines 84-116
+/// (`docs/video/cinepak/reference/wiki/Sega_FILM.wiki`). The STAB
+/// chunk lays out a 16-byte header (signature + chunk length +
+/// `base_frequency` + `num_entries`) followed by `num_entries`
+/// 16-byte sample records of `(sample_offset, sample_length,
+/// sample_info_1, sample_info_2)` big-endian `u32` fields.
+///
+/// [`Samples::new`] takes the records-only byte slice — i.e. the
+/// portion of the FILM header **after** the STAB 16-byte
+/// header — and yields one [`SampleRecordEntry`] per 16-byte row in
+/// wire order. Each yield re-decodes the row's four big-endian
+/// `u32`s into a [`SampleRecord`] and classifies it via
+/// [`SampleKind::from_record`].
+///
+/// The iterator is **read-only** and **content-agnostic**: it
+/// walks the records byte-for-byte without touching the FILM /
+/// FDSC envelopes around it. Callers who already have the records
+/// region in hand — typically because they parsed the STAB header
+/// themselves, or because they're streaming a partial header
+/// without buffering the full FILM file — can drive a typed
+/// per-sample loop without round-tripping through
+/// [`FilmDemuxer::parse`].
+///
+/// ### Composition with the existing typed-iterator family
+///
+/// Mirrors the strip-side typed walkers: r240 [`crate::header::FrameStrips`]
+/// (frame → strips), r243 [`crate::codebook::StripChunks`]
+/// (strip → chunks), r246 / r250 / r253 (per-MB walks of
+/// `0x3200` / `0x3000` / `0x3100`), r256
+/// [`crate::codebook::CodebookEntries`] (codebook chunk → per-slot
+/// entries). This iterator is the container-side analogue: STAB
+/// records → typed sample stream. With it the read-only typed
+/// surface now covers every Cinepak wire layer from FILM
+/// container-table down to per-codebook-slot.
+///
+/// ### Error semantics
+///
+/// [`Samples::new`] rejects record byte slices whose length is not
+/// a multiple of [`SAMPLE_RECORD_SIZE`] up front (a well-formed STAB
+/// always has length `num_entries * 16`). No per-yield errors are
+/// possible after that — every 16-byte record decodes to a valid
+/// [`SampleRecord`] + [`SampleKind`] by construction.
+#[derive(Clone, Debug)]
+pub struct Samples<'a> {
+    /// Records byte slice. The iterator only reads within this slice.
+    records: &'a [u8],
+    /// Byte offset of the next record header within `records`.
+    cursor: usize,
+    /// 0-based index of the next record to yield.
+    next_index: u32,
+}
+
+impl<'a> Samples<'a> {
+    /// Build a sample iterator over the STAB records byte slice
+    /// `records`.
+    ///
+    /// `records` is the `num_entries * 16` bytes that follow the
+    /// 16-byte STAB chunk header — equivalently, the suffix of a
+    /// FILM header buffer starting at offset
+    /// `FILM_HEADER_MIN_SIZE + fdsc_len + 16`.
+    ///
+    /// Returns `Err` iff `records.len() % SAMPLE_RECORD_SIZE != 0`
+    /// (a STAB record table cannot have a partial row).
+    pub fn new(records: &'a [u8]) -> Result<Self> {
+        if records.len() % SAMPLE_RECORD_SIZE != 0 {
+            return Err(CinepakError::invalid(format!(
+                "STAB sample-records slice length {} not a multiple of {SAMPLE_RECORD_SIZE}",
+                records.len()
+            )));
+        }
+        Ok(Self {
+            records,
+            cursor: 0,
+            next_index: 0,
+        })
+    }
+
+    /// Number of records the iterator has yet to yield.
+    pub fn remaining(&self) -> u32 {
+        ((self.records.len() - self.cursor) / SAMPLE_RECORD_SIZE) as u32
+    }
+
+    /// Byte offset of the next record-header read within the records
+    /// slice. Useful for cross-referencing with a higher-level FILM
+    /// walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// 0-based index of the next record to yield.
+    pub fn next_index(&self) -> u32 {
+        self.next_index
+    }
+
+    /// Underlying records byte slice (unchanged from construction).
+    pub fn records_bytes(&self) -> &'a [u8] {
+        self.records
+    }
+}
+
+impl<'a> Iterator for Samples<'a> {
+    type Item = SampleRecordEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor + SAMPLE_RECORD_SIZE > self.records.len() {
+            return None;
+        }
+        let o = self.cursor;
+        // u32::from_be_bytes on 4-byte slices that are guaranteed to
+        // be in-range — the construction-time length check + this
+        // cursor-bound `if` together imply each slice is exactly 4 B.
+        let sample_offset = u32::from_be_bytes(self.records[o..o + 4].try_into().unwrap());
+        let sample_length = u32::from_be_bytes(self.records[o + 4..o + 8].try_into().unwrap());
+        let sample_info_1 = u32::from_be_bytes(self.records[o + 8..o + 12].try_into().unwrap());
+        let sample_info_2 = u32::from_be_bytes(self.records[o + 12..o + 16].try_into().unwrap());
+        let record = SampleRecord {
+            sample_offset,
+            sample_length,
+            sample_info_1,
+            sample_info_2,
+        };
+        let kind = SampleKind::from_record(record);
+        let entry = SampleRecordEntry {
+            index: self.next_index,
+            record,
+            kind,
+        };
+        self.cursor += SAMPLE_RECORD_SIZE;
+        self.next_index += 1;
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.remaining() as usize;
+        (rem, Some(rem))
+    }
+}
+
+impl<'a> ExactSizeIterator for Samples<'a> {}
+
+impl<'a> std::iter::FusedIterator for Samples<'a> {}
+
 /// A parsed FILM container's full header (FILM + FDSC + STAB and the
 /// list of sample records). The sample bytes themselves are not read;
 /// callers consume them by reading `sample_length` bytes from the file
@@ -1787,5 +2043,374 @@ mod tests {
         let dem = FilmDemuxer::parse(&out).unwrap();
         assert!(!dem.fdsc.has_audio());
         assert_eq!(dem.audio_format(), FilmAudioFormat::None);
+    }
+
+    // ---- r261: Samples typed iterator over STAB records ---------------
+
+    /// Helper to encode a 16-byte sample record into raw big-endian
+    /// bytes, the same wire format the STAB record table uses.
+    fn enc_record(off: u32, len: u32, si1: u32, si2: u32) -> [u8; 16] {
+        let mut r = [0u8; 16];
+        r[0..4].copy_from_slice(&off.to_be_bytes());
+        r[4..8].copy_from_slice(&len.to_be_bytes());
+        r[8..12].copy_from_slice(&si1.to_be_bytes());
+        r[12..16].copy_from_slice(&si2.to_be_bytes());
+        r
+    }
+
+    #[test]
+    fn samples_empty_records_yields_none() {
+        let it = Samples::new(&[]).unwrap();
+        assert_eq!(it.remaining(), 0);
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.next_index(), 0);
+        let collected: Vec<_> = it.collect();
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn samples_rejects_misaligned_slice() {
+        // 17 bytes is not a multiple of 16.
+        let buf = [0u8; 17];
+        assert!(Samples::new(&buf).is_err());
+        // 0 bytes is the legal empty case.
+        assert!(Samples::new(&buf[..0]).is_ok());
+        // 16 bytes is one record.
+        assert!(Samples::new(&buf[..16]).is_ok());
+        // 15 bytes (just under one) is rejected.
+        assert!(Samples::new(&buf[..15]).is_err());
+    }
+
+    #[test]
+    fn samples_single_video_keyframe() {
+        // Sample 0 from build_minimal_film(): offset=0, len=500,
+        // si1=0 (key, ts=0), si2=1.
+        let rec = enc_record(0, 500, 0x0000_0000, 1);
+        let mut it = Samples::new(&rec).unwrap();
+        assert_eq!(it.remaining(), 1);
+        let e = it.next().unwrap();
+        assert_eq!(e.index, 0);
+        assert_eq!(e.record.sample_offset, 0);
+        assert_eq!(e.record.sample_length, 500);
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoKeyframe {
+                timestamp_ticks: 0,
+                next_frame_ticks: 1,
+            }
+        );
+        assert!(e.kind.is_keyframe());
+        assert!(e.kind.is_video());
+        assert!(!e.kind.is_audio());
+        assert_eq!(it.next_index(), 1);
+        assert_eq!(it.remaining(), 0);
+        assert!(it.next().is_none());
+    }
+
+    /// Mirrors the spec §2.7 fixture `C3` STAB layout: 5 video
+    /// samples, sample 0 keyframe at ts=0, samples 1-4 inter with
+    /// ascending timestamps.
+    #[test]
+    fn samples_c3_fixture_five_video_samples() {
+        let mut records = Vec::with_capacity(5 * 16);
+        records.extend_from_slice(&enc_record(0, 5177, 0x0000_0000, 1));
+        records.extend_from_slice(&enc_record(0x1439, 2590, 0x8000_0001, 1));
+        records.extend_from_slice(&enc_record(0x1e57, 2400, 0x8000_0002, 1));
+        records.extend_from_slice(&enc_record(0x27b7, 2300, 0x8000_0003, 1));
+        records.extend_from_slice(&enc_record(0x30b3, 2200, 0x8000_0004, 1));
+        let it = Samples::new(&records).unwrap();
+        assert_eq!(it.remaining(), 5);
+        let entries: Vec<_> = it.collect();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            entries[0].kind,
+            SampleKind::VideoKeyframe {
+                timestamp_ticks: 0,
+                next_frame_ticks: 1,
+            }
+        );
+        for (i, e) in entries.iter().enumerate().skip(1) {
+            assert_eq!(e.index as usize, i);
+            assert_eq!(
+                e.kind,
+                SampleKind::VideoInter {
+                    timestamp_ticks: i as u32,
+                    next_frame_ticks: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn samples_audio_sentinel_classified() {
+        // sample_info_1 == 0xFFFFFFFF flags audio; sample_info_2 == 1
+        // is the well-formed audio constant.
+        let rec = enc_record(0x500, 100, 0xFFFF_FFFF, 1);
+        let mut it = Samples::new(&rec).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(e.kind, SampleKind::Audio { well_formed: true });
+        assert!(e.kind.is_audio());
+        assert!(!e.kind.is_video());
+        assert!(!e.kind.is_keyframe());
+        assert_eq!(e.record.sample_info_1, 0xFFFF_FFFF);
+        assert_eq!(e.record.sample_info_2, 1);
+    }
+
+    #[test]
+    fn samples_audio_malformed_si2_flagged() {
+        // si1 == 0xFFFFFFFF is still audio, but si2 != 1 means the
+        // wiki's audio-interleave invariant is broken.
+        let rec = enc_record(0x500, 100, 0xFFFF_FFFF, 7);
+        let mut it = Samples::new(&rec).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(e.kind, SampleKind::Audio { well_formed: false });
+    }
+
+    /// Interleaved video + audio + video classification end-to-end.
+    #[test]
+    fn samples_interleaved_video_audio() {
+        let mut records = Vec::new();
+        records.extend_from_slice(&enc_record(0, 1000, 0x0000_0000, 1)); // V key
+        records.extend_from_slice(&enc_record(0x3e8, 200, 0xFFFF_FFFF, 1)); // A
+        records.extend_from_slice(&enc_record(0x4b0, 800, 0x8000_0014, 20)); // V inter
+        let entries: Vec<_> = Samples::new(&records).unwrap().collect();
+        assert!(matches!(entries[0].kind, SampleKind::VideoKeyframe { .. }));
+        assert!(matches!(entries[1].kind, SampleKind::Audio { .. }));
+        assert!(matches!(entries[2].kind, SampleKind::VideoInter { .. }));
+        if let SampleKind::VideoInter {
+            timestamp_ticks,
+            next_frame_ticks,
+        } = entries[2].kind
+        {
+            assert_eq!(timestamp_ticks, 0x14);
+            assert_eq!(next_frame_ticks, 20);
+        } else {
+            unreachable!();
+        }
+    }
+
+    /// Top bit set + non-zero low 31 bits ⇒ inter; timestamp is the
+    /// low 31 bits.
+    #[test]
+    fn samples_inter_timestamp_strips_top_bit() {
+        let rec = enc_record(0, 1234, 0x8000_007B, 5);
+        let mut it = Samples::new(&rec).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoInter {
+                timestamp_ticks: 0x7B,
+                next_frame_ticks: 5,
+            }
+        );
+    }
+
+    /// Top bit set with low 31 bits == max (0x7FFFFFFF) — saturates
+    /// at the 31-bit timestamp ceiling.
+    #[test]
+    fn samples_inter_timestamp_max_low31() {
+        let rec = enc_record(0, 0, 0xFFFF_FFFE, 1);
+        let mut it = Samples::new(&rec).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoInter {
+                timestamp_ticks: 0x7FFF_FFFE,
+                next_frame_ticks: 1,
+            }
+        );
+    }
+
+    /// Cursor + next_index advance one record at a time, matching the
+    /// per-iteration step of `SAMPLE_RECORD_SIZE` bytes.
+    #[test]
+    fn samples_cursor_and_next_index_advance() {
+        let mut records = Vec::new();
+        records.extend_from_slice(&enc_record(0, 100, 0, 1));
+        records.extend_from_slice(&enc_record(100, 200, 0x8000_0001, 1));
+        records.extend_from_slice(&enc_record(300, 0, 0xFFFF_FFFF, 1));
+        let mut it = Samples::new(&records).unwrap();
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.next_index(), 0);
+        it.next().unwrap();
+        assert_eq!(it.cursor(), SAMPLE_RECORD_SIZE);
+        assert_eq!(it.next_index(), 1);
+        it.next().unwrap();
+        assert_eq!(it.cursor(), 2 * SAMPLE_RECORD_SIZE);
+        assert_eq!(it.next_index(), 2);
+        it.next().unwrap();
+        assert_eq!(it.cursor(), 3 * SAMPLE_RECORD_SIZE);
+        assert_eq!(it.next_index(), 3);
+        assert!(it.next().is_none());
+        assert_eq!(it.remaining(), 0);
+    }
+
+    /// `ExactSizeIterator` reports the correct count both before and
+    /// after pulling items.
+    #[test]
+    fn samples_exact_size_hint() {
+        let records: Vec<u8> = (0..4u32)
+            .flat_map(|i| enc_record(i * 100, 100, 0x8000_0000 | i, 1).to_vec())
+            .collect();
+        let mut it = Samples::new(&records).unwrap();
+        assert_eq!(it.size_hint(), (4, Some(4)));
+        assert_eq!(it.len(), 4);
+        it.next();
+        assert_eq!(it.size_hint(), (3, Some(3)));
+        assert_eq!(it.len(), 3);
+        for _ in &mut it {}
+        assert_eq!(it.size_hint(), (0, Some(0)));
+    }
+
+    /// `Samples` is a `FusedIterator` — once exhausted, every
+    /// subsequent `next()` returns `None`.
+    #[test]
+    fn samples_fused_after_exhaustion() {
+        let rec = enc_record(0, 0, 0, 1);
+        let mut it = Samples::new(&rec).unwrap();
+        assert!(it.next().is_some());
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+    }
+
+    /// `records_bytes()` returns the original slice untouched.
+    #[test]
+    fn samples_records_bytes_round_trip() {
+        let records: Vec<u8> = (0..3u32)
+            .flat_map(|i| enc_record(i, i + 1, i + 2, i + 3).to_vec())
+            .collect();
+        let it = Samples::new(&records).unwrap();
+        assert_eq!(it.records_bytes(), &records[..]);
+    }
+
+    /// Per-yield classification matches the existing
+    /// `SampleRecord::is_audio` / `is_keyframe` predicates on the
+    /// underlying record — the iterator's typed enum is a strict
+    /// re-statement of those, not a re-interpretation.
+    #[test]
+    fn samples_kind_matches_record_predicates() {
+        let mut records = Vec::new();
+        records.extend_from_slice(&enc_record(0, 0, 0x0000_0000, 1)); // V key
+        records.extend_from_slice(&enc_record(0, 0, 0x8000_0005, 1)); // V inter
+        records.extend_from_slice(&enc_record(0, 0, 0xFFFF_FFFF, 1)); // Audio
+        for e in Samples::new(&records).unwrap() {
+            assert_eq!(e.kind.is_audio(), e.record.is_audio());
+            assert_eq!(e.kind.is_keyframe(), e.record.is_keyframe());
+        }
+    }
+
+    /// `Samples` driven over a real `FilmDemuxer`-built buffer
+    /// agrees with `FilmDemuxer::samples` field-by-field. This
+    /// validates that the typed iterator decodes the same wire bytes
+    /// the demuxer does.
+    #[test]
+    fn samples_agrees_with_film_demuxer() {
+        // Reuse the parser path: build a multi-record FILM, parse it,
+        // then re-walk the records via Samples::new from the raw
+        // STAB-records suffix of the buffer.
+        let mut out = build_minimal_film();
+        // Patch num_entries from 1 to 3 + append two records (audio + inter).
+        let num_off = 16 + 32 + 12;
+        out[num_off..num_off + 4].copy_from_slice(&3u32.to_be_bytes());
+        out.extend_from_slice(&enc_record(0x500, 100, 0xFFFF_FFFF, 1));
+        out.extend_from_slice(&enc_record(0x6c0, 400, 0x8000_0002, 1));
+        // Bump header_length to include the two extra 16-byte records.
+        out[4..8].copy_from_slice(&((80 + 32) as u32).to_be_bytes());
+        let dem = FilmDemuxer::parse(&out).unwrap();
+        assert_eq!(dem.samples.len(), 3);
+
+        // STAB records start after FILM header (16) + FDSC (32) +
+        // STAB header (16) = 64.
+        let records_start = 16 + 32 + 16;
+        let records_end = records_start + 3 * SAMPLE_RECORD_SIZE;
+        let it_records = &out[records_start..records_end];
+        let typed: Vec<_> = Samples::new(it_records).unwrap().collect();
+        assert_eq!(typed.len(), dem.samples.len());
+        for (e, expected) in typed.iter().zip(dem.samples.iter()) {
+            assert_eq!(e.record, *expected);
+        }
+        // First record is a keyframe (build_minimal_film default).
+        assert!(matches!(typed[0].kind, SampleKind::VideoKeyframe { .. }));
+        // Second record is the appended audio sentinel.
+        assert!(matches!(typed[1].kind, SampleKind::Audio { .. }));
+        // Third record is an inter frame at ts=2.
+        assert!(matches!(
+            typed[2].kind,
+            SampleKind::VideoInter {
+                timestamp_ticks: 2,
+                next_frame_ticks: 1,
+            }
+        ));
+    }
+
+    /// `SampleKind::from_record` is the single classification surface
+    /// — the iterator just re-uses it. Verify the standalone helper
+    /// matches the same set of wire patterns.
+    #[test]
+    fn sample_kind_from_record_standalone() {
+        let key = SampleRecord {
+            sample_offset: 0,
+            sample_length: 0,
+            sample_info_1: 0x0000_0042,
+            sample_info_2: 7,
+        };
+        assert_eq!(
+            SampleKind::from_record(key),
+            SampleKind::VideoKeyframe {
+                timestamp_ticks: 0x42,
+                next_frame_ticks: 7,
+            }
+        );
+        let inter = SampleRecord {
+            sample_offset: 0,
+            sample_length: 0,
+            sample_info_1: 0x8000_0042,
+            sample_info_2: 7,
+        };
+        assert_eq!(
+            SampleKind::from_record(inter),
+            SampleKind::VideoInter {
+                timestamp_ticks: 0x42,
+                next_frame_ticks: 7,
+            }
+        );
+        let audio_ok = SampleRecord {
+            sample_offset: 0,
+            sample_length: 0,
+            sample_info_1: 0xFFFF_FFFF,
+            sample_info_2: 1,
+        };
+        assert_eq!(
+            SampleKind::from_record(audio_ok),
+            SampleKind::Audio { well_formed: true }
+        );
+        let audio_bad = SampleRecord {
+            sample_offset: 0,
+            sample_length: 0,
+            sample_info_1: 0xFFFF_FFFF,
+            sample_info_2: 99,
+        };
+        assert_eq!(
+            SampleKind::from_record(audio_bad),
+            SampleKind::Audio { well_formed: false }
+        );
+    }
+
+    /// Top-bit clear with non-zero low 31 bits is still a keyframe
+    /// (only the top bit distinguishes intra-vs-inter, not the
+    /// timestamp value).
+    #[test]
+    fn samples_keyframe_with_nonzero_ts() {
+        let rec = enc_record(0, 0, 0x0000_03e8, 1);
+        let mut it = Samples::new(&rec).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoKeyframe {
+                timestamp_ticks: 1000,
+                next_frame_ticks: 1,
+            }
+        );
     }
 }

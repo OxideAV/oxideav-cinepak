@@ -631,6 +631,300 @@ impl<'a> Iterator for StripChunks<'a> {
     }
 }
 
+// ---------- CodebookEntries iterator (typed §3 + §4 walker) -------------
+
+/// A single codebook entry yielded by [`CodebookEntries`].
+///
+/// `slot` is the 0..=255 codebook slot the entry installs into (the
+/// per-group-flag-word bit position for selective-update chunks, or
+/// the chunk-relative position for full-replacement chunks). `entry`
+/// is the parsed [`CodebookEntry`] with `u`/`v` zeroed on grayscale
+/// chunks (`0x24xx`..=`0x27xx`).
+///
+/// Reference: spec §3 (full-replacement) + §4 (selective-update) of
+/// `docs/video/cinepak/spec/02-codebooks.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodebookEntryRecord {
+    /// 0-based slot index this entry installs into. For
+    /// full-replacement chunks (`0x2000` / `0x2200` / `0x2400` /
+    /// `0x2600`) this is the entry's position within the chunk
+    /// payload (entry 0 ⇒ slot 0, entry 1 ⇒ slot 1, …). For
+    /// selective-update chunks (`0x2100` / `0x2300` / `0x2500` /
+    /// `0x2700`) this is `group_base + bit_offset` where
+    /// `group_base ∈ {0, 32, 64, …, 224}` is the group's first slot
+    /// and `bit_offset ∈ 0..=31` is the per-bit position (spec §4.2:
+    /// bit 31 ⇒ slot 0 of the group, bit 0 ⇒ slot 31 of the group,
+    /// MSB-first scan).
+    pub slot: u16,
+    /// Parsed codebook entry. `u`/`v` are `0` when the chunk's
+    /// `PixelMode` is `Gray8` (4-byte entries).
+    pub entry: CodebookEntry,
+}
+
+/// Iterator over the codebook entries inside a single codebook chunk's
+/// payload.
+///
+/// Wire-format reference: spec §3 (full-replacement chunks `0x2000` /
+/// `0x2200` / `0x2400` / `0x2600`) and §4 (selective-update chunks
+/// `0x2100` / `0x2300` / `0x2500` / `0x2700`) of
+/// `docs/video/cinepak/spec/02-codebooks.md`.
+///
+/// The iterator walks the `chunk_size - 4` payload bytes that follow
+/// a codebook chunk's 4-byte chunk header — equivalently the
+/// `StripChunkEntry::payload` slice from a [`StripChunks`] yield
+/// whose `kind` is `StripChunkKind::Codebook(_)` — and yields one
+/// [`CodebookEntryRecord`] per occupied slot, in wire order. Both
+/// chunk styles flow through the same `Iterator::Item` shape so
+/// callers can drive a generic codebook accumulator with one loop
+/// regardless of full-vs-selective.
+///
+/// The iterator is read-only and **content-agnostic**: it does not
+/// touch a [`Codebook`] in place, leaving `apply_codebook_chunk` /
+/// `apply_codebook_chunk_with` out of the call path. Callers wanting
+/// to enumerate the per-slot wire structure of a chunk — validators,
+/// fuzz harnesses that need per-entry boundaries, or wire-format
+/// introspection tools — can take this single dependency instead of
+/// the in-place `Codebook` apply path.
+///
+/// ### Construction
+///
+/// [`CodebookEntries::new`] takes the chunk-payload byte slice and the
+/// chunk's classified [`CodebookChunkKind`] (i.e. the
+/// `StripChunkKind::Codebook(kind)` variant from [`StripChunks`]).
+/// Up-front validation:
+///
+/// - Full-replacement payloads must be a multiple of
+///   `kind.mode.entry_size()` (i.e. `% 6` for 12-bit YUV, `% 4` for
+///   grayscale) and may carry at most `256` entries; the constructor
+///   returns `Err` otherwise. The Sega Saturn deviant 0x5FC-byte
+///   trailing-pad path is **not** supported on this iterator — it
+///   remains under `apply_codebook_chunk_with(..., tolerate_trailing:
+///   true)` per `Sega_FILM.wiki` line 143.
+/// - Selective-update payloads are validated **lazily** during the
+///   walk (per-group; truncation mid-flag-word or mid-entry is
+///   reported per-yield as `Some(Err(_))` and the iterator fuses).
+///
+/// ### Error semantics
+///
+/// `next()` returns `Some(Err(_))` once on the first malformed group
+/// (selective-update only) and `None` on every subsequent call — the
+/// iterator **fuses** itself on error. Full-replacement walks are
+/// infallible after construction.
+///
+/// ### Empty / header-only chunks
+///
+/// A header-only chunk (spec §3.4, `chunk_size = 0x0004`, zero
+/// payload bytes) returns `None` on the first `next()` call for both
+/// full-replacement and selective-update kinds. The header-only
+/// chunk signals "no update" / "reuse the previous codebook"
+/// (spec §3.4) which is correctly modelled by an empty iterator.
+///
+/// ### Composition with [`StripChunks`]
+///
+/// ```ignore
+/// use oxideav_cinepak::{StripChunks, StripChunkKind, CodebookEntries};
+/// for chunk in StripChunks::new(strip_payload).flatten() {
+///     if let StripChunkKind::Codebook(kind) = chunk.kind {
+///         let entries = CodebookEntries::new(kind, chunk.payload)?;
+///         for entry in entries {
+///             let entry = entry?;
+///             // process (entry.slot, entry.entry) …
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CodebookEntries<'a> {
+    /// Chunk-payload slice. The iterator only ever reads within this
+    /// slice.
+    payload: &'a [u8],
+    /// Pixel mode of the chunk (determines entry stride and chroma
+    /// presence per spec §2.1).
+    mode: PixelMode,
+    /// Whether the chunk is full-replacement or selective-update.
+    style: UpdateStyle,
+    /// Byte offset of the next read within `payload`.
+    cursor: usize,
+    /// Next slot to yield. For full-replacement this advances by `1`
+    /// per yield (`0`, `1`, `2`, …). For selective-update this
+    /// advances by `1` per group-bit-position scanned; on a set bit
+    /// the iterator yields the slot, on a clear bit it advances
+    /// silently.
+    next_slot: u16,
+    /// Selective-update group state: cached flag word + the
+    /// `0..=31` bit-scan position within it. `None` between groups
+    /// or when there is no more payload.
+    group: Option<(u32, u8)>,
+    /// One-shot fuse — set when an error is yielded so subsequent
+    /// `next()` calls return `None`.
+    fused: bool,
+}
+
+impl<'a> CodebookEntries<'a> {
+    /// Build a codebook-entry iterator over a single codebook chunk's
+    /// `payload`.
+    ///
+    /// `kind` is the classified codebook chunk kind (which codebook,
+    /// what update style, what pixel mode) — typically the
+    /// `StripChunkKind::Codebook(_)` value from [`StripChunks`].
+    /// `payload` is the `chunk_size - 4` bytes following the 4-byte
+    /// chunk header.
+    ///
+    /// Returns `Err` only for the up-front full-replacement
+    /// validation failures listed in the type docs (non-multiple-of-
+    /// entry-size payload length or `>256` entries); selective-update
+    /// errors are reported per-yield during the walk.
+    pub fn new(kind: CodebookChunkKind, payload: &'a [u8]) -> Result<Self> {
+        if kind.style == UpdateStyle::Full {
+            let entry_size = kind.mode.entry_size();
+            if payload.len() % entry_size != 0 {
+                return Err(CinepakError::invalid(format!(
+                    "full-replace codebook payload size {} not a multiple of entry size {entry_size}",
+                    payload.len()
+                )));
+            }
+            let n = payload.len() / entry_size;
+            if n > 256 {
+                return Err(CinepakError::invalid(format!(
+                    "full-replace codebook has {n} entries (> 256 max)"
+                )));
+            }
+        }
+        Ok(Self {
+            payload,
+            mode: kind.mode,
+            style: kind.style,
+            cursor: 0,
+            next_slot: 0,
+            group: None,
+            fused: false,
+        })
+    }
+
+    /// Pixel mode of the chunk being walked.
+    pub fn mode(&self) -> PixelMode {
+        self.mode
+    }
+
+    /// Update style of the chunk being walked.
+    pub fn style(&self) -> UpdateStyle {
+        self.style
+    }
+
+    /// Byte offset of the next read within the chunk payload. Useful
+    /// for error reporting when integrating with a higher-level
+    /// strip / chunk walker.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Number of payload bytes remaining (unread). Exact for both
+    /// chunk styles; for selective-update walks this includes the
+    /// per-group flag-word bytes that the iterator still has to
+    /// consume.
+    pub fn remaining_bytes(&self) -> usize {
+        self.payload.len().saturating_sub(self.cursor)
+    }
+
+    /// Underlying chunk-payload slice.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+impl<'a> Iterator for CodebookEntries<'a> {
+    type Item = Result<CodebookEntryRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
+        let entry_size = self.mode.entry_size();
+        match self.style {
+            UpdateStyle::Full => {
+                // Length-validated at construction. Just read sequentially.
+                if self.cursor + entry_size > self.payload.len() {
+                    return None;
+                }
+                let entry = read_entry(
+                    self.mode,
+                    &self.payload[self.cursor..self.cursor + entry_size],
+                );
+                let slot = self.next_slot;
+                self.cursor += entry_size;
+                self.next_slot += 1;
+                Some(Ok(CodebookEntryRecord { slot, entry }))
+            }
+            UpdateStyle::Selective => loop {
+                // Load the next group if we're not inside one.
+                if self.group.is_none() {
+                    if self.cursor >= self.payload.len() {
+                        // Clean end-of-payload.
+                        return None;
+                    }
+                    if self.next_slot >= 256 {
+                        self.fused = true;
+                        return Some(Err(CinepakError::invalid(
+                            "selective-update codebook overruns 256 slots",
+                        )));
+                    }
+                    if self.payload.len() - self.cursor < 4 {
+                        self.fused = true;
+                        return Some(Err(CinepakError::invalid(
+                            "selective-update codebook truncated mid-flag-word",
+                        )));
+                    }
+                    let flag = u32::from_be_bytes([
+                        self.payload[self.cursor],
+                        self.payload[self.cursor + 1],
+                        self.payload[self.cursor + 2],
+                        self.payload[self.cursor + 3],
+                    ]);
+                    self.cursor += 4;
+                    self.group = Some((flag, 0));
+                }
+                // Walk the current group's 32 bits looking for a set bit.
+                let (flag, mut bit) = self.group.unwrap();
+                while bit < 32 {
+                    // Guard the 256-slot ceiling: stop scanning the
+                    // group early if the next bit would address slot
+                    // >= 256.
+                    if self.next_slot >= 256 {
+                        // Trailing payload after the 8th group is an
+                        // overrun — surface it on the next outer
+                        // iteration via the slot-base check above.
+                        self.group = None;
+                        break;
+                    }
+                    let mask = 1u32 << (31 - bit);
+                    let bit_set = flag & mask != 0;
+                    let slot = self.next_slot;
+                    self.next_slot += 1;
+                    bit += 1;
+                    if bit_set {
+                        if self.payload.len() - self.cursor < entry_size {
+                            self.fused = true;
+                            return Some(Err(CinepakError::invalid(
+                                "selective-update codebook truncated mid-entry",
+                            )));
+                        }
+                        let entry = read_entry(
+                            self.mode,
+                            &self.payload[self.cursor..self.cursor + entry_size],
+                        );
+                        self.cursor += entry_size;
+                        self.group = Some((flag, bit));
+                        return Some(Ok(CodebookEntryRecord { slot, entry }));
+                    }
+                }
+                // Exhausted the group's 32 bits without finding a set
+                // bit — fall through to load the next group.
+                self.group = None;
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,5 +1419,406 @@ mod tests {
         let _ = it.next().unwrap().unwrap();
         assert_eq!(it.cursor(), 14);
         assert!(it.next().is_none());
+    }
+
+    // ---------- CodebookEntries (typed §3 + §4 walker) tests -----------
+
+    /// Spec §3.1 fixture `T1a` — solid red V1 chunk (`0x2200`) with a
+    /// single 6-byte entry `48 48 48 48 db 5a` ⇒ slot 0 carries
+    /// `(72, 72, 72, 72, -37, +90)`. Cross-checks the typed walker
+    /// against the in-place `apply_codebook_chunk` path.
+    #[test]
+    fn codebook_entries_full_replace_t1a_single_entry() {
+        let kind = CodebookChunkKind::from_id(0x2200).unwrap();
+        let payload = [0x48u8, 0x48, 0x48, 0x48, 0xdb, 0x5a];
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 0);
+        assert_eq!(
+            entries[0].entry,
+            CodebookEntry::from_yuv(72, 72, 72, 72, -37, 90)
+        );
+    }
+
+    /// Full-replacement walker covers the 12-bit YUV happy path with
+    /// three sequential slots and stops cleanly at end-of-payload.
+    #[test]
+    fn codebook_entries_full_replace_walks_sequential_slots() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        let payload = [
+            10, 20, 30, 40, 5, 6, // slot 0
+            50, 60, 70, 80, 7, 8, // slot 1
+            90, 100, 110, 120, 9, 10, // slot 2
+        ];
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].slot, 0);
+        assert_eq!(entries[1].slot, 1);
+        assert_eq!(entries[2].slot, 2);
+        assert_eq!(
+            entries[0].entry,
+            CodebookEntry::from_yuv(10, 20, 30, 40, 5, 6)
+        );
+        assert_eq!(
+            entries[2].entry,
+            CodebookEntry::from_yuv(90, 100, 110, 120, 9, 10)
+        );
+    }
+
+    /// Grayscale full-replacement (`0x2400`) uses 4-byte entries with
+    /// `u`/`v` zeroed.
+    #[test]
+    fn codebook_entries_full_replace_gray8_4byte_entries() {
+        let kind = CodebookChunkKind::from_id(0x2400).unwrap();
+        let payload = [
+            11, 22, 33, 44, // slot 0
+            55, 66, 77, 88, // slot 1
+        ];
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entry, CodebookEntry::from_y(11, 22, 33, 44));
+        assert_eq!(entries[0].entry.u, 0);
+        assert_eq!(entries[0].entry.v, 0);
+        assert_eq!(entries[1].entry, CodebookEntry::from_y(55, 66, 77, 88));
+    }
+
+    /// Header-only chunk (spec §3.4, `chunk_size = 0x0004`, zero
+    /// payload bytes) yields zero entries — empty iterator models the
+    /// "no update / reuse previous codebook" signal correctly. Both
+    /// full-replacement and selective-update kinds behave the same.
+    #[test]
+    fn codebook_entries_header_only_yields_none() {
+        let full = CodebookChunkKind::from_id(0x2000).unwrap();
+        let sel = CodebookChunkKind::from_id(0x2300).unwrap();
+        let empty: &[u8] = &[];
+        assert!(CodebookEntries::new(full, empty).unwrap().next().is_none());
+        assert!(CodebookEntries::new(sel, empty).unwrap().next().is_none());
+    }
+
+    /// Full-replacement payload length not a multiple of `entry_size`
+    /// is rejected at construction (rather than per-yield) per the
+    /// type docs.
+    #[test]
+    fn codebook_entries_full_replace_misaligned_payload_rejected() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        // 7 bytes is not a multiple of 6 (12-bit YUV entry size).
+        let payload = [1u8, 2, 3, 4, 5, 6, 7];
+        assert!(CodebookEntries::new(kind, &payload).is_err());
+    }
+
+    /// Full-replacement chunk with > 256 entries is rejected at
+    /// construction (the wire format caps the codebook at 256 slots
+    /// per spec §3.1).
+    #[test]
+    fn codebook_entries_full_replace_over_256_entries_rejected() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        // 257 entries × 6 bytes = 1542 bytes.
+        let payload = vec![0u8; 257 * 6];
+        assert!(CodebookEntries::new(kind, &payload).is_err());
+    }
+
+    /// Selective-update single-bit walker: bit 31 of group 0 ⇒ slot 0.
+    /// Cross-checked against `apply_selective_single_bit`.
+    #[test]
+    fn codebook_entries_selective_single_bit_msb_slot0() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut payload = vec![0x80, 0x00, 0x00, 0x00]; // bit 31 = slot 0
+        payload.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 0);
+        assert_eq!(
+            entries[0].entry,
+            CodebookEntry::from_yuv(0x10, 0x20, 0x30, 0x40, 0x50, 0x60)
+        );
+    }
+
+    /// Selective-update bit-scan direction (spec §4.2: MSB-first;
+    /// bit 0 of the flag word ⇒ slot 31 of the group). Cross-checks
+    /// `selective_bit_scan_msb_first`.
+    #[test]
+    fn codebook_entries_selective_bit_scan_msb_first() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut payload = vec![0x00, 0x00, 0x00, 0x01]; // bit 0 = slot 31
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 31);
+        assert_eq!(entries[0].entry, CodebookEntry::from_yuv(1, 2, 3, 4, 5, 6));
+    }
+
+    /// Selective-update across multiple groups: slots 33 (group 1
+    /// bit 30) + 255 (group 7 bit 0) in one chunk, with intermediate
+    /// all-zero groups consumed silently. Verifies `group_base + bit`
+    /// arithmetic and per-group flag-word advance.
+    #[test]
+    fn codebook_entries_selective_multi_group() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        // Group 0: no bits.
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00];
+        // Group 1: bit 30 ⇒ slot 33 (32 + 1).
+        payload.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[11, 12, 13, 14, 15, 16]);
+        // Groups 2..=6: no bits.
+        for _ in 0..5 {
+            payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        }
+        // Group 7: bit 0 ⇒ slot 255.
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        payload.extend_from_slice(&[21, 22, 23, 24, 25, 26]);
+
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].slot, 33);
+        assert_eq!(
+            entries[0].entry,
+            CodebookEntry::from_yuv(11, 12, 13, 14, 15, 16)
+        );
+        assert_eq!(entries[1].slot, 255);
+        assert_eq!(
+            entries[1].entry,
+            CodebookEntry::from_yuv(21, 22, 23, 24, 25, 26)
+        );
+    }
+
+    /// Selective-update grayscale (`0x2500`) — 4-byte entries.
+    /// Bit 30 of group 1 ⇒ slot 33.
+    #[test]
+    fn codebook_entries_selective_gray_4byte_entries() {
+        let kind = CodebookChunkKind::from_id(0x2500).unwrap();
+        let mut payload = vec![0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[11, 22, 33, 44]);
+        let entries: Vec<_> = CodebookEntries::new(kind, &payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 33);
+        assert_eq!(entries[0].entry, CodebookEntry::from_y(11, 22, 33, 44));
+    }
+
+    /// Selective-update truncated mid-flag-word fuses with a per-yield
+    /// error.
+    #[test]
+    fn codebook_entries_selective_fuses_on_truncated_flag_word() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let payload = vec![0x00, 0x00, 0x00]; // 3 bytes — flag word needs 4
+        let mut it = CodebookEntries::new(kind, &payload).unwrap();
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// Selective-update truncated mid-entry (group's flag word reads a
+    /// set bit but the entry bytes are missing) fuses with a per-yield
+    /// error.
+    #[test]
+    fn codebook_entries_selective_fuses_on_truncated_entry() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut payload = vec![0x80, 0x00, 0x00, 0x00]; // bit 31 ⇒ slot 0
+        payload.extend_from_slice(&[1, 2, 3]); // 3 bytes — entry needs 6
+        let mut it = CodebookEntries::new(kind, &payload).unwrap();
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+    }
+
+    /// Selective-update with a 9th group's worth of payload after the
+    /// 8-group ceiling is reached (spec §4.3 cap "max of eight groups
+    /// per chunk to span the full 256-entry codebook") fuses with an
+    /// overrun error.
+    #[test]
+    fn codebook_entries_selective_fuses_on_overrun_past_256_slots() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        // 8 empty groups (0 bits each) = 32 bytes ⇒ slots 0..=255 all
+        // walked silently.
+        let mut payload = vec![0u8; 8 * 4];
+        // 9th group's flag word — pushes the iterator past the 256-slot
+        // ceiling.
+        payload.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let mut it = CodebookEntries::new(kind, &payload).unwrap();
+        // All 8 valid groups carry no entries — drain the 256-slot scan.
+        // Then the 9th group surfaces the overrun.
+        let mut saw_error = false;
+        loop {
+            match it.next() {
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => {
+                    saw_error = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        assert!(saw_error, "expected an error on 9th-group overrun");
+        assert!(it.next().is_none());
+    }
+
+    /// Walker output for `0x2300` selective-update agrees with the
+    /// in-place `apply_codebook_chunk` path on `encode_selective_chunk`
+    /// output across a multi-slot multi-group fixture (slots 0 + 33 +
+    /// 200, mirroring `selective_chunk_encode_roundtrip`).
+    #[test]
+    fn codebook_entries_cross_check_apply_path_selective_roundtrip() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut cb = Codebook::default();
+        cb.entries[0] = CodebookEntry::from_yuv(1, 2, 3, 4, 5, 6);
+        cb.entries[33] = CodebookEntry::from_yuv(7, 8, 9, 10, 11, 12);
+        cb.entries[200] = CodebookEntry::from_yuv(13, 14, 15, 16, -1, -2);
+        let slots = [0u8, 33, 200];
+        let mut buf = Vec::new();
+        encode_selective_chunk(kind, &cb, &slots, &mut buf);
+
+        // Reference: in-place apply.
+        let payload = &buf[CHUNK_HEADER_SIZE..];
+        let mut ref_cb = Codebook::default();
+        apply_codebook_chunk(kind, payload, &mut ref_cb).unwrap();
+
+        // Walker: iterate and rebuild a codebook from the yields.
+        let mut walked_cb = Codebook::default();
+        let mut count = 0;
+        for record in CodebookEntries::new(kind, payload).unwrap() {
+            let r = record.unwrap();
+            walked_cb.entries[r.slot as usize] = r.entry;
+            count += 1;
+        }
+        assert_eq!(count, slots.len());
+        for &s in &slots {
+            assert_eq!(walked_cb.entries[s as usize], ref_cb.entries[s as usize]);
+        }
+    }
+
+    /// Walker output for `0x2000` full-replacement agrees with the
+    /// in-place `apply_codebook_chunk` path on `encode_full_chunk`
+    /// output across a multi-entry fixture.
+    #[test]
+    fn codebook_entries_cross_check_apply_path_full_replace() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        let mut cb = Codebook::default();
+        for i in 0..16u8 {
+            cb.entries[i as usize] = CodebookEntry::from_yuv(
+                i.wrapping_mul(3),
+                i.wrapping_mul(5),
+                i.wrapping_mul(7),
+                i.wrapping_mul(11),
+                i as i8,
+                -(i as i8),
+            );
+        }
+        let mut buf = Vec::new();
+        encode_full_chunk(kind, &cb, 16, &mut buf);
+        let payload = &buf[CHUNK_HEADER_SIZE..];
+
+        let mut ref_cb = Codebook::default();
+        apply_codebook_chunk(kind, payload, &mut ref_cb).unwrap();
+
+        let walked: Vec<_> = CodebookEntries::new(kind, payload)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(walked.len(), 16);
+        for (i, w) in walked.iter().enumerate() {
+            assert_eq!(w.slot as usize, i);
+            assert_eq!(w.entry, ref_cb.entries[i]);
+        }
+    }
+
+    /// `mode()` / `style()` / `cursor()` / `remaining_bytes()` /
+    /// `payload()` accessors round out the typed surface.
+    #[test]
+    fn codebook_entries_accessors_track_state() {
+        let kind = CodebookChunkKind::from_id(0x2000).unwrap();
+        let payload = [
+            10, 20, 30, 40, 5, 6, // slot 0
+            50, 60, 70, 80, 7, 8, // slot 1
+        ];
+        let mut it = CodebookEntries::new(kind, &payload).unwrap();
+        assert_eq!(it.mode(), PixelMode::Yuv12);
+        assert_eq!(it.style(), UpdateStyle::Full);
+        assert_eq!(it.cursor(), 0);
+        assert_eq!(it.remaining_bytes(), 12);
+        assert_eq!(it.payload().len(), 12);
+
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 6);
+        assert_eq!(it.remaining_bytes(), 6);
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 12);
+        assert_eq!(it.remaining_bytes(), 0);
+        assert!(it.next().is_none());
+    }
+
+    /// Selective-update cursor tracks the per-yield read advance —
+    /// after a single slot-0 yield the cursor should sit at
+    /// `4 (flag word) + entry_size (6)` = 10.
+    #[test]
+    fn codebook_entries_selective_cursor_advances_past_flag_and_entry() {
+        let kind = CodebookChunkKind::from_id(0x2300).unwrap();
+        let mut payload = vec![0x80, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let mut it = CodebookEntries::new(kind, &payload).unwrap();
+        assert_eq!(it.cursor(), 0);
+        let _ = it.next().unwrap().unwrap();
+        assert_eq!(it.cursor(), 10);
+        assert!(it.next().is_none());
+    }
+
+    /// Composition with [`StripChunks`]: feed a strip-payload buffer
+    /// through `StripChunks`, route each codebook chunk's payload into
+    /// `CodebookEntries`, and verify the entries reconstruct the
+    /// expected per-slot state without ever calling
+    /// `apply_codebook_chunk`. Fixture: spec §3.1 `T1a` solid-red V1
+    /// chunk emitted alongside a header-only V4 chunk per §2.2's
+    /// V4-then-V1 ordering.
+    #[test]
+    fn codebook_entries_composes_with_strip_chunks() {
+        // Strip payload: header-only 0x2000 (V4 full, no entries) +
+        // single-entry 0x2200 (V1 full, T1a fixture).
+        let mut strip_payload = Vec::new();
+        strip_payload.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]); // 0x2000 header-only
+        strip_payload.extend_from_slice(&[0x22, 0x00, 0x00, 0x0a]); // 0x2200 size=10
+        strip_payload.extend_from_slice(&[0x48, 0x48, 0x48, 0x48, 0xdb, 0x5a]);
+
+        let mut v4_entries = Vec::new();
+        let mut v1_entries = Vec::new();
+        for chunk in StripChunks::new(&strip_payload) {
+            let chunk = chunk.unwrap();
+            if let StripChunkKind::Codebook(kind) = chunk.kind {
+                let walker = CodebookEntries::new(kind, chunk.payload).unwrap();
+                for record in walker {
+                    let r = record.unwrap();
+                    match kind.which {
+                        WhichCodebook::V4 => v4_entries.push(r),
+                        WhichCodebook::V1 => v1_entries.push(r),
+                    }
+                }
+            }
+        }
+        // V4: header-only ⇒ zero entries.
+        assert!(v4_entries.is_empty());
+        // V1: single entry at slot 0.
+        assert_eq!(v1_entries.len(), 1);
+        assert_eq!(v1_entries[0].slot, 0);
+        assert_eq!(
+            v1_entries[0].entry,
+            CodebookEntry::from_yuv(72, 72, 72, 72, -37, 90)
+        );
     }
 }

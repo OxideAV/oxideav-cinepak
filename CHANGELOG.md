@@ -8,6 +8,80 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 256 (typed codebook-chunk-payload entry walker): new
+  `codebook::CodebookEntries` iterator at `src/codebook.rs`
+  implementing spec §3 (full-replacement chunks `0x2000` /
+  `0x2200` / `0x2400` / `0x2600`) and §4 (selective-update chunks
+  `0x2100` / `0x2300` / `0x2500` / `0x2700`) of
+  `docs/video/cinepak/spec/02-codebooks.md` — the per-slot wire
+  structure of a codebook chunk's `chunk_size - 4` payload bytes.
+  `CodebookEntries::new(kind, payload)` takes a chunk-payload
+  byte slice and the classified `CodebookChunkKind` (typically
+  the `StripChunkKind::Codebook(_)` value yielded by the
+  round-243 `StripChunks` iterator) and yields one
+  `Result<CodebookEntryRecord>` per occupied slot, in wire order.
+  Both chunk styles flow through the same `Iterator::Item` shape
+  (`CodebookEntryRecord { slot: u16, entry: CodebookEntry }`) so
+  callers can drive a generic codebook accumulator with one loop
+  regardless of full-vs-selective: full-replacement walks yield
+  slots `0`, `1`, …, `N-1` in payload order; selective-update
+  walks yield slots `group_base + bit_offset` where `group_base
+  ∈ {0, 32, 64, …, 224}` is the group's first slot and
+  `bit_offset ∈ 0..=31` is the per-bit position with bit 31
+  (MSB-first scan per spec §4.2) ⇒ slot 0 of the group, bit 0 ⇒
+  slot 31 of the group. The walker is read-only and
+  content-agnostic — `apply_codebook_chunk` /
+  `apply_codebook_chunk_with` stay in the in-place decoder path.
+  Callers wanting per-slot wire boundaries (validators, fuzz
+  harnesses that need per-entry granularity, wire-format
+  introspection tools) can take this single dependency without
+  pulling in the full `Codebook` apply path. Up-front validation:
+  full-replacement payloads must be a multiple of
+  `kind.mode.entry_size()` and ≤ 256 entries (rejected at
+  construction); selective-update payloads are validated lazily
+  per-yield. The Sega Saturn deviant 0x5FC-byte trailing-pad
+  variant per `Sega_FILM.wiki` line 143 stays under
+  `apply_codebook_chunk_with(..., tolerate_trailing: true)` — the
+  typed walker is strict. Header-only chunks (spec §3.4,
+  `chunk_size = 0x0004`) yield zero entries (empty iterator
+  correctly models the "no update / reuse previous codebook"
+  signal). Truncation (mid-flag-word / mid-entry) and >256-slot
+  overrun on selective-update payloads are reported per-yield as
+  `Some(Err(_))` and the iterator fuses to `None` afterwards.
+  `mode()`, `style()`, `cursor()`, `remaining_bytes()`,
+  `payload()` accessors round out the typed surface. The §3-§4
+  capstone for the per-strip-chunk typed surface: r240
+  (`FrameStrips`, frame → strips) + r243 (`StripChunks`, strip
+  → chunks) + r246 (`V1OnlyMacroblocks`, `0x3200` MB-stream) +
+  r250 (`MixedIntraMacroblocks`, `0x3000` MB-stream) + r253
+  (`InterMacroblocks`, `0x3100` MB-stream) + r256
+  (`CodebookEntries`, codebook-chunk payload) — every layer of
+  the wire format from frame down to per-slot / per-macroblock
+  now has a read-only typed iterator that composes back up to
+  `StripChunks` via `StripChunkEntry::payload`. Tests at
+  `src/codebook.rs::tests` (18 added) exercise: spec §3.1 fixture
+  `T1a` (single-entry 0x2200 ⇒ slot 0 carries
+  `(72, 72, 72, 72, -37, +90)`), sequential-slot full-replacement
+  happy path (3-slot 0x2000), grayscale full-replacement
+  (`0x2400` 4-byte entries, `u`/`v` zeroed), header-only
+  chunk-yields-none for both styles, full-replacement
+  misaligned-payload + >256-entry construction-time rejection,
+  selective-update single-bit `bit 31 ⇒ slot 0`, MSB-first scan
+  direction (`bit 0 ⇒ slot 31`), multi-group walk (slot 33 in
+  group 1 + slot 255 in group 7 with intermediate all-zero
+  groups), grayscale selective-update (`0x2500`),
+  truncated-mid-flag-word fuse, truncated-mid-entry fuse,
+  9th-group overrun-past-256-slots fuse, cross-check vs
+  `apply_codebook_chunk` on `encode_selective_chunk` output
+  (slots 0 + 33 + 200), cross-check vs `apply_codebook_chunk` on
+  `encode_full_chunk` output (16 entries), accessor advance
+  contract for full-replacement, selective cursor advance past
+  flag-word + entry, and end-to-end composition with
+  `StripChunks` (a header-only 0x2000 + single-entry 0x2200
+  strip-payload pair driven through both iterators without ever
+  touching `apply_codebook_chunk`). New public exports from the
+  crate root: `CodebookEntries`, `CodebookEntryRecord`.
+
 - Round 253 (typed `0x3100` per-macroblock walker): new
   `vector::InterMacroblocks` iterator at `src/vector.rs`
   implementing spec §3.3 of

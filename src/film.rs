@@ -687,6 +687,13 @@ fn pcm_sign_convention_for(version: &[u8; 4]) -> PcmSignConvention {
     }
 }
 
+/// Size of the STAB chunk's fixed header on the wire, in bytes:
+/// signature (4) + chunk length (4) + base_frequency (4) +
+/// num_entries (4). The per-record sample table starts at this
+/// offset. Reference: `Sega_FILM.wiki` lines 84-91
+/// (`docs/video/cinepak/reference/wiki/Sega_FILM.wiki`).
+pub const STAB_HEADER_SIZE: usize = 16;
+
 /// Sample Table (`STAB`) header (excluding the per-sample records).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StabHeader {
@@ -694,6 +701,90 @@ pub struct StabHeader {
     pub base_frequency: u32,
     /// Number of 16-byte sample records that follow.
     pub num_entries: u32,
+}
+
+impl StabHeader {
+    /// Parse a STAB chunk's fixed 16-byte header from `chunk` and
+    /// return the parsed [`StabHeader`] paired with the records-only
+    /// byte slice that follows it — exactly the slice
+    /// [`Samples::new`] expects.
+    ///
+    /// `chunk` is the STAB chunk starting at its `'STAB'` signature:
+    /// equivalently, the suffix of a FILM header buffer at offset
+    /// `FILM_HEADER_MIN_SIZE + fdsc_len`. The layout (per
+    /// `Sega_FILM.wiki` lines 84-91,
+    /// `docs/video/cinepak/reference/wiki/Sega_FILM.wiki`) is:
+    ///
+    /// - bytes 0-3   `'STAB'` chunk signature
+    /// - bytes 4-7   length of STAB chunk (validation only — see below)
+    /// - bytes 8-11  framerate base frequency in Hz
+    /// - bytes 12-15 number of entries in the sample table
+    /// - bytes 16-n  sample table (`num_entries * 16` bytes)
+    ///
+    /// This is the container-side bridge that hands the records slice
+    /// straight to the r261 [`Samples`] walker without round-tripping
+    /// through [`FilmDemuxer::parse`] (which allocates a
+    /// `Vec<SampleRecord>`). A caller that only wants to walk the
+    /// typed sample stream — a partial-header streamer, a validator,
+    /// a demuxer sharing STAB parsing with a sister format — can do
+    /// `let (hdr, recs) = StabHeader::parse_chunk(chunk)?;` then
+    /// `Samples::new(recs)?`.
+    ///
+    /// The returned slice is bounded to exactly `num_entries * 16`
+    /// bytes; any trailing bytes in `chunk` beyond the declared record
+    /// table are not returned. The STAB `length` field at bytes 4-7 is
+    /// **not** used for offset arithmetic — `Sega_FILM.wiki` line 92
+    /// records that some titles (e.g. Burning Rangers, version `'1.09'`)
+    /// omit the first 16 bytes from that field — so it is read only to
+    /// be carried forward as a structural sanity value; correctness
+    /// relies on `num_entries` alone.
+    ///
+    /// # Errors
+    ///
+    /// - the chunk is shorter than [`STAB_HEADER_SIZE`];
+    /// - bytes 0-3 are not the `'STAB'` signature;
+    /// - the declared `num_entries * 16` records overrun `chunk`.
+    pub fn parse_chunk(chunk: &[u8]) -> Result<(Self, &[u8])> {
+        if chunk.len() < STAB_HEADER_SIZE {
+            return Err(CinepakError::invalid(format!(
+                "STAB: chunk header truncated ({} < {STAB_HEADER_SIZE})",
+                chunk.len()
+            )));
+        }
+        if &chunk[0..4] != STAB_SIGNATURE {
+            return Err(CinepakError::invalid(format!(
+                "STAB: expected 'STAB' signature, got {:?}",
+                &chunk[0..4]
+            )));
+        }
+        // bytes 4-7: chunk length — validation/sanity only, not used
+        // for offset arithmetic (Sega_FILM.wiki line 92).
+        let _chunk_length = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
+        let base_frequency = u32::from_be_bytes(chunk[8..12].try_into().unwrap());
+        let num_entries = u32::from_be_bytes(chunk[12..16].try_into().unwrap());
+        let needed = (num_entries as usize)
+            .checked_mul(SAMPLE_RECORD_SIZE)
+            .ok_or_else(|| {
+                CinepakError::invalid(format!(
+                    "STAB: num_entries {num_entries} overflows record-table size"
+                ))
+            })?;
+        let records_end = STAB_HEADER_SIZE
+            .checked_add(needed)
+            .ok_or_else(|| CinepakError::invalid("STAB: record-table extent overflows usize"))?;
+        if chunk.len() < records_end {
+            return Err(CinepakError::invalid(format!(
+                "STAB: sample records truncated ({} needed, {} available)",
+                needed,
+                chunk.len() - STAB_HEADER_SIZE
+            )));
+        }
+        let header = StabHeader {
+            base_frequency,
+            num_entries,
+        };
+        Ok((header, &chunk[STAB_HEADER_SIZE..records_end]))
+    }
 }
 
 /// One row of the STAB sample table.
@@ -2412,5 +2503,181 @@ mod tests {
                 next_frame_ticks: 1,
             }
         );
+    }
+
+    // ---- StabHeader::parse_chunk -- STAB chunk header → records slice ---
+
+    /// Helper to build a STAB chunk: 16-byte header (signature,
+    /// length, base_frequency, num_entries) followed by the raw
+    /// concatenated record bytes. `chunk_length` lets a test choose
+    /// whether the on-wire length field accounts for the first 16
+    /// bytes (it is validation-only and must not affect parsing).
+    fn enc_stab_chunk(base_freq: u32, records: &[u8], chunk_length: u32) -> Vec<u8> {
+        assert_eq!(records.len() % 16, 0);
+        let num_entries = (records.len() / 16) as u32;
+        let mut out = Vec::with_capacity(16 + records.len());
+        out.extend_from_slice(b"STAB");
+        out.extend_from_slice(&chunk_length.to_be_bytes());
+        out.extend_from_slice(&base_freq.to_be_bytes());
+        out.extend_from_slice(&num_entries.to_be_bytes());
+        out.extend_from_slice(records);
+        out
+    }
+
+    #[test]
+    fn stab_header_const_matches_record_header_split() {
+        // The STAB fixed header is the same 16 bytes the FILM demuxer
+        // skips before the record table.
+        assert_eq!(STAB_HEADER_SIZE, 16);
+    }
+
+    #[test]
+    fn stab_parse_chunk_empty_table() {
+        let chunk = enc_stab_chunk(30, &[], 16);
+        let (hdr, recs) = StabHeader::parse_chunk(&chunk).unwrap();
+        assert_eq!(hdr.base_frequency, 30);
+        assert_eq!(hdr.num_entries, 0);
+        assert!(recs.is_empty());
+        // Records slice feeds Samples::new with no rows.
+        let it = Samples::new(recs).unwrap();
+        assert_eq!(it.remaining(), 0);
+    }
+
+    #[test]
+    fn stab_parse_chunk_single_record_feeds_samples() {
+        let rec = enc_record(0, 500, 0x0000_0000, 1);
+        let chunk = enc_stab_chunk(600, &rec, 16 + 16);
+        let (hdr, recs) = StabHeader::parse_chunk(&chunk).unwrap();
+        assert_eq!(hdr.base_frequency, 600);
+        assert_eq!(hdr.num_entries, 1);
+        assert_eq!(recs.len(), 16);
+        assert_eq!(recs, &rec[..]);
+        let mut it = Samples::new(recs).unwrap();
+        let e = it.next().unwrap();
+        assert_eq!(e.index, 0);
+        assert_eq!(e.record.sample_length, 500);
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoKeyframe {
+                timestamp_ticks: 0,
+                next_frame_ticks: 1,
+            }
+        );
+        assert!(it.next().is_none());
+    }
+
+    /// The C3-style 5-sample table: parse_chunk + Samples must yield
+    /// the same classified stream the round-261 records-only test
+    /// produced.
+    #[test]
+    fn stab_parse_chunk_c3_five_samples() {
+        let mut records = Vec::with_capacity(5 * 16);
+        records.extend_from_slice(&enc_record(0, 5177, 0x0000_0000, 1));
+        records.extend_from_slice(&enc_record(0x1439, 2590, 0x8000_0001, 1));
+        records.extend_from_slice(&enc_record(0x1e57, 2400, 0x8000_0002, 1));
+        records.extend_from_slice(&enc_record(0x27b7, 2300, 0x8000_0003, 1));
+        records.extend_from_slice(&enc_record(0x30b3, 2200, 0x8000_0004, 1));
+        let chunk = enc_stab_chunk(600, &records, 16 + 5 * 16);
+        let (hdr, recs) = StabHeader::parse_chunk(&chunk).unwrap();
+        assert_eq!(hdr.num_entries, 5);
+        assert_eq!(recs.len(), 5 * 16);
+        let entries: Vec<_> = Samples::new(recs).unwrap().collect();
+        assert_eq!(entries.len(), 5);
+        assert!(entries[0].kind.is_keyframe());
+        for (i, e) in entries.iter().enumerate().skip(1) {
+            assert_eq!(
+                e.kind,
+                SampleKind::VideoInter {
+                    timestamp_ticks: i as u32,
+                    next_frame_ticks: 1,
+                }
+            );
+        }
+    }
+
+    /// `Sega_FILM.wiki` line 92: some titles omit the first 16 bytes
+    /// from the STAB length field. parse_chunk must ignore the length
+    /// field for offset arithmetic and rely on `num_entries` — so a
+    /// "short" length still parses the records correctly.
+    #[test]
+    fn stab_parse_chunk_ignores_short_length_field() {
+        let rec = enc_record(7, 11, 0x8000_0005, 3);
+        // Burning-Rangers-style: length omits the first 16 bytes (only
+        // the record table is counted: 16, not 32).
+        let chunk = enc_stab_chunk(30, &rec, 16);
+        let (hdr, recs) = StabHeader::parse_chunk(&chunk).unwrap();
+        assert_eq!(hdr.base_frequency, 30);
+        assert_eq!(hdr.num_entries, 1);
+        let e = Samples::new(recs).unwrap().next().unwrap();
+        assert_eq!(e.record.sample_offset, 7);
+        assert_eq!(e.record.sample_length, 11);
+        assert_eq!(
+            e.kind,
+            SampleKind::VideoInter {
+                timestamp_ticks: 5,
+                next_frame_ticks: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn stab_parse_chunk_trailing_bytes_excluded() {
+        let rec = enc_record(0, 1, 0, 1);
+        let mut chunk = enc_stab_chunk(30, &rec, 32);
+        // Append stray trailing bytes beyond the declared 1-record
+        // table; they must not be returned in the records slice.
+        chunk.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let (hdr, recs) = StabHeader::parse_chunk(&chunk).unwrap();
+        assert_eq!(hdr.num_entries, 1);
+        assert_eq!(recs.len(), 16);
+        assert_eq!(recs, &rec[..]);
+    }
+
+    #[test]
+    fn stab_parse_chunk_rejects_truncated_header() {
+        let buf = [0u8; 15];
+        assert!(StabHeader::parse_chunk(&buf).is_err());
+        // Exactly 16 bytes with 0 entries is the legal minimum.
+        let chunk = enc_stab_chunk(30, &[], 16);
+        assert!(StabHeader::parse_chunk(&chunk).is_ok());
+    }
+
+    #[test]
+    fn stab_parse_chunk_rejects_bad_signature() {
+        let mut chunk = enc_stab_chunk(30, &[], 16);
+        chunk[0] = b'X';
+        assert!(StabHeader::parse_chunk(&chunk).is_err());
+    }
+
+    #[test]
+    fn stab_parse_chunk_rejects_truncated_records() {
+        // Header declares 2 entries but only 1 record's worth of bytes
+        // follow the 16-byte header.
+        let rec = enc_record(0, 1, 0, 1);
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"STAB");
+        chunk.extend_from_slice(&48u32.to_be_bytes()); // length claims 2 records
+        chunk.extend_from_slice(&30u32.to_be_bytes());
+        chunk.extend_from_slice(&2u32.to_be_bytes()); // num_entries = 2
+        chunk.extend_from_slice(&rec); // but only 1 record present
+        assert!(StabHeader::parse_chunk(&chunk).is_err());
+    }
+
+    /// parse_chunk applied to the STAB chunk carved out of a full FILM
+    /// header (FILM + FDSC + STAB) must agree with FilmDemuxer::parse
+    /// on both the header fields and the per-record stream.
+    #[test]
+    fn stab_parse_chunk_agrees_with_film_demuxer() {
+        let film = build_minimal_film();
+        let dem = FilmDemuxer::parse(&film).unwrap();
+        // The STAB chunk begins right after FILM (16) + FDSC (32).
+        let stab_off = FILM_HEADER_MIN_SIZE + 32;
+        let (hdr, recs) = StabHeader::parse_chunk(&film[stab_off..]).unwrap();
+        assert_eq!(hdr, dem.stab_header);
+        let entries: Vec<_> = Samples::new(recs).unwrap().collect();
+        assert_eq!(entries.len(), dem.samples.len());
+        for (e, d) in entries.iter().zip(dem.samples.iter()) {
+            assert_eq!(e.record, *d);
+        }
     }
 }

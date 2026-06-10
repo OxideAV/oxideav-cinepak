@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1422,3 +1422,31 @@ surface for validators / fuzz harnesses / wire-format
 introspection tools that want to walk the macroblock-level
 coverage of the inter vector-chunk code without the codebook
 + V1/V4-expansion + SKIP-reconstruction dependency.
+
+Round 270 added the **container-side bridge to the r261
+`Samples` walker** — `StabHeader::parse_chunk(chunk) ->
+(StabHeader, &[u8])` at `src/film.rs` plus the
+`STAB_HEADER_SIZE = 16` constant. The r261 `Samples` iterator
+walks a STAB *records-only* byte slice, but expected the caller
+to compute that slice's offset
+(`FILM_HEADER_MIN_SIZE + fdsc_len + 16`) and trim it by hand.
+`parse_chunk` takes a STAB chunk starting at its `'STAB'`
+signature, parses the fixed 16-byte header (signature + chunk
+length + `base_frequency` + `num_entries` per
+`docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 84-91),
+and returns the parsed `StabHeader` paired with the records-only
+slice bounded to exactly `num_entries * SAMPLE_RECORD_SIZE`
+bytes — i.e. precisely what `Samples::new` wants, so a caller
+does `let (hdr, recs) = StabHeader::parse_chunk(chunk)?; let it =
+Samples::new(recs)?;` without the `FilmDemuxer::parse` round-trip
+or its `Vec<SampleRecord>` allocation. The wire `length` field
+(bytes 4-7) is read but **not** used for offset arithmetic —
+`Sega_FILM.wiki` line 92 records that some titles omit the first
+16 bytes from it — so correctness rests on `num_entries` alone,
+and trailing bytes past the declared table are excluded from the
+returned slice. Errors on short header, bad signature, or a
+`num_entries * 16` table that overruns the chunk (`checked_mul`
+/ `checked_add` guard a hostile `num_entries`). 10 new lib tests
+(182 → 192). New crate-root export: `STAB_HEADER_SIZE`. Pure
+additive change — no decoder / encoder / `FilmDemuxer::parse`
+behaviour change.

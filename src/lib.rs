@@ -73,7 +73,7 @@ pub use film::{
     pcm_decode_16be_to_i16, pcm_decode_8bit, pcm_deinterleave_stereo_16be,
     pcm_deinterleave_stereo_8bit, pcm_sign_magnitude_to_i8, probe_film, CinepakVariant, Fdsc,
     FilmAudioFormat, FilmDemuxer, FilmHeader, PcmEndianness, PcmSignConvention, SampleKind,
-    SampleRecord, SampleRecordEntry, Samples, StabHeader, SAMPLE_RECORD_SIZE,
+    SampleRecord, SampleRecordEntry, Samples, StabHeader, SAMPLE_RECORD_SIZE, STAB_HEADER_SIZE,
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 pub use vector::{

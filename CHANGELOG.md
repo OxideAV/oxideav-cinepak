@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 270 (standalone STAB chunk-header parser): new
+  `StabHeader::parse_chunk(chunk: &[u8]) -> Result<(StabHeader,
+  &[u8])>` associated function at `src/film.rs` plus the
+  `STAB_HEADER_SIZE = 16` constant. The function parses the STAB
+  chunk's fixed 16-byte header (`'STAB'` signature + chunk length +
+  `base_frequency` + `num_entries`) per
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` lines 84-91 and
+  returns the parsed `StabHeader` paired with the records-only byte
+  slice that follows — bounded to exactly `num_entries *
+  SAMPLE_RECORD_SIZE` bytes, i.e. exactly the slice the round-261
+  `Samples::new` walker expects. This closes the bridge gap left by
+  r261: that iterator required the caller to compute the records-slice
+  offset (`FILM_HEADER_MIN_SIZE + fdsc_len + 16`) by hand and trim it
+  themselves; `parse_chunk` does both from a STAB chunk slice in one
+  read-only step, so a partial-header streamer / validator / sister-
+  format demuxer can do `let (hdr, recs) =
+  StabHeader::parse_chunk(chunk)?; let it = Samples::new(recs)?;`
+  without the `FilmDemuxer::parse` round-trip and its
+  `Vec<SampleRecord>` allocation. The wire `length` field (bytes 4-7)
+  is read but **not** used for offset arithmetic — `Sega_FILM.wiki`
+  line 92 records that some titles (Burning Rangers, version `'1.09'`)
+  omit the first 16 bytes from it — so correctness rests on
+  `num_entries` alone; trailing bytes beyond the declared table are
+  excluded from the returned slice. Errors: chunk shorter than
+  `STAB_HEADER_SIZE`, bad `'STAB'` signature, or a `num_entries * 16`
+  record table that overruns the chunk (with `checked_mul` /
+  `checked_add` guards against arithmetic overflow on a hostile
+  `num_entries`). 10 new lib tests (182 → 192) cover: the
+  `STAB_HEADER_SIZE` constant, empty-table parse + feed into
+  `Samples`, single-record parse + classified-yield, the C3-style
+  5-sample table agreeing with the round-261 classification, the
+  short-length-field (Burning-Rangers) tolerance, trailing-bytes
+  exclusion, truncated-header / bad-signature / truncated-records
+  rejection, and an end-to-end agreement check that carves the STAB
+  chunk out of `build_minimal_film()` and asserts `parse_chunk` ⇒
+  `(StabHeader, records)` matches `FilmDemuxer::parse`'s `stab_header`
+  + per-record stream. New public export: `STAB_HEADER_SIZE`. Pure
+  additive change — no decoder / encoder / `FilmDemuxer::parse`
+  behaviour change, no Cargo.toml changes. Wall:
+  `docs/video/cinepak/reference/wiki/Sega_FILM.wiki` (lines 84-92 —
+  STAB chunk header layout + the length-field-omits-16-bytes note),
+  already-shipped public surface (`StabHeader`, `Samples`,
+  `SAMPLE_RECORD_SIZE`, `STAB_SIGNATURE`, `FilmDemuxer::parse`,
+  `build_minimal_film` test helper). No external library source, no
+  web search, no GH issues opened.
 - Round 261 (typed STAB sample-records walker): new
   `film::Samples` iterator at `src/film.rs` that walks a STAB
   sample-records byte slice and yields one

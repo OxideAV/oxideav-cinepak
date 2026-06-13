@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser + r289-profile-phase-decomposition — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -431,6 +431,27 @@ mixing intra + 4 inter, ~7.6 KiB CVID per frame averaged). The
 artefact's intent: persist a stable visual / numerical baseline that
 future encoder-optimisation rounds can A/B-compare their algorithmic
 tweaks against, without having to re-discover the capture recipe.
+
+Round 289 (depth-mode profiling) added a `phases` mode to the same
+driver that decomposes one stateless intra encode into the marginal
+wall-time of each codebook-training phase — cold median-cut, Lloyd
+refinement (`lloyd_max_iter`), LBG split-refinement (`lbg_max_passes`),
+post-classification Lloyd polish (`pcl_max_iter`), and the k-means++
+cold-start (`kmeans_pp_init`). It toggles each phase ON cumulatively
+from a median-cut-only base and reports the ms each one adds, driving
+only the public `encode_rgb24` entry point through public
+`EncoderOptions` fields so no encoder code is instrumented and the wire
+output is exactly what those option vectors already produce. The
+finding (Apple M4 Max, release, in `profile/README.md`): **LBG
+split-refinement owns the encoder hot path** — +15.4 ms on 320×240
+(5.4× the median-cut base, ~62 % of full-options encode time) and
++64.9 ms on 640×480 — for a <5 % wire effect, because each of its 8
+default passes re-runs a full Lloyd assignment over the O(vectors × K)
+`nearest` scan. k-means++ is the second cost centre (+4.7 to
++21.8 ms; it builds two cold codebooks to guarantee no SSE
+regression); Lloyd refinement and post-classification polish are
+near-free. The artefact tells the next encoder-throughput round
+exactly which phase to profile first; no behaviour changed this round.
 
 Round 215 (vintage-decoder-compatible encoder mode) added
 **`EncoderOptions::vintage_compat: bool`** (default `false`) — closes

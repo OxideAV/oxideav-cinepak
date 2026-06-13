@@ -48,6 +48,14 @@
 //!                   (`encode_rgb24` / `_round6` / `_round7` / `_round8`)
 //!                   on each scenario; reports per-entry-point time +
 //!                   wire-size delta + estimated trial-count multiplier
+//!     phases      — round 289: per-training-phase marginal-cost
+//!                   decomposition of one stateless intra encode. Toggles
+//!                   each codebook-refinement phase (Lloyd / LBG /
+//!                   post-classification-Lloyd / k-means++) ON cumulatively
+//!                   from a median-cut-only base and reports the marginal
+//!                   ms each phase adds plus its wire-size effect, so a
+//!                   future optimiser knows which phase owns the encoder
+//!                   hot path before touching it
 //!     all         — run every mode (default)
 //!
 //! With `samply`:
@@ -55,6 +63,7 @@
 //!     samply record -- ./target/release/examples/profile_cinepak encode 30
 //!     samply record -- ./target/release/examples/profile_cinepak decode 100
 //!     samply record -- ./target/release/examples/profile_cinepak picker 8
+//!     samply record -- ./target/release/examples/profile_cinepak phases 20
 //!
 //! With `cargo flamegraph` (needs `cargo install flamegraph`):
 //!
@@ -498,6 +507,119 @@ fn profile_picker(iters_override: Option<u32>) {
     }
 }
 
+/// Round 289 (depth-mode profiling): per-phase encoder cost
+/// decomposition. The round-160 `encode` mode and the `benches/encode.rs`
+/// Criterion harness both measure the *whole* `encode_rgb24` call, so the
+/// profile shows aggregate ms/iter but never attributes that cost to the
+/// individual codebook-training phases the encoder layers on:
+///
+///   1. cold median-cut codebook build (always runs),
+///   2. k-means++ cold-start init + its Lloyd polish (`kmeans_pp_init`),
+///   3. seed/cold Lloyd refinement passes (`lloyd_max_iter`),
+///   4. LBG split-refinement passes (`lbg_max_passes`),
+///   5. post-classification Lloyd polish (`pcl_max_iter`).
+///
+/// All five run inside the private `build_codebooks_and_decisions` and
+/// share the same O(vectors × K) `nearest` inner loop, so a future
+/// optimiser needs to know which phase dominates before touching the hot
+/// path. This mode holds the input + codebook size fixed and toggles each
+/// phase ON cumulatively (starting from a training-minimal base with every
+/// optional phase OFF), reporting the **marginal** ms each phase adds. It
+/// drives only the public stateless `encode_rgb24` entry point with
+/// public `EncoderOptions` fields — no encoder code changes, no instrumentation
+/// inside `src/`, so the measured wire output is exactly what those option
+/// vectors already produce. Output byte counts are printed per row so the
+/// rate/quality cost of each phase is visible alongside its time cost.
+///
+/// Usage: `cargo run --example profile_cinepak --release -- phases [<iters>]`
+fn profile_phases(iters_override: Option<u32>) {
+    println!("== phases (R289 per-training-phase marginal cost, RGB intra) ==");
+    println!(
+        "  base = training-minimal (median-cut only: kmeans_pp off, \
+         lloyd=0, lbg=0, pcl=0); each row enables one more phase ON TOP \
+         of the rows above it. 'marginal' is this row's median minus the \
+         previous row's."
+    );
+
+    // A training-minimal base: every optional codebook-refinement phase
+    // disabled. `from_quality(50)` supplies the codebook sizes / strip
+    // count / rdo so only the training-phase axis varies row to row.
+    let base = {
+        let mut o = EncoderOptions::from_quality(50);
+        o.kmeans_pp_init = false;
+        o.kmeans_pp_lloyd_iter = 0;
+        o.lloyd_max_iter = 0;
+        o.lbg_max_passes = 0;
+        o.pcl_max_iter = 0;
+        o
+    };
+
+    // Cumulative-toggle ladder. Each closure mutates the running options
+    // in place so row N's config is row N-1's config plus exactly one
+    // phase. The label names the phase the row turns on.
+    type Toggle = (&'static str, fn(&mut EncoderOptions));
+    let ladder: &[Toggle] = &[
+        ("median-cut only (base)", |_o| {}),
+        ("+ lloyd_max_iter=2", |o| o.lloyd_max_iter = 2),
+        ("+ lbg_max_passes=8", |o| o.lbg_max_passes = 8),
+        ("+ pcl_max_iter=2", |o| o.pcl_max_iter = 2),
+        ("+ kmeans_pp_init (4 lloyd)", |o| {
+            o.kmeans_pp_init = true;
+            o.kmeans_pp_lloyd_iter = 4;
+        }),
+    ];
+
+    for scen in scenarios() {
+        if scen.bytes_per_pixel != 3 {
+            continue;
+        }
+        println!("  scenario {name}", name = scen.name);
+        let rgb = build_rgb_gradient(scen.width as usize, scen.height as usize);
+        let iters = iters_override.unwrap_or(scen.encode_iters_default);
+
+        let mut opts = base;
+        let mut prev_ms: Option<f64> = None;
+        for (label, toggle) in ladder {
+            toggle(&mut opts);
+
+            // Warm-up so first-call lazy init isn't charged here.
+            let _ = encode_rgb24(&rgb, scen.width, scen.height, opts).expect("phases warm-up");
+
+            // Three rep groups; report the median to damp laptop jitter.
+            let mut per_rep_ms: Vec<f64> = Vec::with_capacity(3);
+            let mut last_out = 0u64;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let mut total_out = 0u64;
+                for _ in 0..iters {
+                    let out = std::hint::black_box(
+                        encode_rgb24(std::hint::black_box(&rgb), scen.width, scen.height, opts)
+                            .expect("phases encode"),
+                    );
+                    total_out += out.len() as u64;
+                    std::hint::black_box(out);
+                }
+                per_rep_ms.push(t.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64);
+                last_out = total_out / iters.max(1) as u64;
+            }
+            let (median_ms, _jitter) = median_and_jitter(&mut per_rep_ms);
+            let marginal = match prev_ms {
+                Some(p) => median_ms - p,
+                None => median_ms,
+            };
+            let raw_bytes = scen.width as usize * scen.height as usize * scen.bytes_per_pixel;
+            let ratio = last_out as f64 / raw_bytes as f64;
+            println!(
+                "    {label:30} {median_ms:8.3} ms/iter  marginal={marginal:+8.3} ms  \
+                 out={last_out:>5}B ({ratio:.3} of input)"
+            );
+            std::io::stdout().flush().ok();
+            prev_ms = Some(median_ms);
+        }
+        println!();
+    }
+}
+
 /// Round 209: median + jitter helper. Returns
 /// (median, jitter_ratio) where jitter_ratio is
 /// (max - min) / median. Caller passes the rep-group times in ms.
@@ -642,6 +764,7 @@ fn main() {
         "roundtrip" => profile_roundtrip(iters_override),
         "stateful" => profile_stateful(iters_override),
         "picker" => profile_picker(iters_override),
+        "phases" => profile_phases(iters_override),
         "all" => {
             profile_encode_multi(iters_override, samples);
             println!();
@@ -652,11 +775,13 @@ fn main() {
             profile_stateful(iters_override);
             println!();
             profile_picker(iters_override);
+            println!();
+            profile_phases(iters_override);
         }
         other => {
             eprintln!("unknown mode: {other:?}");
             eprintln!(
-                "usage: profile_cinepak [encode|decode|roundtrip|stateful|picker|all] \
+                "usage: profile_cinepak [encode|decode|roundtrip|stateful|picker|phases|all] \
                  [<iters>] [samples=<N>]"
             );
             std::process::exit(2);

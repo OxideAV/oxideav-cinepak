@@ -8,7 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 289 (depth-mode profiling — per-training-phase cost
+  decomposition): new `phases` mode in the `examples/profile_cinepak.rs`
+  driver that decomposes one stateless intra encode into the marginal
+  wall-time of each codebook-training phase. It starts from a
+  training-minimal `EncoderOptions` base (median-cut only:
+  `kmeans_pp_init = false`, `lloyd_max_iter = 0`, `lbg_max_passes = 0`,
+  `pcl_max_iter = 0`) and toggles each phase ON cumulatively —
+  `+ lloyd_max_iter=2`, `+ lbg_max_passes=8`, `+ pcl_max_iter=2`,
+  `+ kmeans_pp_init (4 lloyd)` — measuring the median of 3 rep groups
+  per row and reporting the marginal ms each phase adds plus its
+  wire-size effect. The mode drives only the public `encode_rgb24`
+  entry point through public `EncoderOptions` fields, so no encoder
+  code is instrumented and the measured wire output is exactly what
+  those option vectors already produce. Finding (Apple M4 Max,
+  release, captured in `profile/README.md`): **LBG split-refinement
+  (`lbg_max_passes`) owns the encoder hot path** — +15.4 ms on
+  320×240 (5.4× the median-cut base, ~62 % of full-options encode
+  time) and +64.9 ms on 640×480, for a <5 % wire effect — because
+  each of its 8 default passes re-runs a full Lloyd assignment over
+  the O(vectors × K) `nearest` scan; k-means++ is the second cost
+  centre (+4.7 to +21.8 ms), while Lloyd refinement and
+  post-classification polish are near-free. Pure profiling artefact:
+  no `src/` change, no encode-behaviour change, no Cargo.toml change.
+  The new mode is wired into the `all` aggregate, the usage/help
+  strings, and the module doc-comment. Wall: own crate
+  `src/encoder.rs` public surface (`EncoderOptions` fields,
+  `encode_rgb24`) read only to drive the harness; no external library
+  source, no web search, no GH issues opened.
 - Round 270 (standalone STAB chunk-header parser): new
+  `StabHeader::parse_chunk(chunk: &[u8]) -> Result<(StabHeader,
   `StabHeader::parse_chunk(chunk: &[u8]) -> Result<(StabHeader,
   &[u8])>` associated function at `src/film.rs` plus the
   `STAB_HEADER_SIZE = 16` constant. The function parses the STAB

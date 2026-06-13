@@ -197,6 +197,92 @@ quirk). A/B comparisons against the encode baseline should use
 `samples=5` and read ≥ 10 % deltas as real on the round-7 row, ≥ 3 %
 on the rest.
 
+## Round 289 — per-training-phase marginal-cost decomposition
+
+Rounds 160 + 209 measure the encoder at the **whole-call** granularity
+(one `encode_rgb24` invocation, or the picker tiers that wrap several
+such calls). Neither attributes that cost to the individual
+codebook-training phases the encoder layers inside the private
+`build_codebooks_and_decisions`: cold median-cut, seed/cold Lloyd
+refinement (`lloyd_max_iter`), LBG split-refinement (`lbg_max_passes`),
+post-classification Lloyd polish (`pcl_max_iter`), and the k-means++
+cold-start (`kmeans_pp_init` + its own Lloyd polish). All five share
+the same O(vectors × K) `nearest` inner loop, so before any future
+round touches the hot path it needs to know which phase owns it.
+
+The `phases` mode holds the input + codebook size fixed and toggles
+each phase ON cumulatively from a training-minimal base (median-cut
+only — every optional phase off), reporting the **marginal** ms each
+phase adds. It drives only the public stateless `encode_rgb24` entry
+point through public `EncoderOptions` fields, so no encoder code is
+instrumented and the measured wire output is exactly what those option
+vectors already produce (the output bytes shift row-to-row only because
+each row is a different — valid — encoder configuration).
+
+### Phase decomposition (round 289, Apple M4 Max, release build)
+
+Each row's `marginal` is its median minus the row above; the row's
+output bytes are the wire effect of that phase being on.
+
+```
+rgb24/64x64/q50/round7
+  median-cut only (base)         0.248 ms/iter  marginal=  +0.248 ms  out= 1699B
+  + lloyd_max_iter=2             0.245 ms/iter  marginal=  -0.003 ms  out= 1699B
+  + lbg_max_passes=8             0.973 ms/iter  marginal=  +0.728 ms  out= 1681B
+  + pcl_max_iter=2               1.078 ms/iter  marginal=  +0.104 ms  out= 1675B
+  + kmeans_pp_init (4 lloyd)     1.408 ms/iter  marginal=  +0.330 ms  out= 1684B
+
+rgb24/320x240/q50/baseline
+  median-cut only (base)         2.830 ms/iter  marginal=  +2.830 ms  out=11140B
+  + lloyd_max_iter=2             2.748 ms/iter  marginal=  -0.082 ms  out=11140B
+  + lbg_max_passes=8            18.150 ms/iter  marginal= +15.402 ms  out=10630B
+  + pcl_max_iter=2             20.152 ms/iter  marginal=  +2.002 ms  out=11185B
+  + kmeans_pp_init (4 lloyd)   24.831 ms/iter  marginal=  +4.679 ms  out=11458B
+
+rgb24/640x480/q70/baseline
+  median-cut only (base)        10.137 ms/iter  marginal= +10.137 ms  out=39424B
+  + lloyd_max_iter=2            10.226 ms/iter  marginal=  +0.089 ms  out=39424B
+  + lbg_max_passes=8           75.085 ms/iter  marginal= +64.859 ms  out=40339B
+  + pcl_max_iter=2             82.493 ms/iter  marginal=  +7.408 ms  out=42484B
+  + kmeans_pp_init (4 lloyd)  104.298 ms/iter  marginal= +21.805 ms  out=41761B
+```
+
+#### Reading the phase rows
+
+- **LBG split-refinement owns the encoder hot path.** On both
+  non-trivial fixtures it is by far the largest single marginal:
+  +15.4 ms on 320×240 (5.4× the median-cut base) and +64.9 ms on
+  640×480 (6.4× the base) — roughly 62 %/62 % of the full
+  default-options encode time on those rows. Its wire effect is
+  modest (`out` moves <5 %), so a future optimisation round that wants
+  encoder throughput should profile `lbg_refine_codebook` first: it
+  re-runs a full Lloyd assignment + recentroid pass per split, each
+  iterating the O(vectors × K) `nearest` scan, and the
+  `lbg_max_passes=8` default pays for 8 such passes per codebook per
+  strip. Candidate levers (all to be measured, none landed here):
+  capping passes on large strips, early-stopping on SSE-improvement
+  plateau, or a partial-reassignment pass that only re-scores vectors
+  near the split boundary.
+- **Lloyd refinement (`lloyd_max_iter`) is effectively free** here:
+  its marginal is within timing noise of zero on every row. On the
+  cold-start path it only runs when a seed is present (intra has
+  none), so the intra rows are measuring the empty fast-exit — the
+  cost it *would* carry shows up folded into the k-means++ row, which
+  bundles its own Lloyd polish.
+- **Post-classification polish (`pcl_max_iter`) is cheap** (+0.1 to
+  +7.4 ms, ≤ 9 % of total) — it re-trains only *used* slots from the
+  actually-selected vectors, a much smaller set than the full
+  training population, and converges in 1–2 passes.
+- **k-means++ cold-start is the second cost centre** (+4.7 to
+  +21.8 ms): it computes the D²-sampling distribution (one `nearest`
+  scan per already-chosen centroid) plus 4 Lloyd polish passes, and
+  always builds the median-cut baseline alongside to guarantee it
+  never regresses SSE — so it pays for two cold codebooks where the
+  base row paid for one.
+- The **64×64 row** compresses all five phases into ~1.4 ms total;
+  the small fixture's per-call fixed cost dominates, so the phase
+  *ratios* are clearer on the 320×240 / 640×480 rows.
+
 ## Reproducing
 
 ```bash
@@ -216,6 +302,9 @@ cargo build --release --example profile_cinepak \
 ./target/release/examples/profile_cinepak picker
 ./target/release/examples/profile_cinepak encode 12 samples=5
 ./target/release/examples/profile_cinepak decode 600 samples=5
+
+# Round 289 — per-training-phase marginal-cost decomposition.
+./target/release/examples/profile_cinepak phases
 ```
 
 ### Capturing flamegraphs (samply, no root on macOS)

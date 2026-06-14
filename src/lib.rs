@@ -57,8 +57,8 @@ pub const CODEC_ID_STR: &str = "cinepak";
 
 // Standalone, framework-free re-exports.
 pub use codebook::{
-    CodebookEntries, CodebookEntryRecord, StripChunkEntry, StripChunkKind, StripChunks,
-    VectorChunkKind,
+    expand_v4_chroma, expand_v4_luma, CodebookEntries, CodebookEntryRecord, StripChunkEntry,
+    StripChunkKind, StripChunks, VectorChunkKind,
 };
 pub use decoder::{CinepakDecoder, DeviantConfig};
 pub use encoder::{

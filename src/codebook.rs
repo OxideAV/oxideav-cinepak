@@ -57,6 +57,92 @@ impl CodebookEntry {
             v: 0,
         }
     }
+
+    /// Expand this entry to its 2×2 luminance sub-block, row-major.
+    ///
+    /// Per spec §5 of
+    /// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`, the
+    /// `(Y0, Y1, Y2, Y3)` quadruple reads directly out as the
+    /// sub-block's four pixels in row-major order: `Y0` top-left,
+    /// `Y1` top-right, `Y2` bottom-left, `Y3` bottom-right. The Y
+    /// values are written verbatim — not upsampled, range-mapped, or
+    /// otherwise pre-processed (§4 last paragraph). This is the
+    /// per-sub-block unit shared by both V1 (one entry tiled four
+    /// ways) and V4 (four entries, one per sub-block) expansion.
+    ///
+    /// Returned as `[[u8; 2]; 2]` rows: `[[Y0, Y1], [Y2, Y3]]`.
+    pub fn luma_subblock(self) -> [[u8; 2]; 2] {
+        [[self.y0, self.y1], [self.y2, self.y3]]
+    }
+
+    /// Expand this entry as a **V1** macroblock luminance plane.
+    ///
+    /// Per spec §4 of
+    /// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`, the
+    /// four luminance values map to the four 2×2 quadrants of the 4×4
+    /// macroblock in scan order: `Y0` to the top-left 2×2, `Y1` to the
+    /// top-right 2×2, `Y2` to the bottom-left 2×2, `Y3` to the
+    /// bottom-right 2×2. Each quadrant's four pixels share the same
+    /// luminance value, so the plane is the constant-per-quadrant
+    /// tiling shown in the §4 diagram.
+    ///
+    /// Returned as 4 rows of 4 columns (`[[u8; 4]; 4]`), row-major
+    /// top-to-bottom, left-to-right.
+    pub fn expand_v1_luma(self) -> [[u8; 4]; 4] {
+        let (a, b, c, d) = (self.y0, self.y1, self.y2, self.y3);
+        [[a, a, b, b], [a, a, b, b], [c, c, d, d], [c, c, d, d]]
+    }
+}
+
+/// Expand a **V4** macroblock luminance plane from its four codebook
+/// references.
+///
+/// Per spec §5 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`, a V4
+/// macroblock tiles its four entries `(r0, r1, r2, r3)` as 2×2
+/// sub-blocks — `r0` top-left, `r1` top-right, `r2` bottom-left, `r3`
+/// bottom-right — and within each sub-block the entry's
+/// `(Y0, Y1, Y2, Y3)` quadruple supplies the four pixels in row-major
+/// order ([`CodebookEntry::luma_subblock`]).
+///
+/// `quad` is the four entries in the same order the V4 index bytes
+/// appear in the vector chunk's index stream (`r0, r1, r2, r3`; §5
+/// "Index ordering"). Returned as 4 rows of 4 columns
+/// (`[[u8; 4]; 4]`), row-major.
+pub fn expand_v4_luma(quad: &[CodebookEntry; 4]) -> [[u8; 4]; 4] {
+    let s0 = quad[0].luma_subblock();
+    let s1 = quad[1].luma_subblock();
+    let s2 = quad[2].luma_subblock();
+    let s3 = quad[3].luma_subblock();
+    [
+        [s0[0][0], s0[0][1], s1[0][0], s1[0][1]],
+        [s0[1][0], s0[1][1], s1[1][0], s1[1][1]],
+        [s2[0][0], s2[0][1], s3[0][0], s3[0][1]],
+        [s2[1][0], s2[1][1], s3[1][0], s3[1][1]],
+    ]
+}
+
+/// Expand a **V4** macroblock chroma plane from its four codebook
+/// references.
+///
+/// Per spec §5 of
+/// `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`, the four
+/// chroma pairs `(rkU, rkV)` populate the four 2×2 sub-block positions
+/// of the macroblock's chroma plane in the same scan order as the
+/// luminance sub-blocks — `r0` top-left, `r1` top-right, `r2`
+/// bottom-left, `r3` bottom-right — each scalar covering a 2×2 pixel
+/// region (V4 chroma is 4:2:0 subsampled with four samples per
+/// macroblock, twice the V1 chroma resolution of one sample).
+///
+/// Returned as a 2×2 grid of `(U, V)` pairs (`[[(i8, i8); 2]; 2]`),
+/// row-major: `[[(r0U,r0V), (r1U,r1V)], [(r2U,r2V), (r3U,r3V)]]`. For
+/// 8-bit grayscale streams every entry's `u`/`v` are zero, so the
+/// result is all `(0, 0)`.
+pub fn expand_v4_chroma(quad: &[CodebookEntry; 4]) -> [[(i8, i8); 2]; 2] {
+    [
+        [(quad[0].u, quad[0].v), (quad[1].u, quad[1].v)],
+        [(quad[2].u, quad[2].v), (quad[3].u, quad[3].v)],
+    ]
 }
 
 /// 256-entry codebook (V4 or V1).
@@ -1820,5 +1906,157 @@ mod tests {
             v1_entries[0].entry,
             CodebookEntry::from_yuv(72, 72, 72, 72, -37, 90)
         );
+    }
+
+    // ---------- §4 / §5 macroblock-expansion surface tests ----------
+
+    /// `luma_subblock` reads `(Y0, Y1, Y2, Y3)` directly out in
+    /// row-major order per spec §5: `Y0` top-left, `Y1` top-right,
+    /// `Y2` bottom-left, `Y3` bottom-right.
+    #[test]
+    fn luma_subblock_is_row_major_y_quadruple() {
+        let e = CodebookEntry::from_yuv(11, 22, 33, 44, -5, 7);
+        assert_eq!(e.luma_subblock(), [[11, 22], [33, 44]]);
+        // Chroma plays no part in the luminance sub-block.
+        let g = CodebookEntry::from_y(11, 22, 33, 44);
+        assert_eq!(g.luma_subblock(), e.luma_subblock());
+    }
+
+    /// `expand_v1_luma` tiles each Yi over its 2×2 quadrant per spec
+    /// §4: Y0 → top-left, Y1 → top-right, Y2 → bottom-left, Y3 →
+    /// bottom-right, each quadrant constant.
+    #[test]
+    fn expand_v1_luma_tiles_quadrants() {
+        let e = CodebookEntry::from_y(1, 2, 3, 4);
+        assert_eq!(
+            e.expand_v1_luma(),
+            [[1, 1, 2, 2], [1, 1, 2, 2], [3, 3, 4, 4], [3, 3, 4, 4]]
+        );
+    }
+
+    /// Spec §4 fixture `Y15`: a V1 entry with
+    /// `(Y0=50, Y1=100, Y2=150, Y3=200)` expands to the four quadrants
+    /// 50 / 100 / 150 / 200 (top-left / top-right / bottom-left /
+    /// bottom-right). Cross-checks the §4 worked example verbatim.
+    #[test]
+    fn expand_v1_luma_matches_spec_y15_fixture() {
+        let e = CodebookEntry::from_yuv(50, 100, 150, 200, 0, 0);
+        let plane = e.expand_v1_luma();
+        // Top-left 2×2 quadrant.
+        assert_eq!(plane[0][0], 50);
+        assert_eq!(plane[1][1], 50);
+        // Top-right.
+        assert_eq!(plane[0][2], 100);
+        assert_eq!(plane[1][3], 100);
+        // Bottom-left.
+        assert_eq!(plane[2][0], 150);
+        assert_eq!(plane[3][1], 150);
+        // Bottom-right.
+        assert_eq!(plane[2][2], 200);
+        assert_eq!(plane[3][3], 200);
+    }
+
+    /// Spec §5 fixture `Y16`: four V4 entries
+    /// `e0=(16,30,72,86)`, `e1=(44,58,100,114)`,
+    /// `e2=(128,142,184,198)`, `e3=(156,170,212,226)` expand to the
+    /// 4×4 luminance ramp `16,30,44,58 / 72,86,100,114 /
+    /// 128,142,156,170 / 184,198,212,226` exactly as the §5 worked
+    /// example enumerates.
+    #[test]
+    fn expand_v4_luma_matches_spec_y16_fixture() {
+        let quad = [
+            CodebookEntry::from_y(16, 30, 72, 86),
+            CodebookEntry::from_y(44, 58, 100, 114),
+            CodebookEntry::from_y(128, 142, 184, 198),
+            CodebookEntry::from_y(156, 170, 212, 226),
+        ];
+        assert_eq!(
+            expand_v4_luma(&quad),
+            [
+                [16, 30, 44, 58],
+                [72, 86, 100, 114],
+                [128, 142, 156, 170],
+                [184, 198, 212, 226],
+            ]
+        );
+    }
+
+    /// §5 V4 sub-block placement: each entry lands in its own 2×2
+    /// quadrant (r0 TL, r1 TR, r2 BL, r3 BR) and the within-sub-block
+    /// row-major Y mapping holds.
+    #[test]
+    fn expand_v4_luma_sub_block_placement() {
+        let quad = [
+            CodebookEntry::from_y(1, 2, 3, 4),
+            CodebookEntry::from_y(5, 6, 7, 8),
+            CodebookEntry::from_y(9, 10, 11, 12),
+            CodebookEntry::from_y(13, 14, 15, 16),
+        ];
+        assert_eq!(
+            expand_v4_luma(&quad),
+            [
+                [1, 2, 5, 6],
+                [3, 4, 7, 8],
+                [9, 10, 13, 14],
+                [11, 12, 15, 16],
+            ]
+        );
+    }
+
+    /// §5 V4 chroma: the four `(rkU, rkV)` pairs land in scan-order
+    /// 2×2 sub-block positions; grayscale (zero chroma) yields all
+    /// `(0, 0)`.
+    #[test]
+    fn expand_v4_chroma_scan_order_and_grayscale() {
+        let quad = [
+            CodebookEntry::from_yuv(0, 0, 0, 0, -10, 20),
+            CodebookEntry::from_yuv(0, 0, 0, 0, 30, -40),
+            CodebookEntry::from_yuv(0, 0, 0, 0, 50, 60),
+            CodebookEntry::from_yuv(0, 0, 0, 0, -70, -80),
+        ];
+        assert_eq!(
+            expand_v4_chroma(&quad),
+            [[(-10, 20), (30, -40)], [(50, 60), (-70, -80)]]
+        );
+        let gray = [CodebookEntry::from_y(1, 2, 3, 4); 4];
+        assert_eq!(
+            expand_v4_chroma(&gray),
+            [[(0, 0), (0, 0)], [(0, 0), (0, 0)]]
+        );
+    }
+
+    /// V1 and V4 expansion are genuinely distinct layouts even for the
+    /// same entry: §4 (V1) makes each `Yi` a constant 2×2 quadrant of
+    /// the 4×4, whereas §5 (V4) reads the entry's `(Y0,Y1,Y2,Y3)` as
+    /// the four pixels of a single 2×2 sub-block. A uniform V4 quad
+    /// (all four references the same entry) therefore replicates that
+    /// entry's own 2×2 across all four sub-blocks — it does *not*
+    /// collapse to the V1 constant-per-quadrant tiling.
+    #[test]
+    fn v1_and_v4_expansion_layouts_differ() {
+        let e = CodebookEntry::from_y(60, 90, 120, 150);
+        let v1 = e.expand_v1_luma();
+        let v4_uniform = expand_v4_luma(&[e; 4]);
+        // V1: each Yi fills its quadrant constantly.
+        assert_eq!(
+            v1,
+            [
+                [60, 60, 90, 90],
+                [60, 60, 90, 90],
+                [120, 120, 150, 150],
+                [120, 120, 150, 150],
+            ]
+        );
+        // V4-uniform: the entry's own 2×2 sub-block tiled four ways.
+        assert_eq!(
+            v4_uniform,
+            [
+                [60, 90, 60, 90],
+                [120, 150, 120, 150],
+                [60, 90, 60, 90],
+                [120, 150, 120, 150],
+            ]
+        );
+        assert_ne!(v1, v4_uniform);
     }
 }

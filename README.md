@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser + r289-profile-phase-decomposition — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser + r289-profile-phase-decomposition + r307-macroblock-expansion-surface — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1471,3 +1471,43 @@ returned slice. Errors on short header, bad signature, or a
 (182 → 192). New crate-root export: `STAB_HEADER_SIZE`. Pure
 additive change — no decoder / encoder / `FilmDemuxer::parse`
 behaviour change.
+
+Round 307 added the **typed §4 / §5 macroblock-expansion
+surface** — the layer *below* the r246 / r250 / r253 per-MB
+walkers. Those walkers classify each macroblock and surface its
+raw codebook index byte(s); r307 turns a resolved
+`CodebookEntry` (or a four-entry V4 quad) into the concrete 4×4
+pixel layout per spec §4 (V1) and §5 (V4) of
+`docs/video/cinepak/spec/03-vectors-and-macroblocks.md`, without
+the YUV→RGB matrix dependency the decoder's
+`draw_v1_mb_rgb` / `draw_v4_mb_*` paths carry. Three new entry
+points: `CodebookEntry::luma_subblock() -> [[u8; 2]; 2]` (the
+shared per-sub-block unit — `(Y0,Y1,Y2,Y3)` read out row-major
+per §5: Y0 top-left, Y1 top-right, Y2 bottom-left, Y3
+bottom-right); `CodebookEntry::expand_v1_luma() -> [[u8; 4]; 4]`
+(§4 — each `Yi` tiled constantly over its 2×2 quadrant of the
+4×4); and the free function
+`expand_v4_luma(&[CodebookEntry; 4]) -> [[u8; 4]; 4]` (§5 — the
+four references `r0..r3` placed as 2×2 sub-blocks in scan order,
+each carrying its own `luma_subblock`), with
+`expand_v4_chroma(&[CodebookEntry; 4]) -> [[(i8, i8); 2]; 2]`
+returning the four `(rkU, rkV)` chroma pairs at their scan-order
+sub-block positions (all `(0, 0)` for grayscale). The two
+expansion modes are deliberately distinct: a uniform V4 quad
+(all four references the same entry) tiles that entry's own 2×2
+across all four sub-blocks and does **not** collapse to the V1
+constant-per-quadrant layout. 7 new lib tests (192 → 199) anchor
+each helper to the spec's own worked examples — the §4 fixture
+`Y15` `(Y0=50, Y1=100, Y2=150, Y3=200)` quadrant mapping and the
+§5 fixture `Y16` 4×4 luminance ramp
+(`e0=(16,30,72,86)` … `e3=(156,170,212,226)` →
+`16,30,44,58 / 72,86,100,114 / 128,142,156,170 /
+184,198,212,226`) — plus sub-block placement, V4 chroma
+scan-order + grayscale-zero, and the V1-vs-V4 layout-distinction
+case. New crate-root exports: `expand_v4_luma`,
+`expand_v4_chroma` (the two `CodebookEntry` methods need no
+separate re-export). Pure additive change — the decoder's
+RGB / grayscale pixel-write paths are untouched; r307 is a
+standalone spec-§4/§5 expansion surface for validators,
+introspection tools, and re-encoders that want the luminance /
+chroma plane geometry without the colour-conversion stage.

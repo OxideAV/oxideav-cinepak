@@ -5,7 +5,7 @@ Pure-Rust Cinepak (CVID) video decoder for the
 
 ## Status
 
-**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser + r289-profile-phase-decomposition + r307-macroblock-expansion-surface — clean-room rebuild from `docs/video/cinepak/spec/`.**
+**Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + r47-encoder-RDO + r4-LBG + r5-luma-weight + r6-encoder-PCL + r7-encoder-PCL + r8-per-strip-picker + r9-kmeans++-init + r93-deviant-saturn-decoder + r96-bitrate-target-rate-control + r101-grayscale-rd-grid-picker + r104-grayscale-inter-frame + r113-grayscale-rate-control + r121-chroma-CBR-convergence + r143-keyframe-interval + r148-decoder-fuzz + r155-ffmpeg-inter-cross-decode + r160-profile-driver + r187-film-seek-helpers + r192-decode-vector-chunk-fuzz + r196-decode-multi-frame-fuzz + r202-per-parser-fuzz-corpora + r209-profile-picker-sweep + r215-vintage-compat-encoder + r221-film-audio-format-classifier + r228-film-pcm-shaping + r234-film-pcm-fuzz + r240-frame-strips-iter + r243-strip-chunks-iter + r246-v1only-mb-iter + r250-mixed-intra-mb-iter + r253-inter-mb-iter + r256-codebook-entries-iter + r261-stab-samples-iter + r270-stab-header-parser + r289-profile-phase-decomposition + r307-macroblock-expansion-surface + r309-macroblock-rgb-surface — clean-room rebuild from `docs/video/cinepak/spec/`.**
 The prior implementation was retired by the OxideAV docs audit dated
 2026-05-06; the rebuild replaces it from public reverse-engineering
 references (multimedia.cx wiki, Tim Ferguson's `videocodec/cinepak.txt`,
@@ -1511,3 +1511,33 @@ RGB / grayscale pixel-write paths are untouched; r307 is a
 standalone spec-§4/§5 expansion surface for validators,
 introspection tools, and re-encoders that want the luminance /
 chroma plane geometry without the colour-conversion stage.
+
+Round 309 added the **typed §4 / §5 + §3 macroblock RGB-pixel-block
+surface** — the colour-conversion capstone *above* the r307 plane
+geometry. r307 deliberately stopped before the YUV→RGB matrix; r309
+composes the §4 (V1) / §5 (V4) macroblock expansion of
+`docs/video/cinepak/spec/03-vectors-and-macroblocks.md` with the §3
+inverse matrix of `docs/video/cinepak/spec/04-yuv-rgb-matrix.md`
+(truncation-toward-zero on `U/2`, per-channel clamp to `[0, 255]`) to
+yield the concrete 4×4 RGB pixel block of one macroblock. Two new
+free functions: `expand_v1_mb_rgb(&CodebookEntry) -> [[[u8; 3]; 4]; 4]`
+(§4 — each `Yi`'s converted pixel tiled over its 2×2 quadrant, the
+entry's single `(U, V)` applied across the whole 4×4 at 4:2:0 4×4
+granularity) and `expand_v4_mb_rgb(&[CodebookEntry; 4]) ->
+[[[u8; 3]; 4]; 4]` (§5 — each entry's converted 2×2 sub-block placed
+in scan order under its own `(U, V)`, four chroma samples per
+macroblock). For 8-bit grayscale entries (chroma zero) every pixel's
+three channels equal its luminance value (§4 grayscale identity).
+Both are allocation-free and framework-feature-independent — the
+standalone counterpart to the decoder's internal strided
+`draw_v1_mb_rgb` / `draw_v4_mb_rgb` writes, for validators,
+introspection tools, and re-encoders that want resolved RGB geometry
+without an output framebuffer. r309 also re-exports the already-`pub`
+`yuv::yuv_to_rgb` from the crate root. 7 new lib tests (198 → 205)
+anchor each helper to the spec's worked examples (the §4 `Y15`
+quadrant pattern, the §5 `Y16` ramp through the verified primary
+chroma pairs M1/M2/M3/M7, the V1-vs-V4 layout-distinction case, both
+grayscale identities, and a byte-for-byte cross-check against the
+decoder's own strided V1 write). New crate-root exports:
+`expand_v1_mb_rgb`, `expand_v4_mb_rgb`, `yuv_to_rgb`. Pure additive
+change — the decoder's pixel-write paths are untouched.

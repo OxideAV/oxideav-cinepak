@@ -80,6 +80,7 @@ pub use vector::{
     InterEntry, InterMacroblocks, InterMb, MixedIntraEntry, MixedIntraMacroblocks, MixedIntraMb,
     V1MacroblockEntry, V1OnlyMacroblocks,
 };
+pub use yuv::{expand_v1_mb_rgb, expand_v4_mb_rgb, yuv_to_rgb};
 
 // Framework-integrated re-exports.
 #[cfg(feature = "registry")]

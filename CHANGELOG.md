@@ -8,6 +8,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 309 (typed §4/§5 + §3 macroblock RGB-pixel-block surface):
+  two new free functions at `src/yuv.rs` — `expand_v1_mb_rgb(&CodebookEntry)
+  -> [[[u8; 3]; 4]; 4]` and `expand_v4_mb_rgb(&[CodebookEntry; 4]) ->
+  [[[u8; 3]; 4]; 4]` — that close the colour-conversion capstone above
+  the r307 luminance/chroma plane-geometry surface. r307 stopped at
+  plane geometry (`expand_v1_luma` / `expand_v4_luma` / `expand_v4_chroma`)
+  deliberately *before* the YUV→RGB matrix; r309 composes the spec §4
+  (V1 luminance-quadrant layout) / §5 (V4 sub-block layout +
+  per-sub-block chroma) macroblock expansion of
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` with the
+  spec §3 inverse matrix of
+  `docs/video/cinepak/spec/04-yuv-rgb-matrix.md` (truncation-toward-zero
+  on `U/2`, per-channel clamp to `[0, 255]`) to yield the concrete 4×4
+  RGB pixel block of a single macroblock. V1 applies the entry's single
+  `(U, V)` across the whole 4×4 (chroma 4:2:0 at 4×4 granularity, §4);
+  V4 routes each entry's own `(U, V)` to its 2×2 sub-block (four chroma
+  samples per macroblock, §5). For 8-bit grayscale entries (chroma
+  zero) every pixel's three channels equal its luminance value (the §4
+  grayscale identity). The functions are allocation-free and framework-
+  feature-independent (`default-features = false` build picks them up):
+  the standalone counterpart to the decoder's internal strided
+  `draw_v1_mb_rgb` / `draw_v4_mb_rgb` writes, for validators,
+  introspection tools, and re-encoders that want the resolved RGB
+  geometry of one macroblock without an output framebuffer. Also
+  re-exports the already-`pub` `yuv::yuv_to_rgb` from the crate root
+  (previously reachable only as `oxideav_cinepak::yuv::yuv_to_rgb`).
+  7 new lib tests (198 → 205) anchor each helper to the spec's own
+  worked examples — the §4 `Y15` quadrant pattern under the verified
+  `M10` chroma and the `M1` red primary, the §4.1 grayscale identity,
+  the §5 `Y16` ramp routed through the four verified primary chroma
+  pairs M1/M2/M3/M7 with per-sub-block placement, the V1-vs-V4
+  layout-distinction case (uniform V4 quad ≠ V1 tiling, agree only at
+  shared corners), the V4 grayscale identity, and a byte-for-byte
+  cross-check against the decoder's own strided V1 write. New crate-root
+  exports: `expand_v1_mb_rgb`, `expand_v4_mb_rgb`, `yuv_to_rgb`. Pure
+  additive change — the decoder's RGB / grayscale pixel-write paths are
+  untouched. Wall: `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`
+  (§4 V1 expansion + §5 V4 sub-block / chroma layout),
+  `docs/video/cinepak/spec/04-yuv-rgb-matrix.md` (§3 inverse matrix +
+  §3.1/§3.2 pinned conventions + §4.1 grayscale identity), own crate
+  `src/yuv.rs` + `src/codebook.rs` (`CodebookEntry`) + `src/decoder.rs`
+  (cross-check reference). No external library source, no web search, no
+  GH issues opened.
 - Round 289 (depth-mode profiling — per-training-phase cost
   decomposition): new `phases` mode in the `examples/profile_cinepak.rs`
   driver that decomposes one stateless intra encode into the marginal

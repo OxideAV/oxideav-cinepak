@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 335 (resolved-RGB mixed-intra macroblock walker): new
+  `vector::MixedIntraRgbBlocks<'a>` iterator plus the `MixedIntraRgbBlock`
+  record and `MixedIntraCoding` enum. It is the resolved-RGB capstone
+  over the r250 index-only `MixedIntraMacroblocks` walker: given a
+  `0x3000` payload, the strip's resolved V1/V4 codebooks
+  (`&[CodebookEntry]`), the macroblock-grid width, and the strip
+  macroblock count, it yields each macroblock's fully reconstructed 4×4
+  RGB block together with its `(mb_col, mb_row)` grid position and
+  top-left pixel origin (spec §1.1 scan-order mapping `(i / C, i % C)`
+  in `docs/video/cinepak/spec/03-vectors-and-macroblocks.md`). It
+  composes the §3.2 V1/V4 classification with the §§4/5 macroblock
+  expansion and the §3 YUV→RGB matrix (via `expand_v1_mb_rgb` /
+  `expand_v4_mb_rgb`), giving validators and introspection tools
+  pixel-exact reconstructed blocks without allocating a strided output
+  raster — the framebuffer-free counterpart of the decoder's intra
+  strip-reconstruction loop. An out-of-range codebook index, a
+  truncated payload, or a zero grid width is reported as `Some(Err(_))`
+  (or a construction error) and the iterator self-fuses. Nine unit
+  tests cover all-V1 / all-V4 / mixed grids, the grayscale identity,
+  position mapping, both index-out-of-range paths, truncation fusing,
+  and byte-exact agreement with manual `MixedIntraMacroblocks` +
+  codebook-lookup + expansion composition.
 - Round 309 (typed §4/§5 + §3 macroblock RGB-pixel-block surface):
   two new free functions at `src/yuv.rs` — `expand_v1_mb_rgb(&CodebookEntry)
   -> [[[u8; 3]; 4]; 4]` and `expand_v4_mb_rgb(&[CodebookEntry; 4]) ->

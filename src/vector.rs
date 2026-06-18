@@ -649,6 +649,218 @@ impl<'a> Iterator for MixedIntraMacroblocks<'a> {
     }
 }
 
+// ---------- MixedIntraRgbBlocks resolved-RGB walker (§3.2 + §§4–5 + §3) ---
+
+/// One reconstructed macroblock yielded by [`MixedIntraRgbBlocks`].
+///
+/// Unlike [`MixedIntraEntry`] (which carries only the V1 / V4 codebook
+/// *indices*), this entry carries the macroblock's fully reconstructed
+/// 4×4 RGB pixel block — the codebook lookup and the YUV→RGB matrix of
+/// spec §3 of
+/// `docs/video/cinepak/spec/04-yuv-rgb-matrix.md` already applied —
+/// together with the macroblock's grid position and top-left pixel
+/// origin within the strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixedIntraRgbBlock {
+    /// 0-based macroblock index in strip scan order (spec §1.1).
+    pub index: u16,
+    /// Macroblock column in the strip's macroblock grid
+    /// (`index % mb_cols`, spec §1.1).
+    pub mb_col: u16,
+    /// Macroblock row in the strip's macroblock grid
+    /// (`index / mb_cols`, spec §1.1).
+    pub mb_row: u16,
+    /// Top-left pixel column of this macroblock relative to the strip's
+    /// left edge (`4 × mb_col`, spec §1.1).
+    pub pixel_col: u32,
+    /// Top-left pixel row of this macroblock relative to the strip's
+    /// top edge (`4 × mb_row`, spec §1.1).
+    pub pixel_row: u32,
+    /// Whether this macroblock was V1- or V4-coded (spec §3.2).
+    pub coding: MixedIntraCoding,
+    /// The reconstructed 4×4 RGB pixel block, row-major
+    /// top-to-bottom / left-to-right; each pixel a packed `[R, G, B]`
+    /// triple. For 8-bit grayscale codebooks (chroma zero) every
+    /// channel equals the pixel's luminance (spec §4 grayscale
+    /// identity).
+    pub rgb: [[[u8; 3]; 4]; 4],
+}
+
+/// Per-macroblock V1 / V4 coding mode reported by
+/// [`MixedIntraRgbBlock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixedIntraCoding {
+    /// V1-coded: a single codebook entry tiled per-quadrant.
+    V1,
+    /// V4-coded: four codebook entries, one per 2×2 sub-block.
+    V4,
+}
+
+/// Resolved-RGB walker over a `0x3000` mixed-intra vector chunk.
+///
+/// This is the colour-converted capstone above the index-only
+/// [`MixedIntraMacroblocks`] walker (round-250): it composes the §3.2
+/// per-macroblock V1 / V4 classification with the V1 / V4 codebook
+/// lookup and the §§4–5 macroblock expansion + §3 YUV→RGB matrix
+/// (via [`crate::yuv::expand_v1_mb_rgb`] /
+/// [`crate::yuv::expand_v4_mb_rgb`]), yielding each macroblock's fully
+/// reconstructed 4×4 RGB block together with its grid position (spec
+/// §1.1). It is the standalone, framebuffer-free counterpart of the
+/// decoder's intra strip-reconstruction loop: a validator or
+/// introspection tool can obtain pixel-exact reconstructed blocks
+/// without allocating a strided output raster.
+///
+/// The codebooks are supplied as `&[CodebookEntry]` slices (the
+/// resolved V1 and V4 codebooks for the strip, as produced by the
+/// codebook-chunk decode). An index byte that addresses a slot beyond
+/// the supplied slice yields `Some(Err(_))` and fuses the iterator.
+///
+/// Read-only and content-agnostic with respect to the wire bytes; the
+/// only state beyond [`MixedIntraMacroblocks`] is the macroblock-grid
+/// width (`mb_cols`), used to derive each block's `(mb_col, mb_row)`
+/// position per spec §1.1.
+#[derive(Debug)]
+pub struct MixedIntraRgbBlocks<'a> {
+    inner: MixedIntraMacroblocks<'a>,
+    v1: &'a [crate::codebook::CodebookEntry],
+    v4: &'a [crate::codebook::CodebookEntry],
+    mb_cols: u16,
+    fused: bool,
+}
+
+impl<'a> MixedIntraRgbBlocks<'a> {
+    /// Build a resolved-RGB mixed-intra walker.
+    ///
+    /// - `payload` — the `0x3000` chunk payload (`chunk_size - 4`
+    ///   bytes following the chunk header), as the `payload` field of
+    ///   a [`crate::codebook::StripChunkEntry`] whose `kind` resolves
+    ///   to [`crate::codebook::VectorChunkKind::IntraMixed`].
+    /// - `v1` / `v4` — the resolved V1 and V4 codebooks for the strip.
+    /// - `mb_cols` — the strip's macroblock-grid width (frame width / 4
+    ///   for full-width strips), used to map scan index → `(col, row)`
+    ///   per spec §1.1.
+    /// - `mb_count` — total macroblock count for the strip
+    ///   (`mb_cols × mb_rows`).
+    ///
+    /// `mb_cols` of `0` is rejected (a degenerate grid has no
+    /// position mapping).
+    pub fn new(
+        payload: &'a [u8],
+        v1: &'a [crate::codebook::CodebookEntry],
+        v4: &'a [crate::codebook::CodebookEntry],
+        mb_cols: u16,
+        mb_count: usize,
+    ) -> Result<Self> {
+        if mb_cols == 0 {
+            return Err(CinepakError::invalid(
+                "0x3000 RGB walk requires a non-zero macroblock-grid width",
+            ));
+        }
+        Ok(Self {
+            inner: MixedIntraMacroblocks::new(payload, mb_count),
+            v1,
+            v4,
+            mb_cols,
+            fused: false,
+        })
+    }
+
+    /// Byte offset of the next payload read (delegates to the inner
+    /// index-only walker).
+    pub fn cursor(&self) -> usize {
+        self.inner.cursor()
+    }
+
+    /// Number of macroblocks yet to be yielded.
+    pub fn remaining(&self) -> usize {
+        self.inner.remaining()
+    }
+
+    /// Total macroblock count for the strip.
+    pub fn mb_count(&self) -> usize {
+        self.inner.mb_count()
+    }
+
+    /// The strip's macroblock-grid width passed to [`Self::new`].
+    pub fn mb_cols(&self) -> u16 {
+        self.mb_cols
+    }
+
+    #[inline]
+    fn lookup<'b>(
+        book: &'b [crate::codebook::CodebookEntry],
+        idx: u8,
+        which: &str,
+    ) -> Result<&'b crate::codebook::CodebookEntry> {
+        book.get(idx as usize).ok_or_else(|| {
+            CinepakError::invalid(format!(
+                "0x3000 {which} index {idx} exceeds codebook length {}",
+                book.len()
+            ))
+        })
+    }
+}
+
+impl<'a> Iterator for MixedIntraRgbBlocks<'a> {
+    type Item = Result<MixedIntraRgbBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
+        let entry = match self.inner.next()? {
+            Ok(e) => e,
+            Err(e) => {
+                self.fused = true;
+                return Some(Err(e));
+            }
+        };
+        let (coding, rgb) = match entry.kind {
+            MixedIntraMb::V1(idx) => {
+                let e = match Self::lookup(self.v1, idx, "V1") {
+                    Ok(e) => e,
+                    Err(err) => {
+                        self.fused = true;
+                        return Some(Err(err));
+                    }
+                };
+                (MixedIntraCoding::V1, crate::yuv::expand_v1_mb_rgb(e))
+            }
+            MixedIntraMb::V4(idx) => {
+                let mut quad = [crate::codebook::CodebookEntry::default(); 4];
+                for (slot, &i) in quad.iter_mut().zip(idx.iter()) {
+                    match Self::lookup(self.v4, i, "V4") {
+                        Ok(e) => *slot = *e,
+                        Err(err) => {
+                            self.fused = true;
+                            return Some(Err(err));
+                        }
+                    }
+                }
+                (MixedIntraCoding::V4, crate::yuv::expand_v4_mb_rgb(&quad))
+            }
+        };
+        let mb_col = entry.index % self.mb_cols;
+        let mb_row = entry.index / self.mb_cols;
+        Some(Ok(MixedIntraRgbBlock {
+            index: entry.index,
+            mb_col,
+            mb_row,
+            pixel_col: 4 * mb_col as u32,
+            pixel_row: 4 * mb_row as u32,
+            coding,
+            rgb,
+        }))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.fused {
+            return (0, Some(0));
+        }
+        self.inner.size_hint()
+    }
+}
+
 // ---------- InterMacroblocks iterator (typed §3.3 walker) ----------------
 
 /// One macroblock yielded by [`InterMacroblocks`].
@@ -2065,6 +2277,208 @@ mod tests {
                 (Mb::V4(bx), InterMb::V4(ex)) => assert_eq!(*bx, ex, "V4 idx at {i}"),
                 _ => panic!("mismatch at {i}: bulk {:?}, typed {:?}", b, e.kind),
             }
+        }
+    }
+
+    // ---------- MixedIntraRgbBlocks resolved-RGB walker -----------------
+
+    use crate::codebook::CodebookEntry;
+    use crate::yuv::{expand_v1_mb_rgb, expand_v4_mb_rgb};
+
+    /// Build a tiny resolved V1 codebook with distinguishable entries.
+    fn sample_v1_book() -> Vec<CodebookEntry> {
+        vec![
+            CodebookEntry::from_yuv(72, 72, 72, 72, -37, 91), // 0: M1 red
+            CodebookEntry::from_yuv(145, 145, 145, 145, -73, -73), // 1: M2 green
+            CodebookEntry::from_yuv(50, 100, 150, 200, -36, 39), // 2: M10-chroma ramp
+        ]
+    }
+
+    fn sample_v4_book() -> Vec<CodebookEntry> {
+        vec![
+            CodebookEntry::from_yuv(16, 30, 72, 86, -37, 91), // 0
+            CodebookEntry::from_yuv(40, 54, 96, 110, -73, -73), // 1
+            CodebookEntry::from_yuv(128, 142, 156, 170, 109, -19), // 2
+            CodebookEntry::from_yuv(156, 170, 212, 226, 0, 0), // 3
+        ]
+    }
+
+    /// `0x3000` strip with a 2×2 macroblock grid (4 MBs), all V1 — each
+    /// macroblock reconstructs to the expected RGB block and grid
+    /// position per spec §1.1 + §4 + §3.
+    #[test]
+    fn rgb_blocks_all_v1_positions_and_pixels() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        // Flag word all-zero ⇒ all V1; index bytes select slots 0,1,2,0.
+        let payload = vec![0x00, 0x00, 0x00, 0x00, 0, 1, 2, 0];
+        let blocks: Vec<_> = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 2, 4)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(blocks.len(), 4);
+        // Scan-order → (col, row) for a 2-wide grid: 0→(0,0) 1→(1,0)
+        // 2→(0,1) 3→(1,1).
+        let expect_pos = [(0u16, 0u16), (1, 0), (0, 1), (1, 1)];
+        let idx = [0usize, 1, 2, 0];
+        for (k, b) in blocks.iter().enumerate() {
+            assert_eq!(b.index, k as u16);
+            assert_eq!((b.mb_col, b.mb_row), expect_pos[k]);
+            assert_eq!(b.pixel_col, 4 * expect_pos[k].0 as u32);
+            assert_eq!(b.pixel_row, 4 * expect_pos[k].1 as u32);
+            assert_eq!(b.coding, MixedIntraCoding::V1);
+            assert_eq!(b.rgb, expand_v1_mb_rgb(&v1[idx[k]]));
+        }
+        // Anchor MB 0 to the verified M1 red corner pixel.
+        assert_eq!(blocks[0].rgb[0][0], [254, 0, 0]);
+    }
+
+    /// `0x3000` strip, all V4 — each macroblock reconstructs from its
+    /// four V4 codebook entries via the §5 sub-block layout.
+    #[test]
+    fn rgb_blocks_all_v4() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        // 2 MBs, flag word top 2 bits set ⇒ both V4. 4 idx bytes each.
+        let payload = vec![
+            0xc0, 0x00, 0x00, 0x00, // both V4
+            0, 1, 2, 3, // MB0 quad
+            3, 2, 1, 0, // MB1 quad
+        ];
+        let blocks: Vec<_> = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 2, 2)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].coding, MixedIntraCoding::V4);
+        let quad0 = [v4[0], v4[1], v4[2], v4[3]];
+        let quad1 = [v4[3], v4[2], v4[1], v4[0]];
+        assert_eq!(blocks[0].rgb, expand_v4_mb_rgb(&quad0));
+        assert_eq!(blocks[1].rgb, expand_v4_mb_rgb(&quad1));
+    }
+
+    /// Mixed V1/V4 in one group: the RGB walker resolves each per its
+    /// classification; positions follow scan order.
+    #[test]
+    fn rgb_blocks_mixed_v1_v4() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        // 3 MBs: V1, V4, V1. Flag word top bits = 0b010... ⇒ MB1 V4.
+        let payload = vec![
+            0x40, 0x00, 0x00, 0x00, // MB0 V1, MB1 V4, MB2 V1
+            1,    // MB0 V1 idx
+            0, 1, 2, 3, // MB1 V4 quad
+            2, // MB2 V1 idx
+        ];
+        let blocks: Vec<_> = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 3, 3)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].coding, MixedIntraCoding::V1);
+        assert_eq!(blocks[0].rgb, expand_v1_mb_rgb(&v1[1]));
+        assert_eq!(blocks[1].coding, MixedIntraCoding::V4);
+        assert_eq!(
+            blocks[1].rgb,
+            expand_v4_mb_rgb(&[v4[0], v4[1], v4[2], v4[3]])
+        );
+        assert_eq!(blocks[2].coding, MixedIntraCoding::V1);
+        assert_eq!(blocks[2].rgb, expand_v1_mb_rgb(&v1[2]));
+    }
+
+    /// Grayscale codebooks (chroma zero) reconstruct to
+    /// luminance-on-all-channels per the §4 grayscale identity.
+    #[test]
+    fn rgb_blocks_grayscale_identity() {
+        let v1 = vec![CodebookEntry::from_y(50, 100, 150, 200)];
+        let v4: Vec<CodebookEntry> = Vec::new();
+        let payload = vec![0x00, 0x00, 0x00, 0x00, 0];
+        let blocks: Vec<_> = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 1, 1)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(blocks[0].rgb[0][0], [50, 50, 50]); // Y0 quadrant
+        assert_eq!(blocks[0].rgb[3][3], [200, 200, 200]); // Y3 quadrant
+    }
+
+    /// An out-of-range V1 index yields `Some(Err(_))` then fuses.
+    #[test]
+    fn rgb_blocks_v1_index_out_of_range_fuses() {
+        let v1 = sample_v1_book(); // len 3
+        let v4 = sample_v4_book();
+        let payload = vec![0x00, 0x00, 0x00, 0x00, 0, 99]; // MB1 idx 99 invalid
+        let mut it = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 2, 2).unwrap();
+        assert!(it.next().unwrap().is_ok()); // MB0 fine
+        assert!(it.next().unwrap().is_err()); // MB1 out of range
+        assert!(it.next().is_none()); // fused
+    }
+
+    /// An out-of-range V4 index also errors and fuses.
+    #[test]
+    fn rgb_blocks_v4_index_out_of_range_fuses() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book(); // len 4
+        let payload = vec![0x80, 0x00, 0x00, 0x00, 0, 1, 2, 200]; // last idx invalid
+        let mut it = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 1, 1).unwrap();
+        assert!(it.next().unwrap().is_err());
+        assert!(it.next().is_none());
+    }
+
+    /// A truncated payload propagates the inner walker's error and fuses.
+    #[test]
+    fn rgb_blocks_truncated_payload_fuses() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        // Promises 2 V1 MBs but only one index byte present.
+        let payload = vec![0x00, 0x00, 0x00, 0x00, 0];
+        let mut it = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 2, 2).unwrap();
+        assert!(it.next().unwrap().is_ok());
+        assert!(it.next().unwrap().is_err());
+        assert!(it.next().is_none());
+    }
+
+    /// `mb_cols == 0` is rejected at construction.
+    #[test]
+    fn rgb_blocks_zero_cols_rejected() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        assert!(MixedIntraRgbBlocks::new(&[], &v1, &v4, 0, 0).is_err());
+    }
+
+    /// The resolved-RGB walker agrees with composing the index-only
+    /// [`MixedIntraMacroblocks`] walker + manual codebook lookup +
+    /// expansion — the resolved surface is exactly that composition.
+    #[test]
+    fn rgb_blocks_match_manual_composition() {
+        let v1 = sample_v1_book();
+        let v4 = sample_v4_book();
+        let payload = vec![
+            0x40, 0x00, 0x00, 0x00, // V1, V4, V1, V1
+            0,    // MB0
+            1, 2, 3, 0, // MB1 quad
+            2, // MB2
+            1, // MB3
+        ];
+        let resolved: Vec<_> = MixedIntraRgbBlocks::new(&payload, &v1, &v4, 2, 4)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let indexed: Vec<_> = MixedIntraMacroblocks::new(&payload, 4)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(resolved.len(), indexed.len());
+        for (r, e) in resolved.iter().zip(indexed.iter()) {
+            assert_eq!(r.index, e.index);
+            let expect = match e.kind {
+                MixedIntraMb::V1(i) => expand_v1_mb_rgb(&v1[i as usize]),
+                MixedIntraMb::V4(q) => expand_v4_mb_rgb(&[
+                    v4[q[0] as usize],
+                    v4[q[1] as usize],
+                    v4[q[2] as usize],
+                    v4[q[3] as usize],
+                ]),
+            };
+            assert_eq!(r.rgb, expect);
         }
     }
 }

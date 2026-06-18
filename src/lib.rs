@@ -77,7 +77,8 @@ pub use film::{
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 pub use vector::{
-    InterEntry, InterMacroblocks, InterMb, MixedIntraEntry, MixedIntraMacroblocks, MixedIntraMb,
+    InterEntry, InterMacroblocks, InterMb, MixedIntraCoding, MixedIntraEntry,
+    MixedIntraMacroblocks, MixedIntraMb, MixedIntraRgbBlock, MixedIntraRgbBlocks,
     V1MacroblockEntry, V1OnlyMacroblocks,
 };
 pub use yuv::{expand_v1_mb_rgb, expand_v4_mb_rgb, yuv_to_rgb};

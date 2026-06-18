@@ -154,6 +154,14 @@ validators, fuzz harnesses, and introspection tools:
 - `vector::V1OnlyMacroblocks` / `MixedIntraMacroblocks` /
   `InterMacroblocks` — per-macroblock walkers for the `0x3200` /
   `0x3000` / `0x3100` vector codes.
+- `vector::MixedIntraRgbBlocks` — resolved-RGB capstone over a `0x3000`
+  payload: given the strip's V1/V4 codebooks and macroblock-grid width
+  it yields each macroblock's fully reconstructed 4×4 RGB block
+  (`MixedIntraRgbBlock`) with its `(mb_col, mb_row)` grid position and
+  pixel origin — the framebuffer-free counterpart of the decoder's
+  intra reconstruction loop (composes the `0x3000` walk with the §§4/5
+  expansion and §3 YUV→RGB matrix). Out-of-range indices / truncation
+  yield `Some(Err(_))` then fuse.
 - `CodebookEntry::luma_subblock` / `expand_v1_luma`, plus
   `expand_v4_luma` / `expand_v4_chroma` — §4/§5 macroblock plane
   geometry without the YUV→RGB matrix.

@@ -87,7 +87,8 @@ use crate::header::{
 };
 use crate::image::{CinepakFrame, CinepakPixelFormat};
 use crate::vector::{
-    encode_inter_payload, encode_mixed_intra_payload, Mb, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA,
+    encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload, Mb,
+    VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY,
 };
 
 /// Encoder configuration.
@@ -3495,11 +3496,27 @@ fn encode_intra_strip(
     let mut chunks = Vec::new();
     emit_codebook_chunks_full(mode, &v4_cb, &v1_cb, opts, &mut chunks);
 
-    // Vector chunk 0x3000 (mixed intra).
+    // Vector chunk: pick the cheaper of the two intra-legal codes.
+    // When every macroblock of the strip is V1-coded, the `0x3200`
+    // V1-only form (spec §3.1) is strictly smaller than the `0x3000`
+    // mixed form (spec §3.2): it carries one index byte per macroblock
+    // with no per-group flag word, whereas the mixed form spends an
+    // extra `ceil(N / 32) × 4` bytes on flag words whose every bit is
+    // `0` (all-V1). This mirrors the reference encoder strategy in
+    // spec §8 ("the encoder picks `0x3200` when every macroblock fits a
+    // V1 vector"). Reconstruction is byte-identical either way — the
+    // decoder expands the same V1 indices.
+    let all_v1 = mbs.iter().all(|mb| matches!(mb, Mb::V1(_)));
     let mut vec_payload = Vec::new();
-    encode_mixed_intra_payload(&mbs, &mut vec_payload)?;
+    let vec_chunk_id = if all_v1 && !mbs.is_empty() {
+        encode_v1_only_payload(&mbs, &mut vec_payload)?;
+        VECTOR_CHUNK_V1_ONLY
+    } else {
+        encode_mixed_intra_payload(&mbs, &mut vec_payload)?;
+        VECTOR_CHUNK_INTRA
+    };
     let vec_chunk_size = (CHUNK_HEADER_SIZE + vec_payload.len()) as u16;
-    chunks.extend_from_slice(&VECTOR_CHUNK_INTRA.to_be_bytes());
+    chunks.extend_from_slice(&vec_chunk_id.to_be_bytes());
     chunks.extend_from_slice(&vec_chunk_size.to_be_bytes());
     chunks.extend_from_slice(&vec_payload);
 
@@ -5782,6 +5799,95 @@ mod tests {
                 lums[q]
             );
         }
+    }
+
+    /// An intra strip in which every macroblock is V1-coded is emitted
+    /// with the `0x3200` V1-only vector chunk, not the `0x3000` mixed
+    /// form — saving the per-group flag word(s) per spec §8. A flat /
+    /// low-detail frame collapses to all-V1 macroblocks.
+    #[test]
+    fn flat_intra_strip_emits_v1_only_vector_chunk() {
+        use crate::codebook::{StripChunks, VectorChunkKind};
+        use crate::header::FrameStrips;
+
+        // 64×16 solid mid-gray: every 4×4 MB is the same flat colour, so
+        // the encoder selects V1 for every macroblock.
+        let w = 64usize;
+        let h = 16usize;
+        let rgb = vec![128u8; w * h * 3];
+        let opts = EncoderOptions {
+            strip_count: 1,
+            ..Default::default()
+        };
+        let bytes = encode_rgb24(&rgb, w as u32, h as u32, opts).unwrap();
+
+        // Walk to the single strip's vector chunk.
+        let mut strips = FrameStrips::new(&bytes).unwrap();
+        let strip = strips.next().unwrap().unwrap();
+        let mut saw_vector = false;
+        for chunk in StripChunks::new(strip.payload) {
+            let entry = chunk.unwrap();
+            if let crate::codebook::StripChunkKind::Vector(v) = entry.kind {
+                assert_eq!(
+                    v,
+                    VectorChunkKind::IntraV1Only,
+                    "flat all-V1 intra strip must use 0x3200, got 0x{:04x}",
+                    entry.raw_id
+                );
+                // 0x3200 carries exactly one index byte per macroblock,
+                // no flag word: payload len == MB count == (w/4)*(h/4).
+                let mb_count = (w / 4) * (h / 4);
+                assert_eq!(entry.payload.len(), mb_count);
+                saw_vector = true;
+            }
+        }
+        assert!(saw_vector, "no vector chunk found in strip");
+
+        // Reconstruction is unchanged by the chunk-code choice.
+        let mut dec = CinepakDecoder::new();
+        let f = dec.decode_frame(&bytes, None).unwrap();
+        let p = f.pixels();
+        let s = f.stride();
+        let off = 8 * s + 8 * 3;
+        assert!((p[off] as i32 - 128).abs() <= 8);
+    }
+
+    /// A detailed intra strip (per-MB high-frequency content forcing at
+    /// least one V4 macroblock) still uses the `0x3000` mixed form.
+    #[test]
+    fn detailed_intra_strip_keeps_mixed_vector_chunk() {
+        use crate::codebook::{StripChunks, VectorChunkKind};
+        use crate::header::FrameStrips;
+
+        // 16×16 per-pixel luma ramp: each 4×4 MB needs V4 detail.
+        let w = 16usize;
+        let h = 16usize;
+        let mut rgb = vec![0u8; w * h * 3];
+        for r in 0..h {
+            for c in 0..w {
+                let v = ((r * w + c) * 255 / (w * h)) as u8;
+                let off = (r * w + c) * 3;
+                rgb[off] = v;
+                rgb[off + 1] = v;
+                rgb[off + 2] = v;
+            }
+        }
+        let opts = EncoderOptions {
+            strip_count: 1,
+            ..Default::default()
+        };
+        let bytes = encode_rgb24(&rgb, w as u32, h as u32, opts).unwrap();
+
+        let mut strips = FrameStrips::new(&bytes).unwrap();
+        let strip = strips.next().unwrap().unwrap();
+        let mut vec_kind = None;
+        for chunk in StripChunks::new(strip.payload) {
+            let entry = chunk.unwrap();
+            if let crate::codebook::StripChunkKind::Vector(v) = entry.kind {
+                vec_kind = Some(v);
+            }
+        }
+        assert_eq!(vec_kind, Some(VectorChunkKind::IntraMixed));
     }
 
     /// Encoder rejects non-multiple-of-4 dims (matches header parser).

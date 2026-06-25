@@ -61,6 +61,13 @@ Lloyd polish; per-macroblock V1-vs-V4 selection is Lagrangian
 rate-distortion (`D + λ·R`). All clustering math is published VQ-design
 or academic algorithm work — no external encoder source is consulted.
 
+Intra strips emit the `0x3200` V1-only vector chunk when every
+macroblock is V1-coded (flat / low-detail content), saving the
+per-group flag word(s) the `0x3000` mixed form would carry; a strip
+with any V4 macroblock keeps `0x3000`. Reconstruction is byte-identical
+either way — the choice is a pure rate win and is reflected in the
+RD-grid pickers' byte-cost scoring.
+
 Intra entry points:
 
 - `encode_rgb24` / `encode_gray8` — multi-strip intra encoder.

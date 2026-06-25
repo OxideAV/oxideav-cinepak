@@ -6,6 +6,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 371 (encoder V1-only intra vector chunk): the intra strip
+  encoder now emits the `0x3200` V1-only vector chunk instead of the
+  `0x3000` mixed form whenever every macroblock of the strip is
+  V1-coded (flat / low-detail content). The `0x3200` form carries one
+  index byte per macroblock with **no per-group flag word**, whereas
+  the mixed `0x3000` form spends an extra `ceil(N / 32) × 4` bytes on
+  all-zero flag words; for a single-strip 320×240 frame (4800
+  macroblocks) that saves 600 bytes per all-V1 strip. This mirrors the
+  reference encoder strategy documented in
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` §8 ("the
+  encoder picks `0x3200` when every macroblock fits a V1 vector").
+  Reconstruction is byte-identical to the prior `0x3000` output — the
+  decoder expands the same V1 indices. Detailed strips that need at
+  least one V4 macroblock continue to use `0x3000`. Two new unit tests
+  (`flat_intra_strip_emits_v1_only_vector_chunk`,
+  `detailed_intra_strip_keeps_mixed_vector_chunk`) lock the dispatch.
+
 ### Added
 
 - Round 335 (resolved-RGB mixed-intra macroblock walker): new

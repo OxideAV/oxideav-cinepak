@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Skip-free inter strips now pick the cheapest legal vector code instead
+  of always emitting `0x3100`. When an inter strip contains **no skip
+  macroblocks** — every macroblock is recoded fresh, e.g. a scene cut
+  where no previous-frame content can be reused — the `0x3100` form is
+  wasteful: its skip / V1 / V4 VLC spends 2 bits per coded macroblock, so
+  a 32-bit flag word holds only ~16 macroblocks and the chunk pays
+  `ceil(N / 16) × 4` flag-word bytes. The same skip-free macroblock set
+  is expressed identically by `0x3000` (mixed, 1 bit/MB ⇒ 32 MBs/group,
+  `ceil(N / 32) × 4` flag-word bytes) and, when every coded macroblock is
+  V1, by the flag-word-free `0x3200`. The encoder now routes a skip-free
+  strip to `0x3200` (all-V1) or `0x3000` (any V4), keeping `0x3100` only
+  when at least one macroblock skips. The index data is byte-identical
+  across the three forms, so the reconstruction is unchanged; only the
+  flag-word overhead shrinks. This mirrors the intra-strip dispatch and
+  the reference encoder strategy in
+  `docs/video/cinepak/spec/03-vectors-and-macroblocks.md` §8 ("the
+  encoder may also opt for `0x3000` on an inter strip when the
+  previous-frame content cannot be reused"; the decoder accepts all three
+  vector codes on either strip kind). Three new unit tests
+  (`skipfree_all_v1_inter_strip_uses_v1_only_chunk`,
+  `skipfree_mixed_inter_strip_uses_mixed_chunk`,
+  `inter_strip_with_skips_keeps_inter_chunk`) lock the dispatch in all
+  three directions with roundtrip checks.
 - Round 371 (encoder V1-only intra vector chunk): the intra strip
   encoder now emits the `0x3200` V1-only vector chunk instead of the
   `0x3000` mixed form whenever every macroblock of the strip is

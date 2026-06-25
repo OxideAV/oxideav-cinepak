@@ -3738,11 +3738,48 @@ fn encode_inter_strip_with_stats(
         roll.update_staleness(WhichCodebook::V1, &v1_used, opts.v1_entries as usize);
     }
 
-    // Vector chunk 0x3100 (mixed inter with skip).
+    // Vector chunk: pick the cheapest inter-legal code for this strip.
+    //
+    // The default inter code is `0x3100` (skip / V1 / V4 VLC). But when
+    // the strip contains **no skip macroblocks** — every macroblock was
+    // re-coded fresh, e.g. a scene cut where no previous-frame content
+    // could be reused — `0x3100` is wasteful: its 2-bit-per-coded-MB
+    // grammar fills a 32-bit flag word with only ~16 macroblocks, so it
+    // spends `4 × ceil(N / 16)` flag-word bytes. The skip-free macroblock
+    // set is exactly what `0x3000` (mixed intra, 1 bit/MB ⇒ 32 MBs/group,
+    // `4 × ceil(N / 32)` flag-word bytes) and `0x3200` (all-V1, no flag
+    // word) encode — and the decoder accepts all three vector codes on an
+    // inter strip (spec §8: "both forms are wire-legal on inter strips";
+    // §3.3 reserves `0x3100` for skip semantics that this strip doesn't
+    // use). The index data is byte-identical across the three forms, so
+    // the reconstruction is unchanged; only the flag-word overhead shrinks.
+    //
+    // This mirrors the intra-strip dispatch above and the reference
+    // encoder strategy in spec §8 ("the encoder may also opt for `0x3000`
+    // on an inter strip when the previous-frame content cannot be reused").
+    let has_skip = mbs.iter().any(|mb| matches!(mb, Mb::Skip));
+    let all_v1 = !mbs.is_empty() && mbs.iter().all(|mb| matches!(mb, Mb::V1(_)));
     let mut vec_payload = Vec::new();
-    encode_inter_payload(&mbs, &mut vec_payload)?;
+    let vec_chunk_id = if !has_skip && all_v1 {
+        // No skips and every macroblock is V1 ⇒ the flag-word-free
+        // `0x3200` form is unconditionally smallest.
+        encode_v1_only_payload(&mbs, &mut vec_payload)?;
+        VECTOR_CHUNK_V1_ONLY
+    } else if !has_skip {
+        // No skips but some V4 macroblocks ⇒ `0x3000` (1 bit/MB) is never
+        // larger than `0x3100` (2 bits/MB) for the same macroblock set,
+        // and is strictly smaller whenever the strip spans a flag-word
+        // boundary.
+        encode_mixed_intra_payload(&mbs, &mut vec_payload)?;
+        VECTOR_CHUNK_INTRA
+    } else {
+        // At least one skip ⇒ `0x3100` is the only code that can express
+        // it (spec §3.1/§3.2 have no skip token).
+        encode_inter_payload(&mbs, &mut vec_payload)?;
+        VECTOR_CHUNK_INTER
+    };
     let vec_chunk_size = (CHUNK_HEADER_SIZE + vec_payload.len()) as u16;
-    chunks.extend_from_slice(&VECTOR_CHUNK_INTER.to_be_bytes());
+    chunks.extend_from_slice(&vec_chunk_id.to_be_bytes());
     chunks.extend_from_slice(&vec_chunk_size.to_be_bytes());
     chunks.extend_from_slice(&vec_payload);
 
@@ -5888,6 +5925,143 @@ mod tests {
             }
         }
         assert_eq!(vec_kind, Some(VectorChunkKind::IntraMixed));
+    }
+
+    /// Helper: classify the single vector chunk of a single-strip frame.
+    #[cfg(test)]
+    fn single_strip_vector_kind(bytes: &[u8]) -> crate::codebook::VectorChunkKind {
+        use crate::codebook::{StripChunkKind, StripChunks};
+        use crate::header::FrameStrips;
+        let mut strips = FrameStrips::new(bytes).unwrap();
+        let strip = strips.next().unwrap().unwrap();
+        let mut kind = None;
+        for chunk in StripChunks::new(strip.payload) {
+            if let StripChunkKind::Vector(v) = chunk.unwrap().kind {
+                kind = Some(v);
+            }
+        }
+        kind.expect("no vector chunk found in strip")
+    }
+
+    /// An inter strip with **no skip macroblocks** (every macroblock is
+    /// re-coded fresh — e.g. a scene cut where nothing from the previous
+    /// frame can be reused) and where every coded macroblock is V1 is
+    /// emitted with the flag-word-free `0x3200` form, not the 2-bit-per-MB
+    /// `0x3100` form (spec §8: `0x3000`/`0x3200` are wire-legal on inter
+    /// strips). Reconstruction is byte-identical.
+    #[test]
+    fn skipfree_all_v1_inter_strip_uses_v1_only_chunk() {
+        use crate::codebook::VectorChunkKind;
+        let w = 64usize;
+        let h = 16usize;
+        // Previous frame: solid black. Current frame: solid mid-gray —
+        // wholly different, so no macroblock can skip; and flat, so every
+        // macroblock is V1.
+        let prev_rgb = vec![0u8; w * h * 3];
+        let cur_rgb = vec![128u8; w * h * 3];
+        let intra = encode_rgb24(&prev_rgb, w as u32, h as u32, EncoderOptions::default()).unwrap();
+        let mut dec = CinepakDecoder::new();
+        let prev = dec.decode_frame(&intra, None).unwrap();
+
+        let opts = EncoderOptions {
+            strip_count: 1,
+            // Tiny threshold ⇒ the large black→gray delta never skips.
+            skip_threshold: 0.0,
+            ..Default::default()
+        };
+        let bytes = encode_rgb24_inter(&cur_rgb, &prev, w as u32, h as u32, opts).unwrap();
+        // Inter strip id (0x1100) but V1-only vector chunk.
+        let strip_off = FRAME_HEADER_SIZE;
+        assert_eq!(&bytes[strip_off..strip_off + 2], &[0x11, 0x00]);
+        assert_eq!(
+            single_strip_vector_kind(&bytes),
+            VectorChunkKind::IntraV1Only,
+            "skip-free all-V1 inter strip must use 0x3200"
+        );
+
+        // Reconstruction: decode against the same prev state.
+        let mut dec2 = CinepakDecoder::new();
+        let _ = dec2.decode_frame(&intra, None).unwrap();
+        let f = dec2.decode_frame(&bytes, None).unwrap();
+        let p = f.pixels();
+        let s = f.stride();
+        assert!((p[8 * s + 8 * 3] as i32 - 128).abs() <= 10);
+    }
+
+    /// A skip-free inter strip that contains at least one V4 macroblock is
+    /// emitted with the `0x3000` mixed form (1 bit/MB) rather than `0x3100`
+    /// (2 bits/MB) — never larger, strictly smaller across a flag-word
+    /// boundary. Decode is unchanged.
+    #[test]
+    fn skipfree_mixed_inter_strip_uses_mixed_chunk() {
+        use crate::codebook::VectorChunkKind;
+        let w = 16usize;
+        let h = 16usize;
+        // Previous frame: solid black. Current frame: per-pixel luma ramp
+        // (forces V4 detail), wholly different from black ⇒ no skips.
+        let prev_rgb = vec![0u8; w * h * 3];
+        let mut cur_rgb = vec![0u8; w * h * 3];
+        for r in 0..h {
+            for c in 0..w {
+                let v = ((r * w + c) * 255 / (w * h)) as u8;
+                let off = (r * w + c) * 3;
+                cur_rgb[off] = v;
+                cur_rgb[off + 1] = v;
+                cur_rgb[off + 2] = v;
+            }
+        }
+        let intra = encode_rgb24(&prev_rgb, w as u32, h as u32, EncoderOptions::default()).unwrap();
+        let mut dec = CinepakDecoder::new();
+        let prev = dec.decode_frame(&intra, None).unwrap();
+
+        let opts = EncoderOptions {
+            strip_count: 1,
+            skip_threshold: 0.0,
+            ..Default::default()
+        };
+        let bytes = encode_rgb24_inter(&cur_rgb, &prev, w as u32, h as u32, opts).unwrap();
+        let strip_off = FRAME_HEADER_SIZE;
+        assert_eq!(&bytes[strip_off..strip_off + 2], &[0x11, 0x00]);
+        assert_eq!(
+            single_strip_vector_kind(&bytes),
+            VectorChunkKind::IntraMixed,
+            "skip-free mixed inter strip must use 0x3000"
+        );
+
+        // Roundtrip stays valid.
+        let mut dec2 = CinepakDecoder::new();
+        let _ = dec2.decode_frame(&intra, None).unwrap();
+        let f = dec2.decode_frame(&bytes, None).unwrap();
+        assert_eq!(f.width as usize, w);
+    }
+
+    /// An inter strip that DOES contain skip macroblocks keeps the
+    /// `0x3100` form — it is the only vector code with a skip token.
+    #[test]
+    fn inter_strip_with_skips_keeps_inter_chunk() {
+        use crate::codebook::VectorChunkKind;
+        let w = 16usize;
+        let h = 16usize;
+        // Previous == current solid gray ⇒ every macroblock skips.
+        let rgb = vec![128u8; w * h * 3];
+        let intra = encode_rgb24(&rgb, w as u32, h as u32, EncoderOptions::default()).unwrap();
+        let mut dec = CinepakDecoder::new();
+        let prev = dec.decode_frame(&intra, None).unwrap();
+
+        let opts = EncoderOptions {
+            strip_count: 1,
+            // Generous threshold ⇒ the zero-delta blocks all skip.
+            skip_threshold: 64.0,
+            ..Default::default()
+        };
+        let bytes = encode_rgb24_inter(&rgb, &prev, w as u32, h as u32, opts).unwrap();
+        let strip_off = FRAME_HEADER_SIZE;
+        assert_eq!(&bytes[strip_off..strip_off + 2], &[0x11, 0x00]);
+        assert_eq!(
+            single_strip_vector_kind(&bytes),
+            VectorChunkKind::InterWithSkip,
+            "inter strip with skips must keep 0x3100"
+        );
     }
 
     /// Encoder rejects non-multiple-of-4 dims (matches header parser).

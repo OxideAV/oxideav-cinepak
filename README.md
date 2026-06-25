@@ -61,12 +61,19 @@ Lloyd polish; per-macroblock V1-vs-V4 selection is Lagrangian
 rate-distortion (`D + λ·R`). All clustering math is published VQ-design
 or academic algorithm work — no external encoder source is consulted.
 
-Intra strips emit the `0x3200` V1-only vector chunk when every
-macroblock is V1-coded (flat / low-detail content), saving the
-per-group flag word(s) the `0x3000` mixed form would carry; a strip
-with any V4 macroblock keeps `0x3000`. Reconstruction is byte-identical
-either way — the choice is a pure rate win and is reflected in the
-RD-grid pickers' byte-cost scoring.
+Every strip picks the cheapest legal vector code for its macroblocks.
+An intra strip emits the `0x3200` V1-only chunk when every macroblock is
+V1-coded (flat / low-detail content), saving the per-group flag word(s)
+the `0x3000` mixed form would carry; a strip with any V4 macroblock keeps
+`0x3000`. An **inter strip with no skip macroblocks** (a full recode,
+e.g. a scene cut) is likewise routed to `0x3200` (all-V1) or `0x3000`
+(any V4) rather than `0x3100`: the inter chunk's skip/V1/V4 VLC spends
+2 bits per coded macroblock versus 1 bit for `0x3000`, so dropping it
+roughly halves the flag-word overhead. `0x3100` is kept only when at
+least one macroblock skips (it is the only vector code with a skip
+token). Reconstruction is byte-identical across the forms — the choice
+is a pure rate win and is reflected in the RD-grid pickers' byte-cost
+scoring.
 
 Intra entry points:
 

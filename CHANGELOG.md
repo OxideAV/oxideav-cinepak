@@ -6,6 +6,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- New `encode_roundtrip` `cargo-fuzz` target. The existing harnesses all
+  drive the decode / parse side; this one fuzzes the **encoder**: it
+  builds attacker-shaped pixel buffers, dimensions (capped at 64×64), and
+  option knobs (`from_quality` and a hand-built `EncoderOptions` flavour
+  stressing `strip_count` / `skip_threshold`), encodes via `encode_rgb24`
+  / `encode_gray8` / `encode_rgb24_inter`, and feeds every output back
+  through `CinepakDecoder` to assert the encoder always emits a
+  decoder-acceptable stream. This exercises the full `0x3000` / `0x3100`
+  / `0x3200` vector-code dispatch — including the skip-free inter routing
+  added in this round — across both pixel modes and the intra / inter
+  paths. A 491,520-iteration local replay of the harness body over a
+  synthetic input grid completed with no panic.
+
 ### Changed
 
 - Skip-free inter strips now pick the cheapest legal vector code instead

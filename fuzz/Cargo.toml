@@ -90,3 +90,10 @@ path = "fuzz_targets/film_pcm_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false

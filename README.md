@@ -226,12 +226,20 @@ A `cargo-fuzz` harness under `fuzz/` covers the public parse/decode
 entry points and the FILM PCM-shaping helpers — frame/strip header
 parse, full and deviant `decode_frame`, multi-frame stateful decode,
 the FILM container parse, the codebook-chunk and vector-chunk parsers
-in isolation, and the PCM reshaping functions. Each target's contract
-is that any input yields a `Result` and never panics, overflows, or
-OOMs; pixel-budget caps keep worst-case rasters bounded. Run e.g.:
+in isolation, and the PCM reshaping functions. An `encode_roundtrip`
+target drives the *encoder* with attacker-shaped pixel buffers,
+dimensions, and option knobs across both pixel modes and the
+intra/inter paths, then feeds every encoder output back through
+`CinepakDecoder` to assert the encoder always emits a stream the
+decoder accepts (exercising the `0x3000` / `0x3100` / `0x3200`
+vector-code dispatch). Each target's contract is that any input yields
+a `Result` and never panics, overflows, or OOMs; pixel-budget caps
+(decode) and a 64×64 dimension cap (encode) keep worst-case rasters
+bounded. Run e.g.:
 
 ```sh
 cargo +nightly fuzz run decode_frame
+cargo +nightly fuzz run encode_roundtrip
 ```
 
 ## License

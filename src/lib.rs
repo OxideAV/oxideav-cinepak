@@ -46,6 +46,7 @@ pub mod error;
 pub mod film;
 pub mod header;
 pub mod image;
+pub mod lint;
 pub mod vector;
 pub mod yuv;
 
@@ -76,6 +77,9 @@ pub use film::{
     SampleRecord, SampleRecordEntry, Samples, StabHeader, SAMPLE_RECORD_SIZE, STAB_HEADER_SIZE,
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
+pub use lint::{
+    lint_frame, lint_frame_with, LintIssue, LintOptions, LintReport, LintRule, LintSeverity,
+};
 pub use vector::{
     InterEntry, InterMacroblocks, InterMb, MixedIntraCoding, MixedIntraEntry,
     MixedIntraMacroblocks, MixedIntraMb, MixedIntraRgbBlock, MixedIntraRgbBlocks,

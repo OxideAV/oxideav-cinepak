@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 (wire-format conformance lint — frame + strip layers): new
+  `lint` module with `lint_frame` / `lint_frame_with` entry points and
+  the `LintReport` / `LintIssue` / `LintRule` / `LintSeverity` /
+  `LintOptions` types. Where the decoder answers "can these bytes be
+  turned into pixels?", the linter answers the stricter structured
+  question "do these bytes conform to the documented wire format, and
+  if not, which rule, where, and how badly?" — every finding carries
+  the violated rule, an `Error` (normative violation) vs `Warning`
+  (SHOULD / encoder-convention / corpus-observation deviation)
+  severity, the strip location, the byte offset, and the spec section
+  the rule is grounded in (`LintRule::spec_ref`). This first milestone
+  covers the frame and strip layers of
+  `docs/video/cinepak/spec/01-frame-and-strip.md`: header truncation,
+  `frame_length` under-header / buffer-overrun / `10 + Σ strip_size`
+  accounting (§1.2/§3), zero strip count, zero and non-multiple-of-4
+  frame dimensions (§1 + spec 03 §1), reserved `flags` bits (§1.1
+  SHOULD ⇒ Warning), the `flags`-bit-0-on-all-intra-frame
+  contradiction (§1.1 + spec 02 §5.2 ⇒ Warning), strip-header
+  truncation / `strip_size < 12` / frame overrun (§2), the
+  `{0x1000, 0x1100}` strip-id taxonomy (§2.1), mixed intra+inter strip
+  kinds (§2.1 observation ⇒ Warning), the §2.2 y-sentinel geometry
+  (empty rects, non-multiple-of-4 strip extents, strips outside the
+  coded frame, non-full-width strips ⇒ Warning, non-contiguous
+  vertical tiling ⇒ Warning). The walk is best-effort (reports as many
+  independent issues as possible, never panics on arbitrary input) and
+  read-only. 23 new lib tests cover every rule in both directions plus
+  encoder-output cleanliness (single- and multi-strip) and an
+  adversarial no-panic sweep. Later milestones extend the same report
+  down the chunk, vector, and codebook-occupancy layers.
 - New `encode_roundtrip` `cargo-fuzz` target. The existing harnesses all
   drive the decode / parse side; this one fuzzes the **encoder**: it
   builds attacker-shaped pixel buffers, dimensions (capped at 64×64), and

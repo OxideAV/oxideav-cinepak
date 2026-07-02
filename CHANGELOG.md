@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 2 (conformance lint — chunk layer): the linter
+  now walks each strip's chunk stream per spec 02 §1 and reports:
+  chunk-header truncation / `chunk_size < 4` / strip-payload overrun
+  (§1, which together enforce the `Σ chunk_size == strip_size − 12`
+  accounting), unknown chunk ids (§2.1 low-byte-zero taxonomy + spec
+  03 §2.1 vector codes), selective-update chunks on intra strips (§2.3
+  ⇒ Error), header-only full-replacement chunks on intra strips (§3.4
+  vacuous ⇒ Warning), full-replacement payload arithmetic (entry-size
+  alignment and the 256-entry ceiling, §3.1), selective-update payload
+  structure via the r256 `CodebookEntries` walker (truncated flag
+  word / entry, > 8 groups / 256 slots, §4.2–§4.3), mixed 12-bit-YUV +
+  grayscale chunk families within one frame (spec 04 §4 MUST NOT ⇒
+  Error, reported once with the offending strip/chunk), V1-before-V4
+  codebook ordering (§2.2 ⇒ Warning), duplicate same-flavour codebook
+  chunks (§2.2 ⇒ Warning), and any chunk following the strip's vector
+  chunk (spec 03 §2 "exactly one vector chunk after its codebook
+  chunks" ⇒ Error). `LintIssue.chunk` now carries the 0-based chunk
+  index. 14 new lib tests: a handcrafted fully-conformant intra frame
+  (clean), each rule in both fire and no-fire directions, the
+  once-per-frame mixed-mode cap, and cleanliness of the stateful
+  encoder's intra + inter output and the grayscale encoder's output.
 - Round 383 (wire-format conformance lint — frame + strip layers): new
   `lint` module with `lint_frame` / `lint_frame_with` entry points and
   the `LintReport` / `LintIssue` / `LintRule` / `LintSeverity` /

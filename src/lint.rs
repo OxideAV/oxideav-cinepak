@@ -32,6 +32,9 @@
 //! as it can rather than stopping at the first, and it never panics
 //! on arbitrary input.
 
+use crate::codebook::{
+    CodebookEntries, PixelMode, StripChunkKind, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
+};
 use crate::header::{
     RawStripHeader, StripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER,
     STRIP_ID_INTRA,
@@ -114,6 +117,58 @@ pub enum LintRule {
     /// from 0 to `height` (gap, overlap, or short coverage). Every
     /// observed stream tiles exactly (spec 01 §2.2 tables O3/O5).
     StripCoverageIrregular,
+
+    // ---- chunk layer (spec 02) ----
+    /// Fewer than 4 bytes left where a chunk header was declared.
+    /// Also covers the spec 02 §1 `Σ chunk_size == strip_size − 12`
+    /// accounting: leftover strip bytes that no chunk claims are
+    /// reported here (1–3 bytes) or as an unrecognised chunk.
+    ChunkHeaderTruncated,
+    /// `chunk_size < 4` (the chunk header's own size; spec 02 §1).
+    ChunkSizeUnderHeader,
+    /// Chunk's declared `chunk_size` overruns the strip payload
+    /// (spec 02 §1 accounting).
+    ChunkOverrunsStrip,
+    /// `chunk_id` outside the documented codebook (`0x20xx`–`0x27xx`,
+    /// low byte zero) and vector (`0x3000`/`0x3100`/`0x3200`)
+    /// taxonomies (spec 02 §2.1 + spec 03 §2.1).
+    UnknownChunkId,
+    /// Selective-update codebook chunk (`0x21xx`/`0x23xx`/`0x25xx`/
+    /// `0x27xx`) on an intra strip; spec 02 §2.3: only the
+    /// full-replacement family is permitted (there is no prior
+    /// codebook to update against).
+    SelectiveUpdateOnIntraStrip,
+    /// Header-only full-replacement chunk (`chunk_size = 4`) on an
+    /// intra strip: wire-legal but vacuously useless (spec 02 §3.4 —
+    /// there is no prior codebook to reuse).
+    HeaderOnlyCodebookOnIntraStrip,
+    /// Full-replacement codebook payload not a multiple of the entry
+    /// size (6 B for 12-bit YUV, 4 B for grayscale; spec 02 §3.1).
+    CodebookPayloadMisaligned,
+    /// Full-replacement codebook chunk carrying more than 256 entries
+    /// (spec 02 §3.1: 8-bit vector indices cap the codebook at 256).
+    CodebookTooManyEntries,
+    /// Selective-update payload malformed: truncated flag word or
+    /// entry, or more than 8 update groups / 256 slots addressed
+    /// (spec 02 §4.2–§4.3).
+    SelectiveUpdatePayloadMalformed,
+    /// Codebook chunks of both pixel modes (12-bit YUV `0x20xx`/
+    /// `0x22xx` and grayscale `0x24xx`/`0x26xx`) within one frame;
+    /// spec 04 §4: a conformant stream MUST NOT mix the two flavours
+    /// within the same frame.
+    MixedPixelModes,
+    /// A V1 codebook chunk precedes a V4 codebook chunk within the
+    /// strip; spec 02 §2.2 documents strict V4-then-V1 emission order
+    /// (vintage MacOS players require it; modern decoders don't).
+    CodebookOrderNotV4ThenV1,
+    /// Two codebook chunks addressing the same flavour (V4 or V1)
+    /// within one strip. Spec 02 §2.2 enumerates one chunk per
+    /// flavour; no observed stream repeats a flavour.
+    DuplicateCodebookChunk,
+    /// A chunk appears after the strip's vector chunk; spec 03 §2:
+    /// each strip carries exactly one vector chunk **after** its
+    /// codebook chunks.
+    ChunkAfterVectorChunk,
 }
 
 impl LintRule {
@@ -124,7 +179,10 @@ impl LintRule {
             | LintRule::FlagsInheritanceOnIntraFrame
             | LintRule::MixedStripKinds
             | LintRule::StripNotFullWidth
-            | LintRule::StripCoverageIrregular => LintSeverity::Warning,
+            | LintRule::StripCoverageIrregular
+            | LintRule::HeaderOnlyCodebookOnIntraStrip
+            | LintRule::CodebookOrderNotV4ThenV1
+            | LintRule::DuplicateCodebookChunk => LintSeverity::Warning,
             _ => LintSeverity::Error,
         }
     }
@@ -154,6 +212,21 @@ impl LintRule {
             | LintRule::FrameHeightNotMultipleOf4
             | LintRule::StripHeightNotMultipleOf4
             | LintRule::StripWidthNotMultipleOf4 => "03-vectors-and-macroblocks.md §1",
+            LintRule::ChunkHeaderTruncated
+            | LintRule::ChunkSizeUnderHeader
+            | LintRule::ChunkOverrunsStrip => "02-codebooks.md §1",
+            LintRule::UnknownChunkId => "02-codebooks.md §2.1 + 03-vectors-and-macroblocks.md §2.1",
+            LintRule::SelectiveUpdateOnIntraStrip => "02-codebooks.md §2.3",
+            LintRule::HeaderOnlyCodebookOnIntraStrip => "02-codebooks.md §3.4",
+            LintRule::CodebookPayloadMisaligned | LintRule::CodebookTooManyEntries => {
+                "02-codebooks.md §3.1"
+            }
+            LintRule::SelectiveUpdatePayloadMalformed => "02-codebooks.md §4.2–§4.3",
+            LintRule::MixedPixelModes => "04-yuv-rgb-matrix.md §4",
+            LintRule::CodebookOrderNotV4ThenV1 | LintRule::DuplicateCodebookChunk => {
+                "02-codebooks.md §2.2"
+            }
+            LintRule::ChunkAfterVectorChunk => "03-vectors-and-macroblocks.md §2",
         }
     }
 }
@@ -270,12 +343,290 @@ impl LintReport {
             message,
         });
     }
+
+    fn push_chunk(
+        &mut self,
+        rule: LintRule,
+        strip: u16,
+        chunk: u16,
+        offset: usize,
+        message: String,
+    ) {
+        self.issues.push(LintIssue {
+            rule,
+            severity: rule.severity(),
+            strip: Some(strip),
+            chunk: Some(chunk),
+            offset,
+            message,
+        });
+    }
 }
 
 /// Lint one standard (non-deviant) Cinepak frame with default
 /// options. See [`lint_frame_with`].
 pub fn lint_frame(bytes: &[u8]) -> LintReport {
     lint_frame_with(bytes, &LintOptions::default())
+}
+
+/// Frame-scoped state threaded through the per-strip chunk walks.
+#[derive(Default)]
+struct FrameChunkState {
+    /// Pixel mode established by the first codebook chunk of the
+    /// frame, with the strip index that set it (spec 04 §4: implicit
+    /// per-frame flavour).
+    mode: Option<(PixelMode, u16)>,
+    /// Set once [`LintRule::MixedPixelModes`] has been reported so a
+    /// long mixed frame doesn't flood the report.
+    mixed_reported: bool,
+}
+
+/// Walk one strip's chunk stream (spec 02 §1 layout) and report
+/// chunk-layer conformance issues.
+///
+/// `is_intra` is `Some(kind)` when the strip id classified, `None`
+/// for an unknown strip id (kind-dependent rules are skipped).
+/// `base_off` is the byte offset of `payload` within the frame
+/// buffer, for issue locations.
+fn lint_strip_chunks(
+    rep: &mut LintReport,
+    strip: u16,
+    is_intra: Option<bool>,
+    payload: &[u8],
+    base_off: usize,
+    frame_state: &mut FrameChunkState,
+) {
+    let mut pos = 0usize;
+    let mut chunk_idx: u16 = 0;
+    let mut saw_v4 = false;
+    let mut saw_v1 = false;
+    let mut vector_chunk_at: Option<u16> = None;
+
+    while pos < payload.len() {
+        let off = base_off + pos;
+        if pos + CHUNK_HEADER_SIZE > payload.len() {
+            rep.push_chunk(
+                LintRule::ChunkHeaderTruncated,
+                strip,
+                chunk_idx,
+                off,
+                format!(
+                    "{} unclaimed strip byte(s); a chunk header needs 4 (Σ chunk_size must equal strip_size − 12)",
+                    payload.len() - pos
+                ),
+            );
+            return;
+        }
+        let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let size = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+        if size < CHUNK_HEADER_SIZE {
+            rep.push_chunk(
+                LintRule::ChunkSizeUnderHeader,
+                strip,
+                chunk_idx,
+                off + 2,
+                format!("chunk_size {size} < 4 (its own header)"),
+            );
+            // Cannot advance reliably past a chunk smaller than its
+            // own header.
+            return;
+        }
+        let mut end = pos + size;
+        let mut truncated = false;
+        if end > payload.len() {
+            rep.push_chunk(
+                LintRule::ChunkOverrunsStrip,
+                strip,
+                chunk_idx,
+                off + 2,
+                format!(
+                    "chunk_size {size} overruns the strip payload by {} bytes",
+                    end - payload.len()
+                ),
+            );
+            end = payload.len();
+            truncated = true;
+        }
+        let body = &payload[pos + CHUNK_HEADER_SIZE..end];
+
+        match StripChunkKind::from_id(id) {
+            None => {
+                rep.push_chunk(
+                    LintRule::UnknownChunkId,
+                    strip,
+                    chunk_idx,
+                    off,
+                    format!("chunk_id 0x{id:04x} is neither a codebook nor a vector chunk code"),
+                );
+            }
+            Some(StripChunkKind::Codebook(kind)) => {
+                if let Some(v_at) = vector_chunk_at {
+                    rep.push_chunk(
+                        LintRule::ChunkAfterVectorChunk,
+                        strip,
+                        chunk_idx,
+                        off,
+                        format!(
+                            "codebook chunk 0x{id:04x} appears after the vector chunk (chunk {v_at})"
+                        ),
+                    );
+                }
+                // Pixel-mode consistency across the whole frame.
+                match frame_state.mode {
+                    None => frame_state.mode = Some((kind.mode, strip)),
+                    Some((m, first_strip)) => {
+                        if m != kind.mode && !frame_state.mixed_reported {
+                            frame_state.mixed_reported = true;
+                            rep.push_chunk(
+                                LintRule::MixedPixelModes,
+                                strip,
+                                chunk_idx,
+                                off,
+                                format!(
+                                    "chunk 0x{id:04x} is {:?} but strip {first_strip} established {m:?}",
+                                    kind.mode
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Per-flavour presence + ordering (spec 02 §2.2).
+                match kind.which {
+                    WhichCodebook::V4 => {
+                        if saw_v4 {
+                            rep.push_chunk(
+                                LintRule::DuplicateCodebookChunk,
+                                strip,
+                                chunk_idx,
+                                off,
+                                "second V4 codebook chunk in one strip".into(),
+                            );
+                        }
+                        if saw_v1 && !saw_v4 {
+                            rep.push_chunk(
+                                LintRule::CodebookOrderNotV4ThenV1,
+                                strip,
+                                chunk_idx,
+                                off,
+                                "V4 codebook chunk arrives after a V1 codebook chunk".into(),
+                            );
+                        }
+                        saw_v4 = true;
+                    }
+                    WhichCodebook::V1 => {
+                        if saw_v1 {
+                            rep.push_chunk(
+                                LintRule::DuplicateCodebookChunk,
+                                strip,
+                                chunk_idx,
+                                off,
+                                "second V1 codebook chunk in one strip".into(),
+                            );
+                        }
+                        saw_v1 = true;
+                    }
+                }
+                match kind.style {
+                    UpdateStyle::Full => {
+                        if !truncated {
+                            let entry = kind.mode.entry_size();
+                            if body.len() % entry != 0 {
+                                rep.push_chunk(
+                                    LintRule::CodebookPayloadMisaligned,
+                                    strip,
+                                    chunk_idx,
+                                    off + 2,
+                                    format!(
+                                        "payload {} bytes is not a multiple of the {entry}-byte entry size",
+                                        body.len()
+                                    ),
+                                );
+                            } else if body.len() / entry > 256 {
+                                rep.push_chunk(
+                                    LintRule::CodebookTooManyEntries,
+                                    strip,
+                                    chunk_idx,
+                                    off + 2,
+                                    format!(
+                                        "{} entries exceed the 256-entry codebook",
+                                        body.len() / entry
+                                    ),
+                                );
+                            }
+                            if is_intra == Some(true) && body.is_empty() {
+                                rep.push_chunk(
+                                    LintRule::HeaderOnlyCodebookOnIntraStrip,
+                                    strip,
+                                    chunk_idx,
+                                    off,
+                                    format!(
+                                        "header-only chunk 0x{id:04x} on an intra strip has no prior codebook to reuse"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    UpdateStyle::Selective => {
+                        if is_intra == Some(true) {
+                            rep.push_chunk(
+                                LintRule::SelectiveUpdateOnIntraStrip,
+                                strip,
+                                chunk_idx,
+                                off,
+                                format!("selective-update chunk 0x{id:04x} on an intra strip"),
+                            );
+                        }
+                        if !truncated {
+                            match CodebookEntries::new(kind, body) {
+                                Err(e) => rep.push_chunk(
+                                    LintRule::SelectiveUpdatePayloadMalformed,
+                                    strip,
+                                    chunk_idx,
+                                    off + CHUNK_HEADER_SIZE,
+                                    e.to_string(),
+                                ),
+                                Ok(entries) => {
+                                    for r in entries {
+                                        if let Err(e) = r {
+                                            rep.push_chunk(
+                                                LintRule::SelectiveUpdatePayloadMalformed,
+                                                strip,
+                                                chunk_idx,
+                                                off + CHUNK_HEADER_SIZE,
+                                                e.to_string(),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(StripChunkKind::Vector(_)) => {
+                if let Some(v_at) = vector_chunk_at {
+                    rep.push_chunk(
+                        LintRule::ChunkAfterVectorChunk,
+                        strip,
+                        chunk_idx,
+                        off,
+                        format!(
+                            "vector chunk 0x{id:04x} appears after the vector chunk (chunk {v_at})"
+                        ),
+                    );
+                } else {
+                    vector_chunk_at = Some(chunk_idx);
+                }
+            }
+        }
+
+        if truncated {
+            return;
+        }
+        pos = end;
+        chunk_idx += 1;
+    }
 }
 
 /// Lint one standard (non-deviant) Cinepak frame.
@@ -387,6 +738,7 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
     let mut saw_inter = false;
     let mut coverage_regular = true;
     let mut walk_truncated = false;
+    let mut frame_chunk_state = FrameChunkState::default();
 
     for i in 0..strip_count {
         if cursor + STRIP_HEADER_SIZE > walk_len {
@@ -510,6 +862,24 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
             coverage_regular = false;
         }
         prev_y_bottom = hdr.actual_y_bottom;
+
+        // ---- chunk layer (spec 02 §1) ----
+        let is_intra = match raw.strip_id {
+            STRIP_ID_INTRA => Some(true),
+            STRIP_ID_INTER => Some(false),
+            _ => None,
+        };
+        let payload_start = strip_off + STRIP_HEADER_SIZE;
+        if payload_start <= strip_end {
+            lint_strip_chunks(
+                &mut rep,
+                i,
+                is_intra,
+                &bytes[payload_start..strip_end],
+                payload_start,
+                &mut frame_chunk_state,
+            );
+        }
 
         rep.strips_walked += 1;
         cursor = strip_end;
@@ -842,6 +1212,256 @@ mod tests {
         assert!(s.contains("error"), "{s}");
         assert!(s.contains("strip 0"), "{s}");
         assert!(s.contains("01-frame-and-strip.md"), "{s}");
+    }
+
+    // ---- chunk-layer fixtures (milestone 2) ----
+
+    /// One chunk: 4-byte header (`id`, inclusive size) + body.
+    fn chunk(id: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + body.len());
+        v.extend_from_slice(&id.to_be_bytes());
+        v.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Wrap `(strip_id, wire_y_top, wire_y_bottom, chunk_stream)`
+    /// strips into a frame with correct length accounting.
+    fn wrap_frame(width: u16, height: u16, strips: &[(u16, u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let strips_len: usize = strips
+            .iter()
+            .map(|(_, _, _, p)| STRIP_HEADER_SIZE + p.len())
+            .sum();
+        let frame_length = FRAME_HEADER_SIZE + strips_len;
+        let mut v = Vec::with_capacity(frame_length);
+        v.push(0x00);
+        v.extend_from_slice(&[
+            ((frame_length >> 16) & 0xff) as u8,
+            ((frame_length >> 8) & 0xff) as u8,
+            (frame_length & 0xff) as u8,
+        ]);
+        v.extend_from_slice(&width.to_be_bytes());
+        v.extend_from_slice(&height.to_be_bytes());
+        v.extend_from_slice(&(strips.len() as u16).to_be_bytes());
+        for (id, y_top, y_bottom, payload) in strips {
+            v.extend_from_slice(&id.to_be_bytes());
+            v.extend_from_slice(&((STRIP_HEADER_SIZE + payload.len()) as u16).to_be_bytes());
+            v.extend_from_slice(&y_top.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            v.extend_from_slice(&y_bottom.to_be_bytes());
+            v.extend_from_slice(&width.to_be_bytes());
+            v.extend_from_slice(payload);
+        }
+        v
+    }
+
+    /// A conformant 16×8 single-strip intra chunk stream: full V4 +
+    /// full V1 (one entry each) + `0x3200` vector chunk (8 MBs).
+    fn conformant_intra_stream() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        p
+    }
+
+    #[test]
+    fn handcrafted_conformant_intra_frame_is_clean() {
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, conformant_intra_stream())]);
+        let rep = lint_frame(&f);
+        assert!(rep.is_clean(), "unexpected issues: {:?}", rep.issues());
+    }
+
+    #[test]
+    fn selective_update_on_intra_strip_is_error() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        // Selective V1 update: flag word bit 31 ⇒ slot 0, one entry.
+        let mut body = 0x8000_0000u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&[1, 2, 3, 4, 0, 0]);
+        p.extend_from_slice(&chunk(0x2300, &body));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p.clone())]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::SelectiveUpdateOnIntraStrip));
+        // The same stream on an inter strip is fine.
+        let f = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(!has_rule(&rep, LintRule::SelectiveUpdateOnIntraStrip));
+    }
+
+    #[test]
+    fn header_only_codebook_on_intra_strip_warns() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p.clone())]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));
+        assert!(rep.is_conformant()); // warning only
+                                      // Header-only on an inter strip is the documented reuse signal.
+        let f = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(!has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));
+    }
+
+    #[test]
+    fn misaligned_codebook_payload_is_error() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[1, 2, 3, 4, 5])); // 5 % 6 != 0
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::CodebookPayloadMisaligned));
+    }
+
+    #[test]
+    fn oversized_codebook_is_error() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &vec![0u8; 257 * 6]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::CodebookTooManyEntries));
+    }
+
+    #[test]
+    fn unknown_chunk_id_is_error_and_walk_continues() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3300, &[0u8; 2])); // outside taxonomy
+        p.extend_from_slice(&chunk(0x2001, &[0u8; 6])); // low byte non-zero
+        p.extend_from_slice(&conformant_intra_stream());
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        let unknown = rep
+            .issues()
+            .iter()
+            .filter(|i| i.rule == LintRule::UnknownChunkId)
+            .count();
+        assert_eq!(unknown, 2, "issues: {:?}", rep.issues());
+    }
+
+    #[test]
+    fn chunk_overrun_and_undersize_are_errors() {
+        // Declared size overruns the strip payload.
+        let mut over = chunk(0x2000, &[0u8; 6]);
+        over[3] = 60; // inflate declared size
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, over)]);
+        assert!(has_rule(&lint_frame(&f), LintRule::ChunkOverrunsStrip));
+
+        // Declared size smaller than the chunk header.
+        let mut under = chunk(0x2000, &[]);
+        under[3] = 2;
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, under)]);
+        assert!(has_rule(&lint_frame(&f), LintRule::ChunkSizeUnderHeader));
+    }
+
+    #[test]
+    fn unclaimed_strip_bytes_are_reported() {
+        let mut p = conformant_intra_stream();
+        p.extend_from_slice(&[0xaa, 0xbb]); // 2 bytes no chunk claims
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(has_rule(&lint_frame(&f), LintRule::ChunkHeaderTruncated));
+    }
+
+    #[test]
+    fn v1_before_v4_order_warns() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::CodebookOrderNotV4ThenV1));
+        assert!(rep.is_conformant());
+    }
+
+    #[test]
+    fn duplicate_flavour_codebook_chunk_warns() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2000, &[11, 21, 31, 41, 0, 0]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(has_rule(&lint_frame(&f), LintRule::DuplicateCodebookChunk));
+    }
+
+    #[test]
+    fn chunk_after_vector_chunk_is_error() {
+        let mut p = conformant_intra_stream();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(has_rule(&lint_frame(&f), LintRule::ChunkAfterVectorChunk));
+    }
+
+    #[test]
+    fn mixed_pixel_modes_across_strips_is_error_reported_once() {
+        let mut yuv = Vec::new();
+        yuv.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        yuv.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        yuv.extend_from_slice(&chunk(0x3200, &[0u8; 4]));
+        let mut gray = Vec::new();
+        gray.extend_from_slice(&chunk(0x2400, &[10, 20, 30, 40]));
+        gray.extend_from_slice(&chunk(0x2600, &[10, 20, 30, 40]));
+        gray.extend_from_slice(&chunk(0x3200, &[0u8; 4]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 4, yuv), (0x1000, 0, 4, gray)]);
+        let rep = lint_frame(&f);
+        let mixed = rep
+            .issues()
+            .iter()
+            .filter(|i| i.rule == LintRule::MixedPixelModes)
+            .count();
+        assert_eq!(mixed, 1, "issues: {:?}", rep.issues());
+        assert_eq!(
+            rep.issues()
+                .iter()
+                .find(|i| i.rule == LintRule::MixedPixelModes)
+                .unwrap()
+                .strip,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn malformed_selective_update_payload_is_error() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2100, &[0x80, 0x00])); // truncated flag word
+        p.extend_from_slice(&chunk(0x3100, &0u32.to_be_bytes()));
+        let f = wrap_frame(16, 4, &[(0x1100, 0, 4, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::SelectiveUpdatePayloadMalformed));
+        assert!(!has_rule(&rep, LintRule::SelectiveUpdateOnIntraStrip));
+    }
+
+    #[test]
+    fn stateful_encoder_intra_and_inter_frames_are_clean() {
+        use crate::encoder::CinepakEncoder;
+        let (w, h) = (32u32, 16u32);
+        let mut enc = CinepakEncoder::new();
+        let opts = EncoderOptions::default();
+        let f0: Vec<u8> = (0..(w * h * 3)).map(|i| (i % 199) as u8).collect();
+        let mut f1 = f0.clone();
+        for px in f1.iter_mut().take(48) {
+            *px = px.wrapping_add(90);
+        }
+        let intra = enc.encode_intra(&f0, w, h, opts).unwrap();
+        let inter = enc.encode_inter(&f1, w, h, opts).unwrap();
+        for (label, bytes) in [("intra", &intra), ("inter", &inter)] {
+            let rep = lint_frame(bytes);
+            assert!(rep.is_clean(), "{label} frame issues: {:?}", rep.issues());
+        }
+    }
+
+    #[test]
+    fn gray_encoder_output_is_clean() {
+        use crate::encoder::encode_gray8;
+        let (w, h) = (16u32, 16u32);
+        let gray: Vec<u8> = (0..(w * h)).map(|i| (i * 7 % 256) as u8).collect();
+        let bytes = encode_gray8(&gray, w, h, EncoderOptions::default()).unwrap();
+        let rep = lint_frame(&bytes);
+        assert!(rep.is_clean(), "issues: {:?}", rep.issues());
     }
 
     #[test]

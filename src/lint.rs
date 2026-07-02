@@ -33,7 +33,8 @@
 //! on arbitrary input.
 
 use crate::codebook::{
-    CodebookEntries, PixelMode, StripChunkKind, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
+    CodebookEntries, PixelMode, StripChunkKind, UpdateStyle, VectorChunkKind, WhichCodebook,
+    CHUNK_HEADER_SIZE,
 };
 use crate::header::{
     RawStripHeader, StripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER,
@@ -169,6 +170,25 @@ pub enum LintRule {
     /// each strip carries exactly one vector chunk **after** its
     /// codebook chunks.
     ChunkAfterVectorChunk,
+
+    // ---- vector layer (spec 03) ----
+    /// Strip carries no vector chunk at all; spec 03 §2: each strip
+    /// carries exactly one.
+    MissingVectorChunk,
+    /// `0x3100` (inter with skip codes) on an intra strip; the spec
+    /// 03 §2 taxonomy permits it on inter strips only (skip codes
+    /// need a previous-frame reconstruction, §8).
+    InterVectorChunkOnIntraStrip,
+    /// Vector-chunk payload does not resolve to the strip's
+    /// macroblock count: `0x3200` payload length ≠ MB count (spec 03
+    /// §3.1), or a `0x3000` / `0x3100` group walk runs out of bytes
+    /// before all macroblocks are coded (spec 03 §3.2–§3.3; §7 step
+    /// 5: "any mismatch is a malformed stream").
+    VectorPayloadLengthMismatch,
+    /// Vector-chunk payload has unconsumed bytes after the strip's
+    /// last macroblock (spec 03 §7 step 5: bytes consumed must equal
+    /// `chunk_size − 4`).
+    VectorPayloadTrailingBytes,
 }
 
 impl LintRule {
@@ -226,7 +246,11 @@ impl LintRule {
             LintRule::CodebookOrderNotV4ThenV1 | LintRule::DuplicateCodebookChunk => {
                 "02-codebooks.md §2.2"
             }
-            LintRule::ChunkAfterVectorChunk => "03-vectors-and-macroblocks.md §2",
+            LintRule::ChunkAfterVectorChunk
+            | LintRule::MissingVectorChunk
+            | LintRule::InterVectorChunkOnIntraStrip => "03-vectors-and-macroblocks.md §2",
+            LintRule::VectorPayloadLengthMismatch => "03-vectors-and-macroblocks.md §3 + §7",
+            LintRule::VectorPayloadTrailingBytes => "03-vectors-and-macroblocks.md §7",
         }
     }
 }
@@ -382,16 +406,20 @@ struct FrameChunkState {
 }
 
 /// Walk one strip's chunk stream (spec 02 §1 layout) and report
-/// chunk-layer conformance issues.
+/// chunk-layer + vector-layer conformance issues.
 ///
 /// `is_intra` is `Some(kind)` when the strip id classified, `None`
 /// for an unknown strip id (kind-dependent rules are skipped).
+/// `mb_count` is the strip's macroblock count derived from its
+/// resolved geometry (spec 03 §1), or `None` when the geometry is
+/// itself non-conformant (payload-balance checks are skipped).
 /// `base_off` is the byte offset of `payload` within the frame
 /// buffer, for issue locations.
 fn lint_strip_chunks(
     rep: &mut LintReport,
     strip: u16,
     is_intra: Option<bool>,
+    mb_count: Option<usize>,
     payload: &[u8],
     base_off: usize,
     frame_state: &mut FrameChunkState,
@@ -604,7 +632,7 @@ fn lint_strip_chunks(
                     }
                 }
             }
-            Some(StripChunkKind::Vector(_)) => {
+            Some(StripChunkKind::Vector(vk)) => {
                 if let Some(v_at) = vector_chunk_at {
                     rep.push_chunk(
                         LintRule::ChunkAfterVectorChunk,
@@ -618,6 +646,20 @@ fn lint_strip_chunks(
                 } else {
                     vector_chunk_at = Some(chunk_idx);
                 }
+                if vk == VectorChunkKind::InterWithSkip && is_intra == Some(true) {
+                    rep.push_chunk(
+                        LintRule::InterVectorChunkOnIntraStrip,
+                        strip,
+                        chunk_idx,
+                        off,
+                        "0x3100 inter vector chunk on an intra strip".into(),
+                    );
+                }
+                if !truncated {
+                    if let Some(mb) = mb_count {
+                        lint_vector_payload(rep, strip, chunk_idx, vk, mb, body, off);
+                    }
+                }
             }
         }
 
@@ -626,6 +668,106 @@ fn lint_strip_chunks(
         }
         pos = end;
         chunk_idx += 1;
+    }
+
+    // Natural loop exit ⇒ the chunk stream was walked to the end
+    // without structural derailment, so a missing vector chunk is a
+    // reliable finding (spec 03 §2: each strip carries exactly one).
+    if vector_chunk_at.is_none() {
+        rep.push(
+            LintRule::MissingVectorChunk,
+            Some(strip),
+            base_off,
+            "strip carries no vector chunk".into(),
+        );
+    }
+}
+
+/// Check a vector chunk's payload resolves to exactly `mb_count`
+/// macroblocks with no unconsumed bytes (spec 03 §3 grammars + §7
+/// step 5).
+fn lint_vector_payload(
+    rep: &mut LintReport,
+    strip: u16,
+    chunk_idx: u16,
+    vk: VectorChunkKind,
+    mb_count: usize,
+    body: &[u8],
+    off: usize,
+) {
+    match vk {
+        VectorChunkKind::IntraV1Only => {
+            if body.len() != mb_count {
+                rep.push_chunk(
+                    LintRule::VectorPayloadLengthMismatch,
+                    strip,
+                    chunk_idx,
+                    off,
+                    format!(
+                        "0x3200 payload is {} bytes for {mb_count} macroblocks (must be equal)",
+                        body.len()
+                    ),
+                );
+            }
+        }
+        VectorChunkKind::IntraMixed => {
+            let mut walker = crate::vector::MixedIntraMacroblocks::new(body, mb_count);
+            let mut failed = false;
+            for entry in walker.by_ref() {
+                if let Err(e) = entry {
+                    rep.push_chunk(
+                        LintRule::VectorPayloadLengthMismatch,
+                        strip,
+                        chunk_idx,
+                        off,
+                        format!("0x3000 walk failed: {e}"),
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+            if !failed && walker.cursor() < body.len() {
+                rep.push_chunk(
+                    LintRule::VectorPayloadTrailingBytes,
+                    strip,
+                    chunk_idx,
+                    off,
+                    format!(
+                        "0x3000 payload has {} unconsumed byte(s) after macroblock {mb_count}",
+                        body.len() - walker.cursor()
+                    ),
+                );
+            }
+        }
+        VectorChunkKind::InterWithSkip => {
+            let mut walker = crate::vector::InterMacroblocks::new(body, mb_count);
+            let mut failed = false;
+            for entry in walker.by_ref() {
+                if let Err(e) = entry {
+                    rep.push_chunk(
+                        LintRule::VectorPayloadLengthMismatch,
+                        strip,
+                        chunk_idx,
+                        off,
+                        format!("0x3100 walk failed: {e}"),
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+            if !failed && walker.cursor() < body.len() {
+                rep.push_chunk(
+                    LintRule::VectorPayloadTrailingBytes,
+                    strip,
+                    chunk_idx,
+                    off,
+                    format!(
+                        "0x3100 payload has {} unconsumed byte(s) after macroblock {mb_count}",
+                        body.len() - walker.cursor()
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -869,12 +1011,20 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
             STRIP_ID_INTER => Some(false),
             _ => None,
         };
+        // Macroblock count from the resolved geometry (spec 03 §1):
+        // only derivable when the strip rectangle is conformant.
+        let mb_count = if h > 0 && w > 0 && h % 4 == 0 && w % 4 == 0 {
+            Some((h as usize / 4) * (w as usize / 4))
+        } else {
+            None
+        };
         let payload_start = strip_off + STRIP_HEADER_SIZE;
         if payload_start <= strip_end {
             lint_strip_chunks(
                 &mut rep,
                 i,
                 is_intra,
+                mb_count,
                 &bytes[payload_start..strip_end],
                 payload_start,
                 &mut frame_chunk_state,
@@ -935,10 +1085,12 @@ mod tests {
     use super::*;
     use crate::encoder::{encode_rgb24, EncoderOptions};
 
-    /// Build the spec 01 §1.1 `O1`-shaped single-strip frame body with
-    /// a synthetic payload of `payload_len` zero bytes (not chunk-
-    /// conformant — frame/strip layer tests only).
-    fn frame_one_strip(payload_len: usize) -> Vec<u8> {
+    /// Build the spec 01 §1.1 `O1`-shaped 16×8 single-strip frame body
+    /// around the given strip chunk stream. Pass
+    /// `&conformant_intra_stream()` for a fully-clean frame or a
+    /// zero-filled slice for frame/strip-layer-only tests.
+    fn frame_one_strip(payload: &[u8]) -> Vec<u8> {
+        let payload_len = payload.len();
         let strip_size = STRIP_HEADER_SIZE + payload_len;
         let frame_length = FRAME_HEADER_SIZE + strip_size;
         let mut v = Vec::new();
@@ -957,7 +1109,7 @@ mod tests {
         v.extend_from_slice(&0u16.to_be_bytes()); // x_top
         v.extend_from_slice(&8u16.to_be_bytes()); // y_bottom
         v.extend_from_slice(&16u16.to_be_bytes()); // x_bottom
-        v.extend_from_slice(&vec![0u8; payload_len]);
+        v.extend_from_slice(payload);
         v
     }
 
@@ -999,7 +1151,7 @@ mod tests {
 
     #[test]
     fn reserved_flag_bits_warn() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&conformant_intra_stream());
         f[0] = 0x80;
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::FlagsReservedBitsSet));
@@ -1010,7 +1162,7 @@ mod tests {
 
     #[test]
     fn zero_strip_count_is_error() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[8..10].copy_from_slice(&0u16.to_be_bytes());
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripCountZero));
@@ -1018,7 +1170,7 @@ mod tests {
 
     #[test]
     fn non_multiple_of_4_dims_are_errors() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[4..6].copy_from_slice(&15u16.to_be_bytes());
         f[6..8].copy_from_slice(&9u16.to_be_bytes());
         let rep = lint_frame(&f);
@@ -1028,7 +1180,7 @@ mod tests {
 
     #[test]
     fn frame_length_overrun_is_reported_but_walk_continues() {
-        let mut f = frame_one_strip(4);
+        let mut f = frame_one_strip(&conformant_intra_stream());
         let declared = f.len() + 100;
         f[1] = ((declared >> 16) & 0xff) as u8;
         f[2] = ((declared >> 8) & 0xff) as u8;
@@ -1041,7 +1193,7 @@ mod tests {
 
     #[test]
     fn frame_length_under_header_stops_walk() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[1] = 0;
         f[2] = 0;
         f[3] = 4;
@@ -1054,7 +1206,7 @@ mod tests {
     fn frame_length_accounting_mismatch_is_error() {
         // Declared frame_length includes 2 extra trailing bytes not
         // covered by any strip.
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f.extend_from_slice(&[0, 0]);
         let declared = f.len();
         f[1] = ((declared >> 16) & 0xff) as u8;
@@ -1066,7 +1218,7 @@ mod tests {
 
     #[test]
     fn unknown_strip_id_is_error_and_walk_continues() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[10..12].copy_from_slice(&0x1200u16.to_be_bytes());
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::UnknownStripId));
@@ -1075,7 +1227,7 @@ mod tests {
 
     #[test]
     fn strip_size_under_header_is_error() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[12..14].copy_from_slice(&4u16.to_be_bytes());
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripSizeUnderHeader));
@@ -1083,7 +1235,7 @@ mod tests {
 
     #[test]
     fn strip_overrun_is_error() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[12..14].copy_from_slice(&200u16.to_be_bytes());
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripOverrunsFrame));
@@ -1092,7 +1244,7 @@ mod tests {
     #[test]
     fn strip_header_truncation_is_error() {
         // Two declared strips but bytes for only one.
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[8..10].copy_from_slice(&2u16.to_be_bytes());
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripHeaderTruncated));
@@ -1134,7 +1286,7 @@ mod tests {
     #[test]
     fn coverage_gap_warns() {
         // Single strip covering only the top half of a 16-row frame.
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&conformant_intra_stream());
         f[6..8].copy_from_slice(&16u16.to_be_bytes()); // frame height 16
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripCoverageIrregular));
@@ -1143,7 +1295,7 @@ mod tests {
 
     #[test]
     fn strip_outside_frame_is_error() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[18..20].copy_from_slice(&12u16.to_be_bytes()); // y_bottom 12 > height 8
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripOutsideFrame));
@@ -1151,7 +1303,7 @@ mod tests {
 
     #[test]
     fn partial_width_strip_warns() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[20..22].copy_from_slice(&10u16.to_be_bytes()); // x_bottom 10 < width 16
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripNotFullWidth));
@@ -1160,7 +1312,7 @@ mod tests {
 
     #[test]
     fn empty_rect_is_error() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[14..16].copy_from_slice(&8u16.to_be_bytes()); // y_top 8
         f[18..20].copy_from_slice(&8u16.to_be_bytes()); // y_bottom 8 (empty)
         let rep = lint_frame(&f);
@@ -1191,7 +1343,7 @@ mod tests {
 
     #[test]
     fn inheritance_flag_on_intra_frame_warns() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&conformant_intra_stream());
         f[0] = 0x01;
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::FlagsInheritanceOnIntraFrame));
@@ -1200,7 +1352,7 @@ mod tests {
 
     #[test]
     fn issue_display_carries_rule_location_and_spec_ref() {
-        let mut f = frame_one_strip(0);
+        let mut f = frame_one_strip(&[]);
         f[10..12].copy_from_slice(&0x1200u16.to_be_bytes());
         let rep = lint_frame(&f);
         let issue = rep
@@ -1464,6 +1616,130 @@ mod tests {
         assert!(rep.is_clean(), "issues: {:?}", rep.issues());
     }
 
+    // ---- vector-layer tests (milestone 3) ----
+
+    #[test]
+    fn missing_vector_chunk_is_error() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::MissingVectorChunk));
+        // An empty strip payload is also a missing vector chunk.
+        let f = wrap_frame(16, 8, &[(0x1100, 0, 8, Vec::new())]);
+        assert!(has_rule(&lint_frame(&f), LintRule::MissingVectorChunk));
+    }
+
+    #[test]
+    fn v1_only_payload_length_mismatch_is_error() {
+        // 16×8 strip has 8 MBs; supply 7 and 9 index bytes.
+        for n in [7usize, 9] {
+            let mut p = Vec::new();
+            p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+            p.extend_from_slice(&chunk(0x3200, &vec![0u8; n]));
+            let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+            let rep = lint_frame(&f);
+            assert!(
+                has_rule(&rep, LintRule::VectorPayloadLengthMismatch),
+                "n = {n}: {:?}",
+                rep.issues()
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_intra_truncated_walk_is_error() {
+        // All-V4 flag word but only 3 of the 32 required index bytes.
+        let mut body = 0xff00_0000u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 3]);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3000, &body));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(has_rule(
+            &lint_frame(&f),
+            LintRule::VectorPayloadLengthMismatch
+        ));
+    }
+
+    #[test]
+    fn mixed_intra_trailing_bytes_are_error() {
+        // 8 V1 MBs (flag word zero, 8 index bytes) + 2 stray bytes
+        // inside the declared chunk payload.
+        let mut body = 0u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 8]);
+        body.extend_from_slice(&[0xde, 0xad]);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3000, &body));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(
+            has_rule(&rep, LintRule::VectorPayloadTrailingBytes),
+            "{:?}",
+            rep.issues()
+        );
+    }
+
+    #[test]
+    fn inter_vector_chunk_on_intra_strip_is_error() {
+        // All-skip inter chunk: one zero flag word covers 8 MBs.
+        let body = 0u32.to_be_bytes().to_vec();
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p.clone())]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::InterVectorChunkOnIntraStrip));
+        // Same chunk on an inter strip is conformant.
+        let f = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(
+            !has_rule(&rep, LintRule::InterVectorChunkOnIntraStrip),
+            "{:?}",
+            rep.issues()
+        );
+        assert!(rep.is_conformant(), "{:?}", rep.issues());
+    }
+
+    #[test]
+    fn inter_walk_with_updates_balances_exactly() {
+        // Spec 03 §3.3 fixture Y8 shape on a 16×16 strip (16 MBs):
+        // flag word 0x80000000 ⇒ 1 V1 update + 15 skips + 1 index byte.
+        let mut body = 0x8000_0000u32.to_be_bytes().to_vec();
+        body.push(0x00);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(16, 16, &[(0x1100, 0, 16, p.clone())]);
+        let rep = lint_frame(&f);
+        assert!(rep.is_conformant(), "{:?}", rep.issues());
+        // One extra byte after the resolved walk is a trailing-bytes
+        // error.
+        let mut p2 = Vec::new();
+        p2.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        let mut body2 = body.clone();
+        body2.push(0xee);
+        p2.extend_from_slice(&chunk(0x3100, &body2));
+        let f = wrap_frame(16, 16, &[(0x1100, 0, 16, p2)]);
+        assert!(has_rule(
+            &lint_frame(&f),
+            LintRule::VectorPayloadTrailingBytes
+        ));
+    }
+
+    #[test]
+    fn vector_checks_skipped_when_geometry_invalid() {
+        // Strip height 6 (not a multiple of 4): geometry error is
+        // reported, but no payload-balance error is derived from it.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 6, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::StripHeightNotMultipleOf4));
+        assert!(!has_rule(&rep, LintRule::VectorPayloadLengthMismatch));
+    }
+
     #[test]
     fn arbitrary_bytes_never_panic() {
         // Cheap in-test sweep over adversarial shapes.
@@ -1474,7 +1750,7 @@ mod tests {
             vec![0x00; 64],
             vec![0xff; 64],
         ];
-        let mut f = frame_one_strip(3);
+        let mut f = frame_one_strip(&[0, 0, 0]);
         f[9] = 0xff; // absurd strip count
         cases.push(f);
         for c in cases {

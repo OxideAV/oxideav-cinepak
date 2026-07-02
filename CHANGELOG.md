@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 3 (conformance lint — vector layer): the linter
+  now derives each strip's macroblock count from its resolved geometry
+  (spec 03 §1, `(height/4) × (width/4)`; skipped when the geometry is
+  itself non-conformant so one root cause doesn't cascade) and checks:
+  every strip carries exactly one vector chunk (spec 03 §2 ⇒
+  `MissingVectorChunk`, reported only when the chunk walk reached the
+  strip end without structural derailment), `0x3100` on an intra strip
+  (§2 taxonomy: inter-only; skip codes need a previous-frame
+  reconstruction per §8 ⇒ `InterVectorChunkOnIntraStrip`), `0x3200`
+  payload length = MB count (§3.1), `0x3000` / `0x3100` group-walk
+  byte balance via the r250/r253 typed walkers — truncation mid-walk ⇒
+  `VectorPayloadLengthMismatch`, unconsumed payload bytes after the
+  last macroblock ⇒ `VectorPayloadTrailingBytes` (§7 step 5: "any
+  mismatch is a malformed stream"). 8 new lib tests: both length
+  mismatch directions on `0x3200`, truncated + trailing `0x3000`
+  walks, the spec §3.3 fixture-`Y8`-shaped inter walk balancing
+  exactly (and failing on one extra byte), `0x3100`-on-intra both
+  directions, missing-vector-chunk on codebook-only and empty strips,
+  and the geometry-invalid skip gate. The milestone-1 synthetic
+  fixtures were upgraded to carry conformant chunk streams now that
+  empty strip payloads are (correctly) findings themselves.
 - Round 383 milestone 2 (conformance lint — chunk layer): the linter
   now walks each strip's chunk stream per spec 02 §1 and reports:
   chunk-header truncation / `chunk_size < 4` / strip-payload overrun

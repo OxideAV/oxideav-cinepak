@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 4 (conformance lint — intra codebook occupancy):
+  new `VectorIndexOutOfRange` rule implementing spec 02 §3.2 ("the
+  strip's vector chunk MUST NOT reference an index ≥ N; if it does,
+  the decode of that vector is undefined"). On intra strips the linter
+  accumulates per-flavour occupancy from the strip's own
+  full-replacement chunks (entries `0..N−1` defined; duplicates take
+  the max) and checks every `0x3200` V1 index and every `0x3000`
+  V1/V4 index against it, reporting the first offending macroblock
+  with its flavour, index, and the defined count. The check is
+  deliberately conservative: it is suppressed when occupancy is
+  unknowable — inter strips (inheritance per spec 02 §5.2 crosses the
+  single-frame view), intra strips carrying a selective-update chunk
+  (already an §2.3 error), or damaged codebook chunks (truncation /
+  misalignment / oversize, each already reported) — and it runs
+  deferred to the strip end so a codebook chunk appearing after the
+  vector chunk (already a `ChunkAfterVectorChunk` error) still
+  contributes its entries instead of cascading a false index-range
+  finding. `0x3100` on an intra strip is excluded (already flagged;
+  its updates are inter-style). 6 new lib tests: V1 out-of-range +
+  in-range twin on `0x3200`, V4 sub-block out-of-range + in-range twin
+  inside a mixed `0x3000` walk, inter-strip non-checking,
+  selective-on-intra suppression, out-of-order codebook-after-vector
+  still counting, and header-only-defines-nothing ⇒ any reference
+  flagged.
 - Round 383 milestone 3 (conformance lint — vector layer): the linter
   now derives each strip's macroblock count from its resolved geometry
   (spec 03 §1, `(height/4) × (width/4)`; skipped when the geometry is

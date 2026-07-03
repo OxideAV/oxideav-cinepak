@@ -189,6 +189,14 @@ pub enum LintRule {
     /// last macroblock (spec 03 §7 step 5: bytes consumed must equal
     /// `chunk_size − 4`).
     VectorPayloadTrailingBytes,
+    /// On an intra strip, the vector chunk references a codebook
+    /// index at or beyond the entry count the strip's own
+    /// full-replacement chunks defined; spec 02 §3.2: the vector
+    /// chunk MUST NOT reference an index ≥ N (the decode is
+    /// undefined). Checked on intra strips only — inter strips
+    /// inherit occupancy from previous strips/frames (spec 02 §5.2),
+    /// which a single-frame lint cannot see.
+    VectorIndexOutOfRange,
 }
 
 impl LintRule {
@@ -251,6 +259,7 @@ impl LintRule {
             | LintRule::InterVectorChunkOnIntraStrip => "03-vectors-and-macroblocks.md §2",
             LintRule::VectorPayloadLengthMismatch => "03-vectors-and-macroblocks.md §3 + §7",
             LintRule::VectorPayloadTrailingBytes => "03-vectors-and-macroblocks.md §7",
+            LintRule::VectorIndexOutOfRange => "02-codebooks.md §3.2",
         }
     }
 }
@@ -429,6 +438,14 @@ fn lint_strip_chunks(
     let mut saw_v4 = false;
     let mut saw_v1 = false;
     let mut vector_chunk_at: Option<u16> = None;
+    // Intra-strip codebook occupancy (spec 02 §3.2): entries the
+    // strip's own full-replacement chunks define. Tracking is
+    // abandoned when the chunk stream is too damaged for the counts
+    // to be trustworthy.
+    let mut v4_defined = 0usize;
+    let mut v1_defined = 0usize;
+    let mut occupancy_known = is_intra == Some(true);
+    let mut vector_occ: Option<(u16, usize, VectorChunkKind, &[u8])> = None;
 
     while pos < payload.len() {
         let off = base_off + pos;
@@ -556,9 +573,12 @@ fn lint_strip_chunks(
                 }
                 match kind.style {
                     UpdateStyle::Full => {
-                        if !truncated {
+                        if truncated {
+                            occupancy_known = false;
+                        } else {
                             let entry = kind.mode.entry_size();
                             if body.len() % entry != 0 {
+                                occupancy_known = false;
                                 rep.push_chunk(
                                     LintRule::CodebookPayloadMisaligned,
                                     strip,
@@ -570,6 +590,7 @@ fn lint_strip_chunks(
                                     ),
                                 );
                             } else if body.len() / entry > 256 {
+                                occupancy_known = false;
                                 rep.push_chunk(
                                     LintRule::CodebookTooManyEntries,
                                     strip,
@@ -580,6 +601,14 @@ fn lint_strip_chunks(
                                         body.len() / entry
                                     ),
                                 );
+                            } else {
+                                // Spec 02 §3.2: entries 0..N−1 are now
+                                // defined for this flavour.
+                                let n = body.len() / entry;
+                                match kind.which {
+                                    WhichCodebook::V4 => v4_defined = v4_defined.max(n),
+                                    WhichCodebook::V1 => v1_defined = v1_defined.max(n),
+                                }
                             }
                             if is_intra == Some(true) && body.is_empty() {
                                 rep.push_chunk(
@@ -596,6 +625,11 @@ fn lint_strip_chunks(
                     }
                     UpdateStyle::Selective => {
                         if is_intra == Some(true) {
+                            // The stream is already non-conformant here
+                            // and the selective merge makes the strip's
+                            // own occupancy unknowable — suppress the
+                            // §3.2 index check rather than cascade.
+                            occupancy_known = false;
                             rep.push_chunk(
                                 LintRule::SelectiveUpdateOnIntraStrip,
                                 strip,
@@ -659,6 +693,9 @@ fn lint_strip_chunks(
                     if let Some(mb) = mb_count {
                         lint_vector_payload(rep, strip, chunk_idx, vk, mb, body, off);
                     }
+                    if vector_occ.is_none() {
+                        vector_occ = Some((chunk_idx, off, vk, body));
+                    }
                 }
             }
         }
@@ -680,6 +717,89 @@ fn lint_strip_chunks(
             base_off,
             "strip carries no vector chunk".into(),
         );
+    }
+
+    // Intra-strip occupancy check (spec 02 §3.2), deferred to the
+    // strip end so codebook chunks appearing after the vector chunk
+    // (itself already flagged) still contribute their entries and
+    // don't produce false index-range findings.
+    if occupancy_known {
+        if let (Some((v_idx, v_off, vk, body)), Some(mb)) = (vector_occ, mb_count) {
+            lint_vector_occupancy(
+                rep, strip, v_idx, vk, mb, body, v_off, v1_defined, v4_defined,
+            );
+        }
+    }
+}
+
+/// On an intra strip, report the first vector index referencing a
+/// codebook entry the strip's own full-replacement chunks did not
+/// define (spec 02 §3.2: undefined decode).
+#[allow(clippy::too_many_arguments)]
+fn lint_vector_occupancy(
+    rep: &mut LintReport,
+    strip: u16,
+    chunk_idx: u16,
+    vk: VectorChunkKind,
+    mb_count: usize,
+    body: &[u8],
+    off: usize,
+    v1_defined: usize,
+    v4_defined: usize,
+) {
+    let mut push = |mb: usize, flavour: &str, idx: u8, defined: usize| {
+        rep.push_chunk(
+            LintRule::VectorIndexOutOfRange,
+            strip,
+            chunk_idx,
+            off,
+            format!(
+                "macroblock {mb} references {flavour} entry {idx} but the strip defines only \
+                 {defined} entr{} (indices 0..{defined})",
+                if defined == 1 { "y" } else { "ies" }
+            ),
+        );
+    };
+    match vk {
+        VectorChunkKind::IntraV1Only => {
+            if body.len() != mb_count {
+                return; // balance error already reported
+            }
+            for (mb, &idx) in body.iter().enumerate() {
+                if idx as usize >= v1_defined {
+                    push(mb, "V1", idx, v1_defined);
+                    return;
+                }
+            }
+        }
+        VectorChunkKind::IntraMixed => {
+            for entry in crate::vector::MixedIntraMacroblocks::new(body, mb_count) {
+                let Ok(e) = entry else {
+                    return; // balance error already reported
+                };
+                match e.kind {
+                    crate::vector::MixedIntraMb::V1(idx) => {
+                        if idx as usize >= v1_defined {
+                            push(e.index.into(), "V1", idx, v1_defined);
+                            return;
+                        }
+                    }
+                    crate::vector::MixedIntraMb::V4(quad) => {
+                        for idx in quad {
+                            if idx as usize >= v4_defined {
+                                push(e.index.into(), "V4", idx, v4_defined);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // `0x3100` on an intra strip is already an
+        // `InterVectorChunkOnIntraStrip` error, and its V1/V4 updates
+        // are semantically inter-style (inheriting occupancy this
+        // single-strip view cannot see) — no index check.
+        VectorChunkKind::InterWithSkip => {}
     }
 }
 
@@ -1738,6 +1858,121 @@ mod tests {
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::StripHeightNotMultipleOf4));
         assert!(!has_rule(&rep, LintRule::VectorPayloadLengthMismatch));
+    }
+
+    // ---- intra occupancy tests (milestone 4) ----
+
+    #[test]
+    fn v1_index_out_of_range_on_intra_strip_is_error() {
+        // Two V1 entries defined (indices 0..2); reference index 2.
+        let two_entries = [10, 20, 30, 40, 0, 0, 11, 21, 31, 41, 0, 0];
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &two_entries));
+        let mut idx = vec![1u8; 8];
+        idx[5] = 2; // out of range
+        p.extend_from_slice(&chunk(0x3200, &idx));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        let issue = rep
+            .issues()
+            .iter()
+            .find(|i| i.rule == LintRule::VectorIndexOutOfRange)
+            .expect("expected out-of-range finding");
+        assert!(issue.message.contains("macroblock 5"), "{}", issue.message);
+        // In-range twin is clean of the rule.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &two_entries));
+        p.extend_from_slice(&chunk(0x3200, &[1u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(!has_rule(&lint_frame(&f), LintRule::VectorIndexOutOfRange));
+    }
+
+    #[test]
+    fn v4_index_out_of_range_in_mixed_chunk_is_error() {
+        // Two V4 entries defined; an all-V4 0x3000 chunk (8 MBs ⇒ one
+        // 0xff000000 flag word + 32 index bytes) references entry 2.
+        let two_entries = [10, 20, 30, 40, 0, 0, 11, 21, 31, 41, 0, 0];
+        let build = |bad: bool| {
+            let mut body = 0xff00_0000u32.to_be_bytes().to_vec();
+            let mut quads = vec![1u8; 32];
+            if bad {
+                quads[13] = 2; // MB 3, second sub-block index
+            }
+            body.extend_from_slice(&quads);
+            let mut p = Vec::new();
+            p.extend_from_slice(&chunk(0x2000, &two_entries));
+            p.extend_from_slice(&chunk(0x2200, &two_entries[..6]));
+            p.extend_from_slice(&chunk(0x3000, &body));
+            wrap_frame(16, 8, &[(0x1000, 0, 8, p)])
+        };
+        let rep = lint_frame(&build(true));
+        let issue = rep
+            .issues()
+            .iter()
+            .find(|i| i.rule == LintRule::VectorIndexOutOfRange)
+            .expect("expected out-of-range finding");
+        assert!(issue.message.contains("V4"), "{}", issue.message);
+        assert!(issue.message.contains("macroblock 3"), "{}", issue.message);
+        assert!(!has_rule(
+            &lint_frame(&build(false)),
+            LintRule::VectorIndexOutOfRange
+        ));
+    }
+
+    #[test]
+    fn inter_strip_indices_are_not_range_checked() {
+        // Inter strip defines 1 V1 entry but references entry 5 — the
+        // rest of the codebook may be inherited (spec 02 §5.2), which
+        // a single-frame lint cannot see.
+        let mut body = 0x8000_0000u32.to_be_bytes().to_vec();
+        body.push(5);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(16, 16, &[(0x1100, 0, 16, p)]);
+        assert!(!has_rule(&lint_frame(&f), LintRule::VectorIndexOutOfRange));
+    }
+
+    #[test]
+    fn selective_chunk_on_intra_strip_suppresses_occupancy_check() {
+        // The selective merge makes occupancy unknowable; only the
+        // §2.3 error fires, not a cascaded index-range finding.
+        let mut sel = 0x8000_0000u32.to_be_bytes().to_vec();
+        sel.extend_from_slice(&[1, 2, 3, 4, 0, 0]);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2300, &sel));
+        p.extend_from_slice(&chunk(0x3200, &[7u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::SelectiveUpdateOnIntraStrip));
+        assert!(!has_rule(&rep, LintRule::VectorIndexOutOfRange));
+    }
+
+    #[test]
+    fn codebook_after_vector_chunk_still_counts_for_occupancy() {
+        // Out-of-order stream (already flagged): the V1 codebook
+        // arrives after the vector chunk. The deferred occupancy
+        // check still sees it — no false index-range finding.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::ChunkAfterVectorChunk));
+        assert!(!has_rule(&rep, LintRule::VectorIndexOutOfRange));
+    }
+
+    #[test]
+    fn zero_defined_entries_with_references_is_error() {
+        // Header-only V1 codebook on an intra strip defines nothing;
+        // any 0x3200 reference is undefined.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(has_rule(&rep, LintRule::VectorIndexOutOfRange));
+        assert!(has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));
     }
 
     #[test]

@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 5 (conformance lint — vintage profile +
+  sequence context + `lint_sequence`): `LintOptions` gains two knobs
+  (with `with_vintage` / `with_sequence_start` builders).
+  `vintage: bool` enforces the vintage-player structural constraints
+  the encoder\'s `EncoderOptions::vintage_compat` targets, closing the
+  encode/verify loop: `VintageStripCountExceeded` (spec 01 §2.3,
+  > 3 strips) and `VintageCodebookPairViolation` (spec 01 §2.3 / 02
+  §2.2 — both V4 and V1 codebook chunks present per strip, header-only
+  allowed, strict V4-then-V1 order). `sequence_start: bool` flags
+  previous-frame/previous-codebook dependence on a stream\'s first
+  frame or a seek target: `PrevFrameDependencyAtSequenceStart` fires
+  on a `0x3100` chunk coding at least one skip macroblock (spec 03 §6:
+  reusing an undefined previous reconstruction is undefined output —
+  a skip-free `0x3100` stays legal) and on any selective-update
+  codebook chunk (spec 02 §4.1: nothing to merge into). New
+  `lint_sequence(frames, opts)` maps a decode sequence to per-frame
+  reports with `sequence_start` forced on the first frame. 7 new lib
+  tests: the 3-strip ceiling in both directions, missing-V1 (T7
+  shape) and V1-before-V4 pairing violations plus the header-only
+  pair passing, `vintage_compat` stateful-encoder intra + inter
+  output passing the vintage profile end-to-end, skip-at-start vs
+  skip-free-`0x3100`-at-start, selective-at-start, sequence mapping
+  flagging only the first frame, and a 4-frame GOP
+  (`with_keyframe_interval(2)`) from the auto-routing encoder
+  linting clean per-frame.
 - Round 383 milestone 4 (conformance lint — intra codebook occupancy):
   new `VectorIndexOutOfRange` rule implementing spec 02 §3.2 ("the
   strip's vector chunk MUST NOT reference an index ≥ N; if it does,

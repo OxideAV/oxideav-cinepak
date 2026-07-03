@@ -78,7 +78,8 @@ pub use film::{
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 pub use lint::{
-    lint_frame, lint_frame_with, LintIssue, LintOptions, LintReport, LintRule, LintSeverity,
+    lint_frame, lint_frame_with, lint_sequence, LintIssue, LintOptions, LintReport, LintRule,
+    LintSeverity,
 };
 pub use vector::{
     InterEntry, InterMacroblocks, InterMb, MixedIntraCoding, MixedIntraEntry,

@@ -197,6 +197,24 @@ pub enum LintRule {
     /// inherit occupancy from previous strips/frames (spec 02 §5.2),
     /// which a single-frame lint cannot see.
     VectorIndexOutOfRange,
+
+    // ---- profile / context rules (LintOptions-gated) ----
+    /// `strip_count > 3` under [`LintOptions::vintage`]; spec 01
+    /// §2.3: vintage Windows / MacOS players work only up to 3 strips
+    /// per frame.
+    VintageStripCountExceeded,
+    /// Under [`LintOptions::vintage`], a strip does not carry both V4
+    /// and V1 codebook chunks in strict V4-then-V1 order; spec 01
+    /// §2.3 / spec 02 §2.2: vintage MacOS players need both always
+    /// present (header-only allowed), V4 first.
+    VintageCodebookPairViolation,
+    /// Under [`LintOptions::sequence_start`], the frame depends on a
+    /// previous frame or previous codebook: a `0x3100` chunk codes at
+    /// least one skip macroblock (spec 03 §6: reusing an undefined
+    /// previous reconstruction yields undefined output) or a
+    /// selective-update codebook chunk merges into a codebook that
+    /// does not exist yet (spec 02 §4.1).
+    PrevFrameDependencyAtSequenceStart,
 }
 
 impl LintRule {
@@ -260,6 +278,11 @@ impl LintRule {
             LintRule::VectorPayloadLengthMismatch => "03-vectors-and-macroblocks.md §3 + §7",
             LintRule::VectorPayloadTrailingBytes => "03-vectors-and-macroblocks.md §7",
             LintRule::VectorIndexOutOfRange => "02-codebooks.md §3.2",
+            LintRule::VintageStripCountExceeded => "01-frame-and-strip.md §2.3",
+            LintRule::VintageCodebookPairViolation => "02-codebooks.md §2.2",
+            LintRule::PrevFrameDependencyAtSequenceStart => {
+                "02-codebooks.md §4.1 + 03-vectors-and-macroblocks.md §6"
+            }
         }
     }
 }
@@ -309,12 +332,40 @@ impl core::fmt::Display for LintIssue {
 /// Lint configuration knobs. Defaults check the modern wire format.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct LintOptions {}
+pub struct LintOptions {
+    /// Enforce the vintage-player structural constraints of spec 01
+    /// §2.3 / spec 02 §2.2 (`Cinepak.wiki` line 33): at most 3 strips
+    /// per frame, and every strip carries **both** V4 and V1 codebook
+    /// chunks (header-only allowed) in strict V4-then-V1 order.
+    /// Modern decoders don't require either, so these fire only under
+    /// this profile. Mirrors the encoder's
+    /// `EncoderOptions::vintage_compat`.
+    pub vintage: bool,
+    /// Treat the frame as the first of a decode sequence (stream
+    /// start or seek target): content that depends on a previous
+    /// frame or previous codebook — `0x3100` skip codes (spec 03 §6:
+    /// undefined output) or selective-update codebook chunks (spec 02
+    /// §4.1: nothing to merge into) — is reported as an error.
+    pub sequence_start: bool,
+}
 
 impl LintOptions {
     /// The default option set.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable the vintage-player profile (see [`Self::vintage`]).
+    pub fn with_vintage(mut self, vintage: bool) -> Self {
+        self.vintage = vintage;
+        self
+    }
+
+    /// Mark the frame as a sequence start (see
+    /// [`Self::sequence_start`]).
+    pub fn with_sequence_start(mut self, sequence_start: bool) -> Self {
+        self.sequence_start = sequence_start;
+        self
     }
 }
 
@@ -402,6 +453,27 @@ pub fn lint_frame(bytes: &[u8]) -> LintReport {
     lint_frame_with(bytes, &LintOptions::default())
 }
 
+/// Lint a decode sequence of standard Cinepak frames, returning one
+/// [`LintReport`] per frame in order.
+///
+/// The first frame is linted with [`LintOptions::sequence_start`]
+/// forced on (a conformant stream opens with a self-contained intra
+/// frame — no skip codes, no selective updates); subsequent frames
+/// use `opts` as given. Cross-frame state deeper than that (e.g.
+/// verifying an inter frame's inherited codebook occupancy) requires
+/// a decoder, not a lint.
+pub fn lint_sequence<'a, I>(frames: I, opts: &LintOptions) -> Vec<LintReport>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let first_opts = opts.with_sequence_start(true);
+    frames
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| lint_frame_with(f, if i == 0 { &first_opts } else { opts }))
+        .collect()
+}
+
 /// Frame-scoped state threaded through the per-strip chunk walks.
 #[derive(Default)]
 struct FrameChunkState {
@@ -424,6 +496,7 @@ struct FrameChunkState {
 /// itself non-conformant (payload-balance checks are skipped).
 /// `base_off` is the byte offset of `payload` within the frame
 /// buffer, for issue locations.
+#[allow(clippy::too_many_arguments)]
 fn lint_strip_chunks(
     rep: &mut LintReport,
     strip: u16,
@@ -432,6 +505,7 @@ fn lint_strip_chunks(
     payload: &[u8],
     base_off: usize,
     frame_state: &mut FrameChunkState,
+    opts: &LintOptions,
 ) {
     let mut pos = 0usize;
     let mut chunk_idx: u16 = 0;
@@ -444,6 +518,7 @@ fn lint_strip_chunks(
     // to be trustworthy.
     let mut v4_defined = 0usize;
     let mut v1_defined = 0usize;
+    let mut order_violated = false;
     let mut occupancy_known = is_intra == Some(true);
     let mut vector_occ: Option<(u16, usize, VectorChunkKind, &[u8])> = None;
 
@@ -548,6 +623,7 @@ fn lint_strip_chunks(
                             );
                         }
                         if saw_v1 && !saw_v4 {
+                            order_violated = true;
                             rep.push_chunk(
                                 LintRule::CodebookOrderNotV4ThenV1,
                                 strip,
@@ -624,6 +700,17 @@ fn lint_strip_chunks(
                         }
                     }
                     UpdateStyle::Selective => {
+                        if opts.sequence_start {
+                            rep.push_chunk(
+                                LintRule::PrevFrameDependencyAtSequenceStart,
+                                strip,
+                                chunk_idx,
+                                off,
+                                format!(
+                                    "selective-update chunk 0x{id:04x} at sequence start has no previous codebook to merge into"
+                                ),
+                            );
+                        }
                         if is_intra == Some(true) {
                             // The stream is already non-conformant here
                             // and the selective merge makes the strip's
@@ -691,7 +778,7 @@ fn lint_strip_chunks(
                 }
                 if !truncated {
                     if let Some(mb) = mb_count {
-                        lint_vector_payload(rep, strip, chunk_idx, vk, mb, body, off);
+                        lint_vector_payload(rep, strip, chunk_idx, vk, mb, body, off, opts);
                     }
                     if vector_occ.is_none() {
                         vector_occ = Some((chunk_idx, off, vk, body));
@@ -717,6 +804,31 @@ fn lint_strip_chunks(
             base_off,
             "strip carries no vector chunk".into(),
         );
+    }
+
+    // Vintage-profile pairing (spec 01 §2.3 / 02 §2.2): both
+    // codebook chunks present, V4 first. Checked at the natural loop
+    // exit only (a structurally derailed strip already errored).
+    if opts.vintage && is_intra.is_some() {
+        if !saw_v4 || !saw_v1 {
+            rep.push(
+                LintRule::VintageCodebookPairViolation,
+                Some(strip),
+                base_off,
+                format!(
+                    "vintage profile requires both codebook chunks per strip (V4 {}, V1 {})",
+                    if saw_v4 { "present" } else { "missing" },
+                    if saw_v1 { "present" } else { "missing" },
+                ),
+            );
+        } else if order_violated {
+            rep.push(
+                LintRule::VintageCodebookPairViolation,
+                Some(strip),
+                base_off,
+                "vintage profile requires strict V4-then-V1 codebook order".into(),
+            );
+        }
     }
 
     // Intra-strip occupancy check (spec 02 §3.2), deferred to the
@@ -806,6 +918,7 @@ fn lint_vector_occupancy(
 /// Check a vector chunk's payload resolves to exactly `mb_count`
 /// macroblocks with no unconsumed bytes (spec 03 §3 grammars + §7
 /// step 5).
+#[allow(clippy::too_many_arguments)]
 fn lint_vector_payload(
     rep: &mut LintReport,
     strip: u16,
@@ -814,6 +927,7 @@ fn lint_vector_payload(
     mb_count: usize,
     body: &[u8],
     off: usize,
+    opts: &LintOptions,
 ) {
     match vk {
         VectorChunkKind::IntraV1Only => {
@@ -862,7 +976,13 @@ fn lint_vector_payload(
         VectorChunkKind::InterWithSkip => {
             let mut walker = crate::vector::InterMacroblocks::new(body, mb_count);
             let mut failed = false;
+            let mut first_skip: Option<usize> = None;
             for entry in walker.by_ref() {
+                if let Ok(e) = &entry {
+                    if first_skip.is_none() && matches!(e.kind, crate::vector::InterMb::Skip) {
+                        first_skip = Some(e.index.into());
+                    }
+                }
                 if let Err(e) = entry {
                     rep.push_chunk(
                         LintRule::VectorPayloadLengthMismatch,
@@ -887,6 +1007,19 @@ fn lint_vector_payload(
                     ),
                 );
             }
+            if opts.sequence_start {
+                if let Some(mb) = first_skip {
+                    rep.push_chunk(
+                        LintRule::PrevFrameDependencyAtSequenceStart,
+                        strip,
+                        chunk_idx,
+                        off,
+                        format!(
+                            "macroblock {mb} is skip-coded at sequence start; there is no previous reconstruction to reuse"
+                        ),
+                    );
+                }
+            }
         }
     }
 }
@@ -899,7 +1032,6 @@ fn lint_vector_payload(
 /// while localised strip issues let the walk continue to the next
 /// strip.
 pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
-    let _ = opts; // No option-dependent rules at this layer yet.
     let mut rep = LintReport::default();
 
     // ---- frame header (spec 01 §1) ----
@@ -961,6 +1093,14 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
             None,
             8,
             "strip_count = 0; spec requires ≥ 1".into(),
+        );
+    }
+    if opts.vintage && strip_count > 3 {
+        rep.push(
+            LintRule::VintageStripCountExceeded,
+            None,
+            8,
+            format!("strip_count {strip_count} exceeds the 3-strip vintage-player ceiling"),
         );
     }
     if frame_length < FRAME_HEADER_SIZE {
@@ -1148,6 +1288,7 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
                 &bytes[payload_start..strip_end],
                 payload_start,
                 &mut frame_chunk_state,
+                opts,
             );
         }
 
@@ -1973,6 +2114,200 @@ mod tests {
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::VectorIndexOutOfRange));
         assert!(has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));
+    }
+
+    // ---- profile / sequence tests (milestone 5) ----
+
+    #[test]
+    fn vintage_strip_count_ceiling() {
+        // Four conformant 8-row strips on a 16×32 frame: clean by
+        // default, over the ceiling under the vintage profile.
+        let strips: Vec<(u16, u16, u16, Vec<u8>)> = (0..4)
+            .map(|_| (0x1000u16, 0u16, 8u16, conformant_intra_stream()))
+            .collect();
+        let f = wrap_frame(16, 32, &strips);
+        let rep = lint_frame(&f);
+        assert!(rep.is_clean(), "{:?}", rep.issues());
+        let rep = lint_frame_with(&f, &LintOptions::new().with_vintage(true));
+        assert!(has_rule(&rep, LintRule::VintageStripCountExceeded));
+        // Three strips pass the vintage ceiling.
+        let strips: Vec<(u16, u16, u16, Vec<u8>)> = (0..3)
+            .map(|_| (0x1000u16, 0u16, 8u16, conformant_intra_stream()))
+            .collect();
+        let f = wrap_frame(16, 24, &strips);
+        let rep = lint_frame_with(&f, &LintOptions::new().with_vintage(true));
+        assert!(
+            !has_rule(&rep, LintRule::VintageStripCountExceeded),
+            "{:?}",
+            rep.issues()
+        );
+    }
+
+    #[test]
+    fn vintage_codebook_pair_rules() {
+        let vintage = LintOptions::new().with_vintage(true);
+        // Strip with only a V4 chunk (spec 02 §2.2 T7 shape): fine by
+        // default, a pairing violation under vintage.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        let mut body = 0xff00_0000u32.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 32]);
+        p.extend_from_slice(&chunk(0x3000, &body));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(lint_frame(&f).is_clean(), "{:?}", lint_frame(&f).issues());
+        assert!(has_rule(
+            &lint_frame_with(&f, &vintage),
+            LintRule::VintageCodebookPairViolation
+        ));
+        // V1-before-V4 order: warning by default, violation under
+        // vintage.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        let rep = lint_frame(&f);
+        assert!(rep.is_conformant());
+        assert!(has_rule(
+            &lint_frame_with(&f, &vintage),
+            LintRule::VintageCodebookPairViolation
+        ));
+        // A header-only pair satisfies the profile.
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2000, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3200, &[0u8; 8]));
+        let f = wrap_frame(16, 8, &[(0x1000, 0, 8, p)]);
+        assert!(
+            !has_rule(
+                &lint_frame_with(&f, &vintage),
+                LintRule::VintageCodebookPairViolation
+            ),
+            "{:?}",
+            lint_frame_with(&f, &vintage).issues()
+        );
+    }
+
+    #[test]
+    fn vintage_compat_encoder_output_passes_vintage_profile() {
+        use crate::encoder::CinepakEncoder;
+        let vintage = LintOptions::new().with_vintage(true);
+        let opts = EncoderOptions {
+            vintage_compat: true,
+            strip_count: 2,
+            ..EncoderOptions::default()
+        };
+        let (w, h) = (16u32, 16u32);
+        let mut enc = CinepakEncoder::new();
+        let f0: Vec<u8> = (0..(w * h * 3)).map(|i| (i % 191) as u8).collect();
+        let f1 = f0.clone(); // unchanged frame ⇒ maximal reuse/skips
+        let intra = enc.encode_intra(&f0, w, h, opts).unwrap();
+        let inter = enc.encode_inter(&f1, w, h, opts).unwrap();
+        for (label, bytes) in [("intra", &intra), ("inter", &inter)] {
+            let rep = lint_frame_with(bytes, &vintage);
+            assert!(rep.is_clean(), "{label}: {:?}", rep.issues());
+        }
+    }
+
+    #[test]
+    fn skip_codes_at_sequence_start_are_error() {
+        let seq_start = LintOptions::new().with_sequence_start(true);
+        // All-skip inter strip: clean mid-stream, an error at start.
+        let body = 0u32.to_be_bytes().to_vec();
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
+        assert!(lint_frame(&f).is_conformant());
+        let rep = lint_frame_with(&f, &seq_start);
+        assert!(has_rule(&rep, LintRule::PrevFrameDependencyAtSequenceStart));
+        // A skip-free 0x3100 (1 V1 update on a 1-MB strip: bits `10`)
+        // is self-contained even at sequence start.
+        let mut body = 0x8000_0000u32.to_be_bytes().to_vec();
+        body.push(0);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2200, &[10, 20, 30, 40, 0, 0]));
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(4, 4, &[(0x1100, 0, 4, p)]);
+        let rep = lint_frame_with(&f, &seq_start);
+        assert!(
+            !has_rule(&rep, LintRule::PrevFrameDependencyAtSequenceStart),
+            "{:?}",
+            rep.issues()
+        );
+    }
+
+    #[test]
+    fn selective_update_at_sequence_start_is_error() {
+        let seq_start = LintOptions::new().with_sequence_start(true);
+        let mut sel = 0x8000_0000u32.to_be_bytes().to_vec();
+        sel.extend_from_slice(&[1, 2, 3, 4, 0, 0]);
+        let mut body = 0x8000_0000u32.to_be_bytes().to_vec();
+        body.push(0);
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x2300, &sel));
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let f = wrap_frame(4, 4, &[(0x1100, 0, 4, p)]);
+        assert!(lint_frame(&f).is_conformant());
+        assert!(has_rule(
+            &lint_frame_with(&f, &seq_start),
+            LintRule::PrevFrameDependencyAtSequenceStart
+        ));
+    }
+
+    #[test]
+    fn lint_sequence_flags_only_the_first_frame() {
+        // Frame A: all-skip inter frame (prev-frame dependent).
+        let body = 0u32.to_be_bytes().to_vec();
+        let mut p = Vec::new();
+        p.extend_from_slice(&chunk(0x3100, &body));
+        let dependent = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
+        // Frame B: self-contained intra frame.
+        let intra = frame_one_strip(&conformant_intra_stream());
+
+        // intra-first: both reports clean.
+        let reps = lint_sequence(
+            [intra.as_slice(), dependent.as_slice()],
+            &LintOptions::new(),
+        );
+        assert_eq!(reps.len(), 2);
+        assert!(reps[0].is_clean(), "{:?}", reps[0].issues());
+        assert!(reps[1].is_conformant(), "{:?}", reps[1].issues());
+
+        // dependent-first: only the first report errors.
+        let reps = lint_sequence(
+            [dependent.as_slice(), dependent.as_slice()],
+            &LintOptions::new(),
+        );
+        assert!(has_rule(
+            &reps[0],
+            LintRule::PrevFrameDependencyAtSequenceStart
+        ));
+        assert!(!has_rule(
+            &reps[1],
+            LintRule::PrevFrameDependencyAtSequenceStart
+        ));
+    }
+
+    #[test]
+    fn encoder_gop_sequence_passes_lint_sequence() {
+        use crate::encoder::CinepakEncoder;
+        let (w, h) = (16u32, 16u32);
+        let mut enc = CinepakEncoder::new().with_keyframe_interval(2);
+        let mut frames = Vec::new();
+        for n in 0..4u32 {
+            let px: Vec<u8> = (0..(w * h * 3))
+                .map(|i| ((i + n * 11) % 223) as u8)
+                .collect();
+            frames.push(
+                enc.encode_frame(&px, w, h, EncoderOptions::default())
+                    .unwrap()
+                    .bytes,
+            );
+        }
+        let reps = lint_sequence(frames.iter().map(|f| f.as_slice()), &LintOptions::new());
+        for (n, rep) in reps.iter().enumerate() {
+            assert!(rep.is_clean(), "frame {n}: {:?}", rep.issues());
+        }
     }
 
     #[test]

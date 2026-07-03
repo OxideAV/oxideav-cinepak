@@ -1,5 +1,7 @@
 # oxideav-cinepak
 
+[![CI](https://github.com/OxideAV/oxideav-cinepak/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-cinepak/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-cinepak.svg)](https://crates.io/crates/oxideav-cinepak) [![docs.rs](https://docs.rs/oxideav-cinepak/badge.svg)](https://docs.rs/oxideav-cinepak) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust Cinepak (CVID) video codec — full decoder plus a
 quality- and rate-controlled encoder — for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.

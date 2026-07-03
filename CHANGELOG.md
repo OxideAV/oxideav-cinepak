@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 6 (conformance lint — encoder self-conformance
+  property test + fuzz target): new integration test
+  `tests/lint_encoder_conformance.rs` locking "every public encode
+  entry point emits a stream the crate\'s own linter finds completely
+  clean (zero errors *and* zero warnings)": the 8 stateless intra RGB
+  entry points (baseline, best-strips, RD-grid ×2, 3-axis ×2,
+  per-strip ×2), the 3 grayscale entry points, both stateless inter
+  entry points (against a decoder-reconstructed previous frame), a
+  6-frame multi-strip GOP through the auto-routing stateful encoder
+  checked via `lint_sequence`, the stateful gray paths, the
+  byte-budget rate-controlled paths, a `vintage_compat` GOP checked
+  under the vintage lint profile (closing the encode/verify loop on
+  skip-heavy inter frames with header-only reuse chunks), and a
+  `from_quality` sweep (q ∈ {0, 25, 50, 75, 100}). An encoder
+  regression that mis-accounts a chunk size, reorders codebook
+  chunks, or emits an out-of-range vector index now trips `cargo
+  test` directly. Plus a new `lint_frame` cargo-fuzz target (10th
+  harness): drives arbitrary bytes through `lint_frame` and both
+  option profiles, asserting total-function behaviour (a `LintReport`
+  for every input, no panic/overflow/OOM), profile monotonicity
+  (gated profiles only ever add findings) plus `strips_walked`
+  agreement, and that every issue renders through `Display`. 46-second
+  local smoke run: 796 672 executions, zero crashes.
 - Round 383 milestone 5 (conformance lint — vintage profile +
   sequence context + `lint_sequence`): `LintOptions` gains two knobs
   (with `with_vintage` / `with_sequence_start` builders).

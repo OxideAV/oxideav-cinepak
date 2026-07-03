@@ -97,3 +97,10 @@ path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lint_frame"
+path = "fuzz_targets/lint_frame.rs"
+test = false
+doc = false
+bench = false

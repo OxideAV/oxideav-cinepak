@@ -183,6 +183,51 @@ validators, fuzz harnesses, and introspection tools:
   pixel block of one macroblock.
 - `film::Samples` / `StabHeader::parse_chunk` — STAB record walking.
 
+## Wire-format conformance lint
+
+Where the decoder answers "can these bytes become pixels?", the
+`lint` module answers "do these bytes *conform* to the documented
+wire format — and if not, which rule, where, and how badly?".
+`lint_frame(bytes)` / `lint_frame_with(bytes, &LintOptions)` walk the
+frame → strip → chunk → vector layers read-only and return a
+`LintReport` of `LintIssue`s, each carrying the violated `LintRule`,
+an `Error` (normative violation) vs `Warning` (SHOULD /
+encoder-convention / corpus-observation deviation) severity, the
+strip/chunk location, the byte offset, and the grounding spec section
+(`LintRule::spec_ref`). The walk is best-effort (reports as many
+independent findings as possible) and total (arbitrary bytes never
+panic — unparseable structure is itself a finding).
+
+Rule coverage: frame-header field ranges and `frame_length`
+accounting; strip-id taxonomy, y-sentinel geometry, vertical tiling,
+and strip-size accounting; chunk taxonomy and `Σ chunk_size`
+accounting; per-strip-kind chunk restrictions (selective updates and
+`0x3100` barred from intra strips); codebook payload arithmetic
+(entry alignment, 256-entry ceiling, selective-update group walk);
+V4-then-V1 ordering and one-vector-chunk-per-strip placement; mixed
+YUV/grayscale flavours in one frame; per-strip macroblock-count byte
+balance for all three vector codes; and the intra codebook-occupancy
+rule (vector indices referencing entries the strip never defined).
+
+`LintOptions` adds two gated profiles: `vintage` enforces the
+vintage-player constraints the encoder's `vintage_compat` targets
+(≤ 3 strips, both codebook chunks per strip in strict V4-then-V1
+order), and `sequence_start` flags previous-frame/previous-codebook
+dependence (skip codes, selective updates) on a stream's first frame
+or seek target. `lint_sequence(frames, opts)` maps a decode sequence
+with `sequence_start` forced on the first frame.
+
+The encoder is held to the linter:
+`tests/lint_encoder_conformance.rs` asserts every public encode entry
+point — all intra/gray/inter/stateful/rate-controlled/quality-sweep
+paths, plus a `vintage_compat` GOP under the vintage profile — emits
+streams with zero errors *and* zero warnings.
+
+`examples/lint_cvid.rs` is the command-line driver: it splits a file
+of concatenated raw frames on `frame_length` (spec 01 §1.2) and
+prints per-frame findings (`--vintage`, `--mid-stream`; exit 1 on any
+error-severity finding).
+
 ## Registration
 
 `CVID` is registered (AVI `biCompression`, QuickTime `cvid`, Sega FILM
@@ -226,7 +271,9 @@ A `cargo-fuzz` harness under `fuzz/` covers the public parse/decode
 entry points and the FILM PCM-shaping helpers — frame/strip header
 parse, full and deviant `decode_frame`, multi-frame stateful decode,
 the FILM container parse, the codebook-chunk and vector-chunk parsers
-in isolation, and the PCM reshaping functions. An `encode_roundtrip`
+in isolation, the PCM reshaping functions, and the conformance
+linter (`lint_frame` across all option profiles, asserting
+total-function behaviour and profile monotonicity). An `encode_roundtrip`
 target drives the *encoder* with attacker-shaped pixel buffers,
 dimensions, and option knobs across both pixel modes and the
 intra/inter paths, then feeds every encoder output back through

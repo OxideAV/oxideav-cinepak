@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 383 milestone 7 (conformance lint — command-line driver):
+  new `examples/lint_cvid.rs`, a standalone lint tool for raw Cinepak
+  bytes (pre-extracted from AVI / QuickTime / Sega FILM samples —
+  container walking stays in the container tooling). It splits a file
+  of concatenated frames on the 24-bit `frame_length` field (the only
+  next-frame pointer in a raw concatenation per spec 01 §1.2, with
+  undecidable boundaries handed to the linter as a malformed residue
+  frame), lints each frame — `--vintage` adds the vintage-player
+  profile, `--mid-stream` suppresses the sequence-start rules for the
+  first frame — and prints every finding with rule, severity,
+  strip/chunk location, byte offset, and grounding spec section.
+  Exit status: 0 conformant (warnings allowed), 1 any error-severity
+  finding, 2 usage/IO. Smoke-verified against a two-frame conformant
+  stream (exit 0, both frames clean) and the same stream with a
+  corrupted strip id (exit 1, `UnknownStripId` at the right offset).
+  README gains a "Wire-format conformance lint" section covering the
+  round-383 subsystem end to end.
 - Round 383 milestone 6 (conformance lint — encoder self-conformance
   property test + fuzz target): new integration test
   `tests/lint_encoder_conformance.rs` locking "every public encode

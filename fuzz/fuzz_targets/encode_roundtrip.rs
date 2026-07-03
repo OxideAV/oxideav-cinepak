@@ -91,7 +91,9 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(bytes) = encode_rgb24(&rgb, width, height, opts) {
             // The encoder's own output must round-trip cleanly.
             let mut dec = CinepakDecoder::new();
-            let prev = dec.decode_frame(&bytes, None).expect("encoder output must decode");
+            let prev = dec
+                .decode_frame(&bytes, None)
+                .expect("encoder output must decode");
             assert_eq!(prev.width, width);
             assert_eq!(prev.height, height);
 
@@ -101,11 +103,15 @@ fuzz_target!(|data: &[u8]| {
             let mut rgb2 = rgb.clone();
             for (i, p) in rgb2.iter_mut().enumerate() {
                 if i % 3 == 0 {
-                    *p = p.wrapping_add((seed.get(i % seed.len().max(1)).copied().unwrap_or(0)) ^ 0x55);
+                    *p = p.wrapping_add(
+                        (seed.get(i % seed.len().max(1)).copied().unwrap_or(0)) ^ 0x55,
+                    );
                 }
             }
             if let Ok(inter) = encode_rgb24_inter(&rgb2, &prev, width, height, opts) {
-                let f = dec.decode_frame(&inter, None).expect("inter output must decode");
+                let f = dec
+                    .decode_frame(&inter, None)
+                    .expect("inter output must decode");
                 assert_eq!(f.width, width);
                 assert_eq!(f.height, height);
             }
@@ -116,7 +122,9 @@ fuzz_target!(|data: &[u8]| {
         fill(&mut gray, seed);
         if let Ok(bytes) = encode_gray8(&gray, width, height, opts) {
             let mut dec = CinepakDecoder::new();
-            let f = dec.decode_frame(&bytes, None).expect("gray encoder output must decode");
+            let f = dec
+                .decode_frame(&bytes, None)
+                .expect("gray encoder output must decode");
             assert_eq!(f.width, width);
             assert_eq!(f.height, height);
         }

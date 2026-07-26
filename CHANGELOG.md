@@ -93,6 +93,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decode untouched), and the post-round samply hotspot ranking. The
   crate README benchmark blurb is updated to match.
 
+- Round 430 (step 5 — regression fuzz pass): bounded local
+  `cargo-fuzz` sweep over the optimized tree — `encode_roundtrip`
+  182,403 runs/360 s, `lint_frame` 1,004,606 runs/180 s,
+  `decode_frame` 20.6 M runs/120 s, `decode_multi_frame`
+  12.8 M runs/120 s — zero crashes, zero artifacts. No harness or
+  corpus changes were needed; this entry records the round's
+  no-regression evidence alongside the golden pins.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

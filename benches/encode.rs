@@ -171,6 +171,124 @@ fn bench_encode_gray8_320x240_q50_round7(c: &mut Criterion) {
     g.finish();
 }
 
+/// Round 430 (encoder-performance depth round): criterion mirror of the
+/// profile driver's `phases` mode. Each row enables one more training
+/// phase on top of the previous row (cumulative), so `criterion`'s
+/// change detection can watch the *marginal* cost of each codebook-
+/// training phase — cold median-cut, seeded Lloyd, LBG split-
+/// refinement, post-classification polish, and the k-means++ cold-start
+/// — across optimization commits. All five phases share the same
+/// O(vectors x K) nearest-neighbour inner loop, which is exactly what
+/// the round-430 hot-path work restructures; these rows are the
+/// regression guard for it.
+///
+/// Options are spelled field-explicitly (same vectors as the golden
+/// wire-hash pins) so the benched paths are the pinned paths.
+fn bench_encode_training_phases_320x240(c: &mut Criterion) {
+    let rgb = build_rgb_gradient(320, 240);
+    let base = EncoderOptions {
+        v4_entries: 64,
+        v1_entries: 64,
+        strip_count: 1,
+        skip_threshold: 64.0,
+        lloyd_max_iter: 0,
+        lloyd_eps: 1,
+        stale_slot_threshold: Some(8),
+        rdo_lambda: Some(5.0),
+        lbg_max_passes: 0,
+        luma_weight: 2,
+        pcl_max_iter: 0,
+        kmeans_pp_init: false,
+        kmeans_pp_lloyd_iter: 0,
+        vintage_compat: false,
+    };
+    let rows: [(&str, EncoderOptions); 5] = [
+        ("mediancut_only", base),
+        (
+            "plus_lloyd2",
+            EncoderOptions {
+                lloyd_max_iter: 2,
+                ..base
+            },
+        ),
+        (
+            "plus_lbg8",
+            EncoderOptions {
+                lloyd_max_iter: 2,
+                lbg_max_passes: 8,
+                ..base
+            },
+        ),
+        (
+            "plus_pcl2",
+            EncoderOptions {
+                lloyd_max_iter: 2,
+                lbg_max_passes: 8,
+                pcl_max_iter: 2,
+                ..base
+            },
+        ),
+        (
+            "plus_kmeanspp4",
+            EncoderOptions {
+                lloyd_max_iter: 2,
+                lbg_max_passes: 8,
+                pcl_max_iter: 2,
+                kmeans_pp_init: true,
+                kmeans_pp_lloyd_iter: 4,
+                ..base
+            },
+        ),
+    ];
+    let mut g = c.benchmark_group("encode_training_phases_320x240");
+    g.throughput(Throughput::Bytes((320 * 240 * 3) as u64));
+    g.sample_size(10);
+    for (name, opts) in rows {
+        g.bench_function(BenchmarkId::from_parameter(name), |b| {
+            b.iter(|| {
+                encode_rgb24(criterion::black_box(&rgb), 320, 240, opts).expect("phase encode");
+            });
+        });
+    }
+    g.finish();
+}
+
+/// Round 430: multi-strip large-frame row — the strip-assembly +
+/// per-strip codebook-training shape (3 strips at 640x480). Costs
+/// scale with strips x per-strip training; this is the "big frame"
+/// guard the 320x240 single-strip rows can't see.
+fn bench_encode_rgb24_640x480_strips3(c: &mut Criterion) {
+    let rgb = build_rgb_gradient(640, 480);
+    let opts = EncoderOptions {
+        v4_entries: 128,
+        v1_entries: 128,
+        strip_count: 3,
+        skip_threshold: 32.0,
+        lloyd_max_iter: 2,
+        lloyd_eps: 1,
+        stale_slot_threshold: Some(8),
+        rdo_lambda: Some(5.0),
+        lbg_max_passes: 8,
+        luma_weight: 2,
+        pcl_max_iter: 2,
+        kmeans_pp_init: true,
+        kmeans_pp_lloyd_iter: 4,
+        vintage_compat: false,
+    };
+    let mut g = c.benchmark_group("encode_rgb24_640x480_strips3");
+    g.throughput(Throughput::Bytes((640 * 480 * 3) as u64));
+    g.sample_size(10);
+    g.bench_function(
+        BenchmarkId::from_parameter("baseline/640x480/strips3"),
+        |b| {
+            b.iter(|| {
+                encode_rgb24(criterion::black_box(&rgb), 640, 480, opts).expect("encode 640x480");
+            });
+        },
+    );
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_rgb24_64x64_q50_baseline,
@@ -179,5 +297,7 @@ criterion_group!(
     bench_encode_rgb24_320x240_q50_baseline,
     bench_encode_gray8_320x240_q50,
     bench_encode_gray8_320x240_q50_round7,
+    bench_encode_training_phases_320x240,
+    bench_encode_rgb24_640x480_strips3,
 );
 criterion_main!(benches);

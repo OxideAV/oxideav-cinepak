@@ -4979,30 +4979,43 @@ fn median_cut_seeded(
             // returned codebook is the descendant of the seed's slot
             // `i`; slots that attract no vectors at any iteration
             // retain the seed's slot `i` byte-identical).
+            // Round 430 (output-invariant de-churn): accumulate flat
+            // per-slot sums + counts instead of materialising cluster
+            // membership Vecs each iteration (i64 sums are exact and
+            // commutative, so `centroid_from_sums` equals the old
+            // `centroid(members)`), and update `cb` in place — each
+            // slot's new centroid depends only on its own old entry,
+            // so the clone-then-swap of the round-6 form was pure copy
+            // cost.
             let mut cb = prev.clone();
+            let n_slots = n.min(256);
+            let mut sums: Vec<[i64; 6]> = vec![[0i64; 6]; n_slots];
+            let mut counts: Vec<u32> = vec![0; n_slots];
             for _iter in 0..max_iter {
-                let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
+                for s in sums.iter_mut() {
+                    *s = [0i64; 6];
+                }
+                counts.fill(0);
                 for v in vectors {
                     let (slot, _) = nearest(v, &cb, n, mode, luma_weight);
-                    clusters[slot as usize].push(*v);
+                    accumulate_slot(&mut sums[slot as usize], v);
+                    counts[slot as usize] += 1;
                 }
                 let mut max_drift: u32 = 0;
-                let mut next_cb = cb.clone();
-                for (i, c) in clusters.iter().enumerate().take(n) {
-                    if !c.is_empty() {
-                        let new_centroid = centroid(c, mode);
+                for i in 0..n_slots {
+                    if counts[i] > 0 {
+                        let new_centroid = centroid_from_sums(&sums[i], counts[i], mode);
                         max_drift = max_drift.max(entry_l1_distance(
                             &cb.entries[i],
                             &new_centroid,
                             mode,
                             luma_weight,
                         ));
-                        next_cb.entries[i] = new_centroid;
+                        cb.entries[i] = new_centroid;
                     }
                     // else: keep cb.entries[i] verbatim (no drift
                     // contribution — empty cluster locks the slot).
                 }
-                cb = next_cb;
                 // Early stop: centroids are essentially stable.
                 if max_drift <= eps {
                     break;
@@ -5148,35 +5161,74 @@ fn kmeans_pp_init_cold(
         chosen += 1;
     }
 
-    // Step 3: Lloyd refinement.
+    // Step 3: Lloyd refinement. Round 430: flat per-slot sums/counts +
+    // in-place centroid update, same de-churn as the seeded-Lloyd loop
+    // in `median_cut_seeded` (bit-identical results — see there).
     if lloyd_iter > 0 {
+        let mut sums: Vec<[i64; 6]> = vec![[0i64; 6]; n];
+        let mut counts: Vec<u32> = vec![0; n];
         for _iter in 0..lloyd_iter {
-            let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
+            for s in sums.iter_mut() {
+                *s = [0i64; 6];
+            }
+            counts.fill(0);
             for v in vectors {
                 let (slot, _) = nearest(v, &cb, n, mode, luma_weight);
-                clusters[slot as usize].push(*v);
+                accumulate_slot(&mut sums[slot as usize], v);
+                counts[slot as usize] += 1;
             }
             let mut max_drift: u32 = 0;
-            let mut next_cb = cb.clone();
-            for (i, c) in clusters.iter().enumerate().take(n) {
-                if !c.is_empty() {
-                    let new_centroid = centroid(c, mode);
+            for i in 0..n {
+                if counts[i] > 0 {
+                    let new_centroid = centroid_from_sums(&sums[i], counts[i], mode);
                     max_drift = max_drift.max(entry_l1_distance(
                         &cb.entries[i],
                         &new_centroid,
                         mode,
                         luma_weight,
                     ));
-                    next_cb.entries[i] = new_centroid;
+                    cb.entries[i] = new_centroid;
                 }
             }
-            cb = next_cb;
             if max_drift <= lloyd_eps {
                 break;
             }
         }
     }
     cb
+}
+
+/// Add one vector's components into a flat per-slot accumulator.
+/// Chroma dims are accumulated unconditionally — `centroid_from_sums`
+/// zeroes them for `Gray8`, matching the round-6 `centroid` exactly.
+#[inline]
+fn accumulate_slot(s: &mut [i64; 6], v: &CodebookEntry) {
+    s[0] += i64::from(v.y0);
+    s[1] += i64::from(v.y1);
+    s[2] += i64::from(v.y2);
+    s[3] += i64::from(v.y3);
+    s[4] += i64::from(v.u);
+    s[5] += i64::from(v.v);
+}
+
+/// Centroid of a cluster from its flat component sums + population —
+/// the same truncating integer divisions as `centroid(members)`, and
+/// i64 addition is exact + commutative, so accumulation order cannot
+/// change the result.
+fn centroid_from_sums(s: &[i64; 6], count: u32, mode: PixelMode) -> CodebookEntry {
+    let div = i64::from(count);
+    let (u, v) = match mode {
+        PixelMode::Yuv12 => ((s[4] / div) as i8, (s[5] / div) as i8),
+        PixelMode::Gray8 => (0, 0),
+    };
+    CodebookEntry {
+        y0: (s[0] / div) as u8,
+        y1: (s[1] / div) as u8,
+        y2: (s[2] / div) as u8,
+        y3: (s[3] / div) as u8,
+        u,
+        v,
+    }
 }
 
 /// Deterministic xorshift32 PRNG seeded from a hash of the input
@@ -5490,13 +5542,7 @@ fn lbg_refine_codebook(
         trial_counts.fill(0);
         for v in vectors {
             let (slot, _err) = nearest(v, cb, n, mode, luma_weight);
-            let s = &mut sums[slot as usize];
-            s[0] += i64::from(v.y0);
-            s[1] += i64::from(v.y1);
-            s[2] += i64::from(v.y2);
-            s[3] += i64::from(v.y3);
-            s[4] += i64::from(v.u);
-            s[5] += i64::from(v.v);
+            accumulate_slot(&mut sums[slot as usize], v);
             trial_counts[slot as usize] += 1;
         }
         let mut next_cb = cb.clone();
@@ -5505,19 +5551,7 @@ fn lbg_refine_codebook(
                 // Keep prior value (unreferenced slot, no harm).
                 continue;
             }
-            let div = i64::from(trial_counts[i]);
-            let (u, v) = match mode {
-                PixelMode::Yuv12 => ((sums[i][4] / div) as i8, (sums[i][5] / div) as i8),
-                PixelMode::Gray8 => (0, 0),
-            };
-            next_cb.entries[i] = CodebookEntry {
-                y0: (sums[i][0] / div) as u8,
-                y1: (sums[i][1] / div) as u8,
-                y2: (sums[i][2] / div) as u8,
-                y3: (sums[i][3] / div) as u8,
-                u,
-                v,
-            };
+            next_cb.entries[i] = centroid_from_sums(&sums[i], trial_counts[i], mode);
         }
         // Recompute total SSE against the recentroided codebook — this
         // is the SSE the encoder will actually see when it picks

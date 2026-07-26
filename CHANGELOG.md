@@ -40,6 +40,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gray8/320x240 11.47→10.91 ms. Wire bytes identical on all 15
   golden-pin scenarios.
 
+- Round 430 (step 3, optimization 3 — Lloyd-loop de-churn,
+  output-invariant): the seeded-Lloyd loop in `median_cut_seeded`
+  (cross-frame warm start, the inter-frame path) and the k-means++
+  Lloyd polish now accumulate flat per-slot sums/counts (new shared
+  `accumulate_slot` / `centroid_from_sums` helpers — i64 sums are exact
+  and commutative, truncating divisions identical to `centroid`) and
+  update the codebook in place instead of materialising a
+  `Vec<Vec<CodebookEntry>>` plus a full `Codebook` clone per iteration;
+  the LBG recentroid now shares the same helpers. Measured: stateful
+  5-frame GOP at 320x240 51.80→49.91 ms/seq (−3.6% on top of
+  optimization 2; 66.35→49.91, −24.8% cumulative for the round);
+  intra-only rows move −3.4%..0% (the de-churned loops run on the
+  seeded/cold-start paths, not the intra hot loop). Wire bytes
+  identical on all 15 golden-pin scenarios.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

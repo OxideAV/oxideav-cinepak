@@ -6,6 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-cinepak/compare/v0.0.3...v0.0.4) - 2026-07-26
+
+### Other
+
+- record round-430 bounded fuzz pass (zero crashes, four targets)
+- round-430 profile ledger — cumulative -23..-31% encode, decode re-verified
+- i32 k-means++ D2-seeding pass with fused sigma-d2 refresh
+- cache median-cut split selection, single-sweep cluster extents
+- flat-accumulator Lloyd loops (seeded + k-means++ polish), in-place update
+- LBG pass restructure — 2 nearest scans per pass, flat accumulators
+- restructure nearest-neighbour scan (i32, mode-split, size-gated early exit)
+- criterion training-phase toggle rows + 640x480 3-strip row
+- round-430 golden wire-byte pins for the encoder (15-scenario matrix)
+
 ### Changed
 
 - Round 430 (encoder-performance depth round, step 3 — nearest-neighbour

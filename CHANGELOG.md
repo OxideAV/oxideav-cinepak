@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 430 (encoder-performance depth round, step 3 — nearest-neighbour
+  scan restructure, output-invariant): the `nearest` inner loop shared
+  by every codebook-training phase and per-MB classification now
+  accumulates distances in `i32` (worst case 66,455,550 « `i32::MAX`)
+  over mode-split branchless loops, with a partial-distance early exit
+  after the luma block gated to large colour codebooks (`n >= 64`) where
+  it measures faster; small-codebook and `Gray8` scans stay branchless
+  (the exit's data-dependent branch measured +20% there). Measured
+  (Apple M4 Max, `profile_cinepak encode 12 samples=5`, median):
+  rgb24/64x64/round7 30.13→27.63 ms (−8.3%), rgb24/320x240 24.18→21.29 ms
+  (−12.0%), rgb24/640x480/q70 166.24→143.93 ms (−13.4%), gray8/320x240
+  12.72→11.47 ms (−9.8%). Wire bytes identical on all 15 golden-pin
+  scenarios; selected slot, returned error and tie-breaking (first
+  minimum wins) are provably unchanged.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

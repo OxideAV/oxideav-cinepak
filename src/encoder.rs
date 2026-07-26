@@ -5638,6 +5638,44 @@ fn entry_distance(a: &CodebookEntry, b: &CodebookEntry, mode: PixelMode, luma_we
     d
 }
 
+/// Round 430 (hot-path restructure): the nearest-neighbour scan is the
+/// inner loop of every training phase (Lloyd assignment, LBG passes,
+/// k-means++ D² seeding via `codebook_total_sse`) *and* of per-MB V4/V1
+/// classification — round-289 profiling attributes ~2/3 of total encode
+/// time to it. Two output-invariant changes vs the round-4 form:
+///
+/// 1. **Narrow arithmetic**: per-dim deltas fit `i32` comfortably —
+///    the worst-case total is `w·4·255² + 2·255²` = 66,455,550 with
+///    `w = luma_weight ≤ 255`, far below `i32::MAX` — so the whole
+///    distance accumulates in `i32` and widens to `i64` once, at
+///    return.
+/// 2. **Size-gated partial-distance early exit**: squared-error terms
+///    are non-negative, so once the running partial sum reaches the
+///    best distance seen so far the entry cannot win (the `<` update
+///    rule is strict, ties keep the earlier slot) and the remaining
+///    dims can be skipped. Measured on the r160 fixture set, the
+///    exit's data-dependent branch is a *loss* on small codebooks
+///    (K~45: +20% on the 64x64/round-7 and gray8 rows — misprediction
+///    stalls outrun the saved multiply-adds) but a win on large ones
+///    (K~91 at 640x480/q70: a further −3% under the branchless form),
+///    so the checkpoint — placed after the 4-dim luma block — is only
+///    compiled into the `n >= 64` colour path; smaller scans and the
+///    4-dim `Gray8` scan (nothing left to skip after luma) stay
+///    branchless.
+///
+/// Equivalence to the naive full-distance scan: an entry is skipped
+/// only when its *partial* distance already `>=` the current best, in
+/// which case its full distance is also `>=` best and the strict-`<`
+/// update would have rejected it anyway. Selected index, returned
+/// error, and tie-breaking (first minimum wins) are all identical —
+/// pinned by `tests/golden_wire_hashes.rs`.
+///
+/// Measured effect of this function alone (r430, Apple M4 Max,
+/// `profile_cinepak encode 12 samples=5`, median): 30.13→27.63 ms
+/// (−8.3%) on rgb24/64x64/q50/round7, 24.18→21.29 ms (−12.0%) on
+/// rgb24/320x240/q50, 166.24→143.93 ms (−13.4%) on rgb24/640x480/q70,
+/// 12.72→11.47 ms (−9.8%) on gray8/320x240/q50; wire bytes identical
+/// on every row.
 fn nearest(
     target: &CodebookEntry,
     cb: &Codebook,
@@ -5645,16 +5683,73 @@ fn nearest(
     mode: PixelMode,
     luma_weight: u8,
 ) -> (u8, i64) {
+    let n = n.min(256);
+    if n == 0 {
+        return (0, i64::MAX);
+    }
+    let w = i32::from(luma_weight.max(1));
+    let ty0 = i32::from(target.y0);
+    let ty1 = i32::from(target.y1);
+    let ty2 = i32::from(target.y2);
+    let ty3 = i32::from(target.y3);
+    let tu = i32::from(target.u);
+    let tv = i32::from(target.v);
     let mut best_idx = 0u8;
-    let mut best_err = i64::MAX;
-    for i in 0..n.min(256) {
-        let d = entry_distance(target, &cb.entries[i], mode, luma_weight);
-        if d < best_err {
-            best_err = d;
-            best_idx = i as u8;
+    let mut best = i32::MAX;
+    match mode {
+        PixelMode::Yuv12 if n >= 64 => {
+            // Large-codebook scan: partial-distance early exit after the
+            // luma block. Skipping is exact — a partial sum already >=
+            // best can only grow, and the update rule below is strict
+            // `<`, so skipped entries could never have won.
+            for (i, e) in cb.entries[..n].iter().enumerate() {
+                let dy0 = ty0 - i32::from(e.y0);
+                let dy1 = ty1 - i32::from(e.y1);
+                let dy2 = ty2 - i32::from(e.y2);
+                let dy3 = ty3 - i32::from(e.y3);
+                let mut d = w * (dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3);
+                if d >= best {
+                    continue;
+                }
+                let du = tu - i32::from(e.u);
+                let dv = tv - i32::from(e.v);
+                d += du * du + dv * dv;
+                if d < best {
+                    best = d;
+                    best_idx = i as u8;
+                }
+            }
+        }
+        PixelMode::Yuv12 => {
+            for (i, e) in cb.entries[..n].iter().enumerate() {
+                let dy0 = ty0 - i32::from(e.y0);
+                let dy1 = ty1 - i32::from(e.y1);
+                let dy2 = ty2 - i32::from(e.y2);
+                let dy3 = ty3 - i32::from(e.y3);
+                let du = tu - i32::from(e.u);
+                let dv = tv - i32::from(e.v);
+                let d = w * (dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3) + du * du + dv * dv;
+                if d < best {
+                    best = d;
+                    best_idx = i as u8;
+                }
+            }
+        }
+        PixelMode::Gray8 => {
+            for (i, e) in cb.entries[..n].iter().enumerate() {
+                let dy0 = ty0 - i32::from(e.y0);
+                let dy1 = ty1 - i32::from(e.y1);
+                let dy2 = ty2 - i32::from(e.y2);
+                let dy3 = ty3 - i32::from(e.y3);
+                let d = w * (dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3);
+                if d < best {
+                    best = d;
+                    best_idx = i as u8;
+                }
+            }
         }
     }
-    (best_idx, best_err)
+    (best_idx, i64::from(best))
 }
 
 fn pick_v4(

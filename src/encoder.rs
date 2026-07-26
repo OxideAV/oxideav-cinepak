@@ -5656,43 +5656,54 @@ fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode, luma_weight:
         PixelMode::Gray8 => 4,
     };
     let w = luma_weight.max(1) as i32;
+    // Round 430 (output-invariant restructure): the round-5 form
+    // rescanned EVERY cluster along EVERY dimension on EVERY bisection
+    // — O(K iterations x clusters x dims x members) — even though a
+    // split only changes two clusters. Each cluster's best
+    // (weighted-score, dim) pair is now cached and recomputed only for
+    // the two clusters a split produces, and the per-cluster extents
+    // come from one all-dims member sweep instead of `dims` sweeps.
+    // Selection semantics are unchanged: within a cluster the first
+    // dim with a strictly greater weighted extent wins (ascending d,
+    // strict `>` — same as the flat scan), and across clusters the
+    // first cluster with a strictly greater score wins (ascending ci,
+    // strict `>`), so the chosen (cluster, dim) sequence — and hence
+    // every split — is identical to the round-5 flat rescan.
+    //
+    // Y-dims (0..=3) get a `luma_weight` multiplier; U/V-dims (4..=5)
+    // stay at weight 1. We compare on the weighted score but still
+    // split on the un-weighted dim values themselves — the weight only
+    // affects which dim wins. A cached score of 0 marks a cluster that
+    // can never be split (fewer than 2 members, or all members
+    // identical along every dim) — same clusters the flat scan skipped.
     let mut clusters: Vec<Vec<CodebookEntry>> = vec![vectors.to_vec()];
+    let mut split_cache: Vec<(i32, usize)> = vec![cluster_split_score(&clusters[0], dims, w)];
     while clusters.len() < n {
-        // Find cluster with largest weighted extent along any dimension.
-        // Y-dims (0..=3) get a `luma_weight` multiplier; U/V-dims
-        // (4..=5) stay at weight 1. We compare on the weighted score
-        // but still split on the un-weighted dim values themselves —
-        // the weight only affects which dim wins.
         let mut best_idx = None;
         let mut best_score: i32 = 0;
         let mut best_dim = 0;
-        for (ci, c) in clusters.iter().enumerate() {
-            if c.len() < 2 {
-                continue;
-            }
-            for d in 0..dims {
-                let (lo, hi) = extent(c, d);
-                let ext = hi - lo;
-                let weighted = if d < 4 { ext.saturating_mul(w) } else { ext };
-                if weighted > best_score {
-                    best_score = weighted;
-                    best_idx = Some(ci);
-                    best_dim = d;
-                }
+        for (ci, &(score, dim)) in split_cache.iter().enumerate() {
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(ci);
+                best_dim = dim;
             }
         }
         let Some(idx) = best_idx else {
             break;
         };
-        if best_score == 0 {
-            break;
-        }
         let mut cluster = std::mem::take(&mut clusters[idx]);
         cluster.sort_by_key(|e| dim_value(e, best_dim));
         let mid = cluster.len() / 2;
         let right = cluster.split_off(mid);
         clusters[idx] = cluster;
         clusters.push(right);
+        split_cache[idx] = cluster_split_score(&clusters[idx], dims, w);
+        split_cache.push(cluster_split_score(
+            clusters.last().expect("just pushed"),
+            dims,
+            w,
+        ));
     }
     // Compute centroids and write to codebook entries.
     for (i, c) in clusters.iter().enumerate().take(n) {
@@ -5702,6 +5713,39 @@ fn median_cut(vectors: &[CodebookEntry], n: usize, mode: PixelMode, luma_weight:
         cb.entries[i] = centroid(c, mode);
     }
     cb
+}
+
+/// Best split axis for one median-cut cluster: `(weighted score, dim)`
+/// with the same tie-breaking as the round-5 flat scan — ascending dim
+/// order, strict `>`, Y-dims weighted by `w`, U/V unweighted. Returns
+/// `(0, 0)` for clusters that can never be split (fewer than 2 members
+/// or zero extent along every dim), which the caller's strict-`>`
+/// selection skips exactly like the flat scan did. Extents for all
+/// dims come from a single member sweep (min/max is order-free).
+fn cluster_split_score(c: &[CodebookEntry], dims: usize, w: i32) -> (i32, usize) {
+    if c.len() < 2 {
+        return (0, 0);
+    }
+    let mut lo = [i32::MAX; 6];
+    let mut hi = [i32::MIN; 6];
+    for e in c {
+        for (d, (l, h)) in lo.iter_mut().zip(hi.iter_mut()).enumerate().take(dims) {
+            let val = dim_value(e, d);
+            *l = (*l).min(val);
+            *h = (*h).max(val);
+        }
+    }
+    let mut best_score: i32 = 0;
+    let mut best_dim = 0usize;
+    for d in 0..dims {
+        let ext = hi[d] - lo[d];
+        let weighted = if d < 4 { ext.saturating_mul(w) } else { ext };
+        if weighted > best_score {
+            best_score = weighted;
+            best_dim = d;
+        }
+    }
+    (best_score, best_dim)
 }
 
 fn dim_value(e: &CodebookEntry, d: usize) -> i32 {
@@ -5714,17 +5758,6 @@ fn dim_value(e: &CodebookEntry, d: usize) -> i32 {
         5 => i32::from(e.v),
         _ => 0,
     }
-}
-
-fn extent(c: &[CodebookEntry], d: usize) -> (i32, i32) {
-    let mut lo = i32::MAX;
-    let mut hi = i32::MIN;
-    for e in c {
-        let v = dim_value(e, d);
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
-    (lo, hi)
 }
 
 fn centroid(c: &[CodebookEntry], mode: PixelMode) -> CodebookEntry {

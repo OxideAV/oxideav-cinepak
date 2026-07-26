@@ -55,6 +55,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   seeded/cold-start paths, not the intra hot loop). Wire bytes
   identical on all 15 golden-pin scenarios.
 
+- Round 430 (step 3, optimization 4 — median-cut split-selection cache,
+  output-invariant): `median_cut` rescanned every cluster along every
+  dimension on every bisection even though a split changes exactly two
+  clusters. Each cluster's best `(weighted score, dim)` is now cached
+  (new `cluster_split_score`, one all-dims member sweep replacing the
+  per-dim `extent` sweeps; the now-unused `extent` helper is removed)
+  and recomputed only for the two split products. Tie-breaking is
+  preserved exactly (ascending dim / ascending cluster index, strict
+  `>`), so the split sequence is identical. Largest single win of the
+  round — measured (same protocol, on top of optimization 3):
+  rgb24/64x64/round7 25.89→21.02 ms (−18.8%), rgb24/320x240
+  20.02→18.38 ms (−8.2%), rgb24/640x480/q70 132.15→117.26 ms (−11.3%),
+  gray8/320x240 10.79→9.77 ms (−9.4%), stateful GOP 49.91→48.21 ms/seq;
+  median-cut-only base drops 2.65→1.95 ms (320x240) and 9.82→7.28 ms
+  (640x480). Wire bytes identical on all 15 golden-pin scenarios.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

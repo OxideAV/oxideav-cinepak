@@ -71,6 +71,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   median-cut-only base drops 2.65→1.95 ms (320x240) and 9.82→7.28 ms
   (640x480). Wire bytes identical on all 15 golden-pin scenarios.
 
+- Round 430 (step 3, optimization 5 — k-means++ D²-seeding pass,
+  output-invariant): the per-centroid D² update loop (the k-means++
+  cost centre, O(vectors×K) distances total) now computes each
+  distance in `i32` with the centroid components and mode branch
+  hoisted out of the loop, and refreshes Σd² inside the same pass
+  (vector order, `saturating_add` over the identical post-min values
+  the separate re-scan summed) instead of re-walking `d2` at the top
+  of every selection step. Measured: k-means++ marginal
+  rgb24/320x240 4.95→4.26 ms (−14%), rgb24/640x480/q70 21.14→19.28 ms
+  (−8.8%); whole-call medians move within jitter (the marginal is a
+  minority share of the k-means++ row, which bundles its Lloyd
+  polish). Wire bytes identical on all 15 golden-pin scenarios.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

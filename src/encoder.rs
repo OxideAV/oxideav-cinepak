@@ -5113,22 +5113,31 @@ fn kmeans_pp_init_cold(
     }
 
     // `d2[i]` = min squared luma-weighted distance from `vectors[i]`
-    // to any centroid chosen so far. We use the existing
-    // `entry_distance` helper (already squared in `Yuv12` mode and L2
-    // in `Gray8`). Maintain incrementally: when a new centroid `c`
-    // joins the set, update each `d2[i]` to `min(d2[i], d(vectors[i],
-    // c))`.
-    let mut d2: Vec<i64> = vectors
-        .iter()
-        .map(|v| entry_distance(v, &cb.entries[0], mode, luma_weight))
-        .collect();
+    // to any centroid chosen so far. Same metric as `entry_distance`
+    // (already squared in `Yuv12` mode and L2 in `Gray8`). Maintain
+    // incrementally: when a new centroid `c` joins the set, update
+    // each `d2[i]` to `min(d2[i], d(vectors[i], c))`.
+    //
+    // Round 430 (output-invariant): the per-centroid distance pass is
+    // the k-means++ cost centre (O(vectors) `entry_distance` calls per
+    // chosen centroid, O(vectors x K) total). It now computes each
+    // distance in `i32` (identical exact value — see `nearest` for the
+    // 66,455,550 worst-case bound) with the centroid components and
+    // mode branch hoisted out of the loop, and folds the Σd² refresh
+    // into the same pass (vector-index order, `saturating_add`, over
+    // the same post-min values the separate re-scan summed — identical
+    // sequence of adds, so an identical `sum`).
+    let mut d2: Vec<i64> = Vec::with_capacity(vectors.len());
+    let mut sum: i64 = 0;
+    for v in vectors {
+        let d = entry_distance(v, &cb.entries[0], mode, luma_weight);
+        d2.push(d);
+        sum = sum.saturating_add(d);
+    }
 
     while chosen < n {
-        // Step 2: cumulative distribution of D².
-        let mut sum: i64 = 0;
-        for &d in &d2 {
-            sum = sum.saturating_add(d);
-        }
+        // Step 2: cumulative distribution of D² (kept incrementally by
+        // the update pass below; the initial fill above seeds it).
         if sum <= 0 {
             // All remaining vectors are already exact-match to some
             // chosen centroid. Fill remaining slots with the first
@@ -5151,12 +5160,35 @@ fn kmeans_pp_init_cold(
             }
         }
         cb.entries[chosen] = vectors[pick_idx];
-        // Update d² incrementally against the new centroid.
-        for (i, v) in vectors.iter().enumerate() {
-            let d = entry_distance(v, &cb.entries[chosen], mode, luma_weight);
-            if d < d2[i] {
-                d2[i] = d;
+        // Update d² incrementally against the new centroid, refreshing
+        // Σd² in the same pass. i32 arithmetic with hoisted centroid
+        // components; values are exactly those of `entry_distance`.
+        let c = cb.entries[chosen];
+        let cy0 = i32::from(c.y0);
+        let cy1 = i32::from(c.y1);
+        let cy2 = i32::from(c.y2);
+        let cy3 = i32::from(c.y3);
+        let cu = i32::from(c.u);
+        let cv = i32::from(c.v);
+        let w = i32::from(luma_weight.max(1));
+        let chroma = matches!(mode, PixelMode::Yuv12);
+        sum = 0;
+        for (slot, v) in d2.iter_mut().zip(vectors.iter()) {
+            let dy0 = cy0 - i32::from(v.y0);
+            let dy1 = cy1 - i32::from(v.y1);
+            let dy2 = cy2 - i32::from(v.y2);
+            let dy3 = cy3 - i32::from(v.y3);
+            let mut d = w * (dy0 * dy0 + dy1 * dy1 + dy2 * dy2 + dy3 * dy3);
+            if chroma {
+                let du = cu - i32::from(v.u);
+                let dv = cv - i32::from(v.v);
+                d += du * du + dv * dv;
             }
+            let d = i64::from(d);
+            if d < *slot {
+                *slot = d;
+            }
+            sum = sum.saturating_add(*slot);
         }
         chosen += 1;
     }

@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 430 (encoder-performance depth round, step 1 — golden pins):
+  new `tests/golden_wire_hashes.rs` pinning FNV-1a-64 wire-byte
+  digests for a 15-scenario encode matrix (intra default / legacy
+  training-minimal / 3-strip vintage / 256-entry / 8-entry / gray8;
+  round-6/7/8 picker tiers; RGB, vintage 3-strip, stale-slot-reclaim
+  and gray8 stateful GOPs; byte-budget rate control with and without
+  carry-over cap). Every pinned stream is also asserted fully clean
+  (zero findings, warnings included) under the 42-rule conformance
+  linter. All option vectors are built field-explicitly — no
+  `from_quality`, keeping `f32::powf` out of the pinned paths — so
+  digests are bit-stable across platforms and opt levels (verified
+  identical debug vs release). These pins gate the round's
+  output-invariant hot-path optimizations.
+
 - Round 383 milestone 7 (conformance lint — command-line driver):
   new `examples/lint_cvid.rs`, a standalone lint tool for raw Cinepak
   bytes (pre-extracted from AVI / QuickTime / Sega FILM samples —

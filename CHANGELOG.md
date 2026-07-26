@@ -23,6 +23,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scenarios; selected slot, returned error and tie-breaking (first
   minimum wins) are provably unchanged.
 
+- Round 430 (step 3, optimization 2 — LBG pass restructure,
+  output-invariant): `lbg_refine_codebook` now runs **two** O(vectors×K)
+  nearest scans per pass instead of three — the per-slot SSE the
+  round-4 form recomputed via `entry_distance` is exactly the distance
+  `nearest` already returned (accumulated in the same per-slot order),
+  and the post-recentroid verify scan now records the assignment state
+  a kept pass needs to open the next iteration, eliminating the opening
+  scan of every pass after the first. Cluster-membership `Vec<Vec<_>>`
+  churn (two tables per pass) is replaced by flat per-slot
+  sums/counts/SSE buffers allocated once, with the splitter extent
+  taken in a single order-free min/max sweep. Measured (same protocol):
+  LBG marginal on rgb24/320x240 15.09→9.83 ms, on rgb24/640x480/q70
+  63.39→42.53 ms; whole-call medians rgb24/64x64/round7 27.63→26.80 ms,
+  rgb24/320x240 21.29→19.75 ms, rgb24/640x480/q70 143.93→132.38 ms,
+  gray8/320x240 11.47→10.91 ms. Wire bytes identical on all 15
+  golden-pin scenarios.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

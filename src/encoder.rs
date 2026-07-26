@@ -5332,41 +5332,73 @@ fn lbg_refine_codebook(
     if max_passes == 0 || n <= 1 || vectors.is_empty() {
         return;
     }
+    let n = n.min(256);
     let dims = match mode {
         PixelMode::Yuv12 => 6,
         PixelMode::Gray8 => 4,
     };
+    // Round 430 (output-invariant restructure): the round-4 form ran
+    // THREE full O(vectors x K) nearest scans per pass (assign,
+    // post-perturb rebalance, post-recentroid verify) plus an O(vectors)
+    // per-slot SSE recompute, and materialised two `Vec<Vec<_>>` cluster
+    // tables per pass. Three observations make most of that redundant,
+    // changing no observable value:
+    //
+    // 1. `nearest` already returns the distance to the assigned slot's
+    //    CURRENT centroid — exactly the quantity the per-slot SSE loop
+    //    recomputed via `entry_distance` — so per-slot SSE accumulates
+    //    for free inside the assignment scan (same values, same
+    //    per-slot saturating-add order: vector order filtered by slot,
+    //    identical to cluster push order).
+    // 2. After a kept pass, the next pass's opening assignment scan
+    //    against the updated `cb` is bit-identical to the verify scan
+    //    that just ran against `next_cb` (same codebook, same vectors,
+    //    same deterministic `nearest`) — so the verify scan records
+    //    assignments/counts/per-slot SSE and carries them forward,
+    //    eliminating the opening scan of every pass after the first.
+    // 3. Cluster membership lists were only consumed by `centroid` (a
+    //    sum + divide, computable from flat per-slot sums), by
+    //    population counts, and by the splitter `extent` (a min/max,
+    //    order-free over the members) — none needs the members
+    //    materialised.
+    //
+    // Net: 2 nearest scans per pass instead of 3, no per-pass Vec
+    // churn. Wire output pinned by `tests/golden_wire_hashes.rs`.
+    //
+    // Assignment state for the CURRENT `cb` (carried across passes).
+    let mut assign: Vec<u8> = vec![0; vectors.len()];
+    let mut counts: Vec<u32> = vec![0; n];
+    let mut per_slot_sse: Vec<i64> = vec![0; n];
+    let mut total_sse_before = lbg_assign_scan(
+        cb,
+        vectors,
+        n,
+        mode,
+        luma_weight,
+        &mut assign,
+        &mut counts,
+        &mut per_slot_sse,
+    );
+    // Trial-side scratch, allocated once.
+    let mut sums: Vec<[i64; 6]> = vec![[0i64; 6]; n];
+    let mut trial_counts: Vec<u32> = vec![0; n];
+    let mut assign_trial: Vec<u8> = vec![0; vectors.len()];
+    let mut counts_trial: Vec<u32> = vec![0; n];
+    let mut per_slot_sse_trial: Vec<i64> = vec![0; n];
+
     for _pass in 0..max_passes {
-        // Assign every vector to its nearest current slot; collect both
-        // total SSE and per-slot population + per-slot SSE.
-        let mut clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
-        let mut total_sse_before: i64 = 0;
-        for v in vectors {
-            let (slot, err) = nearest(v, cb, n, mode, luma_weight);
-            clusters[slot as usize].push(*v);
-            total_sse_before = total_sse_before.saturating_add(err);
-        }
-        // Compute per-slot SSE for splitter selection. Per-slot SSE is
-        // recomputed against the slot's CURRENT centroid (not a refreshed
-        // mean of its members) so we measure the slot's actual coding
-        // distortion as the encoder will see it on this iteration.
-        let mut per_slot_sse: Vec<i64> = vec![0; n];
-        for (i, c) in clusters.iter().enumerate().take(n) {
-            let centre = cb.entries[i];
-            for v in c {
-                per_slot_sse[i] =
-                    per_slot_sse[i].saturating_add(entry_distance(v, &centre, mode, luma_weight));
-            }
-        }
         // Pick the highest-SSE slot with ≥ 2 members ("splitter") and
         // the lowest-population slot ("donor"). Donor must be DIFFERENT
         // from splitter, and donor's SSE must be strictly less than
         // splitter's SSE (otherwise the swap would never lower total
-        // distortion).
+        // distortion). Per-slot SSE is measured against the slot's
+        // CURRENT centroid (not a refreshed mean of its members) so we
+        // measure the slot's actual coding distortion as the encoder
+        // will see it on this iteration.
         let mut splitter: Option<usize> = None;
         let mut splitter_sse: i64 = -1;
         for i in 0..n {
-            if clusters[i].len() >= 2 && per_slot_sse[i] > splitter_sse {
+            if counts[i] >= 2 && per_slot_sse[i] > splitter_sse {
                 splitter_sse = per_slot_sse[i];
                 splitter = Some(i);
             }
@@ -5375,13 +5407,13 @@ fn lbg_refine_codebook(
             break;
         };
         let mut donor: Option<usize> = None;
-        let mut donor_pop: usize = usize::MAX;
+        let mut donor_pop: u32 = u32::MAX;
         let mut donor_sse: i64 = i64::MAX;
         for i in 0..n {
             if i == splitter_idx {
                 continue;
             }
-            let pop = clusters[i].len();
+            let pop = counts[i];
             // Prefer the smallest-population slot; tiebreak on smallest
             // per-slot SSE (least useful slot to keep).
             if pop < donor_pop || (pop == donor_pop && per_slot_sse[i] < donor_sse) {
@@ -5402,12 +5434,25 @@ fn lbg_refine_codebook(
         // Find the splitter cluster's widest dimension; perturbation
         // direction is ±1 along that dim. Magnitude 1 keeps the
         // perturbation small so subsequent Lloyd re-centroids quickly
-        // resolve the two new clusters.
+        // resolve the two new clusters. All-dims min/max in one sweep
+        // over the splitter's members (min/max is order-free, so this
+        // equals the per-dim `extent` calls of the round-4 form).
+        let mut lo = [i32::MAX; 6];
+        let mut hi = [i32::MIN; 6];
+        for (vi, v) in vectors.iter().enumerate() {
+            if assign[vi] as usize != splitter_idx {
+                continue;
+            }
+            for (d, (l, h)) in lo.iter_mut().zip(hi.iter_mut()).enumerate().take(dims) {
+                let val = dim_value(v, d);
+                *l = (*l).min(val);
+                *h = (*h).max(val);
+            }
+        }
         let mut wide_dim = 0usize;
         let mut wide_ext: i32 = -1;
         for d in 0..dims {
-            let (lo, hi) = extent(&clusters[splitter_idx], d);
-            let ext = hi - lo;
+            let ext = hi[d] - lo[d];
             if ext > wide_ext {
                 wide_ext = ext;
                 wide_dim = d;
@@ -5435,31 +5480,66 @@ fn lbg_refine_codebook(
         cb.entries[splitter_idx] = new_splitter;
         cb.entries[donor_idx] = new_donor;
         // One Lloyd pass to rebalance assignments + recentroid every
-        // slot using the new pair.
-        let mut new_clusters: Vec<Vec<CodebookEntry>> = vec![Vec::new(); n];
-        let mut total_sse_after: i64 = 0;
+        // slot using the new pair: accumulate flat per-slot sums +
+        // counts (i64 addition is exact and commutative, so slot-order
+        // vs vector-order accumulation is identical to the round-4
+        // `centroid(members)` call).
+        for s in sums.iter_mut() {
+            *s = [0i64; 6];
+        }
+        trial_counts.fill(0);
         for v in vectors {
-            let (slot, err) = nearest(v, cb, n, mode, luma_weight);
-            new_clusters[slot as usize].push(*v);
-            total_sse_after = total_sse_after.saturating_add(err);
+            let (slot, _err) = nearest(v, cb, n, mode, luma_weight);
+            let s = &mut sums[slot as usize];
+            s[0] += i64::from(v.y0);
+            s[1] += i64::from(v.y1);
+            s[2] += i64::from(v.y2);
+            s[3] += i64::from(v.y3);
+            s[4] += i64::from(v.u);
+            s[5] += i64::from(v.v);
+            trial_counts[slot as usize] += 1;
         }
         let mut next_cb = cb.clone();
-        for (i, c) in new_clusters.iter().enumerate().take(n) {
-            if !c.is_empty() {
-                next_cb.entries[i] = centroid(c, mode);
+        for i in 0..n {
+            if trial_counts[i] == 0 {
+                // Keep prior value (unreferenced slot, no harm).
+                continue;
             }
-            // else: keep prior value (unreferenced slot, no harm).
+            let div = i64::from(trial_counts[i]);
+            let (u, v) = match mode {
+                PixelMode::Yuv12 => ((sums[i][4] / div) as i8, (sums[i][5] / div) as i8),
+                PixelMode::Gray8 => (0, 0),
+            };
+            next_cb.entries[i] = CodebookEntry {
+                y0: (sums[i][0] / div) as u8,
+                y1: (sums[i][1] / div) as u8,
+                y2: (sums[i][2] / div) as u8,
+                y3: (sums[i][3] / div) as u8,
+                u,
+                v,
+            };
         }
         // Recompute total SSE against the recentroided codebook — this
         // is the SSE the encoder will actually see when it picks
-        // nearest-neighbours for MB classification.
-        let mut total_sse_final: i64 = 0;
-        for v in vectors {
-            let (_slot, err) = nearest(v, &next_cb, n, mode, luma_weight);
-            total_sse_final = total_sse_final.saturating_add(err);
-        }
+        // nearest-neighbours for MB classification. The same scan also
+        // records the assignment state so a kept pass starts the next
+        // iteration without re-scanning.
+        let total_sse_final = lbg_assign_scan(
+            &next_cb,
+            vectors,
+            n,
+            mode,
+            luma_weight,
+            &mut assign_trial,
+            &mut counts_trial,
+            &mut per_slot_sse_trial,
+        );
         if total_sse_final < total_sse_before {
             *cb = next_cb;
+            std::mem::swap(&mut assign, &mut assign_trial);
+            std::mem::swap(&mut counts, &mut counts_trial);
+            std::mem::swap(&mut per_slot_sse, &mut per_slot_sse_trial);
+            total_sse_before = total_sse_final;
             // Continue to next pass.
         } else {
             // Revert and stop: no further passes can help.
@@ -5468,6 +5548,35 @@ fn lbg_refine_codebook(
             break;
         }
     }
+}
+
+/// One full assignment scan for [`lbg_refine_codebook`]: assigns every
+/// vector to its nearest slot of `cb`, records the per-vector slot plus
+/// per-slot population and per-slot SSE, and returns the total SSE.
+/// The accumulation order (vector order, saturating adds) matches the
+/// round-4 cluster-membership form exactly.
+#[allow(clippy::too_many_arguments)]
+fn lbg_assign_scan(
+    cb: &Codebook,
+    vectors: &[CodebookEntry],
+    n: usize,
+    mode: PixelMode,
+    luma_weight: u8,
+    assign: &mut [u8],
+    counts: &mut [u32],
+    per_slot_sse: &mut [i64],
+) -> i64 {
+    counts.fill(0);
+    per_slot_sse.fill(0);
+    let mut total: i64 = 0;
+    for (vi, v) in vectors.iter().enumerate() {
+        let (slot, err) = nearest(v, cb, n, mode, luma_weight);
+        assign[vi] = slot;
+        counts[slot as usize] += 1;
+        per_slot_sse[slot as usize] = per_slot_sse[slot as usize].saturating_add(err);
+        total = total.saturating_add(err);
+    }
+    total
 }
 
 /// Helper for [`lbg_refine_codebook`]: nudge a codebook entry by `±delta`

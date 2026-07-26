@@ -265,7 +265,12 @@ at ~3–4 GiB/s of raw output; stateless intra encode is dominated by the
 codebook trainer and RD-grid picker. A standalone profiling driver
 (`examples/profile_cinepak.rs`, baseline under `profile/README.md`)
 supports `samply` / `cargo flamegraph` capture and a per-phase encoder
-decomposition; LBG split-refinement is the encoder hot path.
+decomposition; LBG split-refinement is the encoder hot path. Round 430
+restructured the training hot paths output-invariantly (byte-identical
+wire output, pinned by `tests/golden_wire_hashes.rs`) for a −23%..−31%
+whole-call encode-time cut across the fixture set (e.g. 320×240 intra
+9.1→12.2 MiB/s, 5-frame stateful GOP 16.6→22.9 MiB/s); see
+`profile/README.md` for the per-optimization ledger.
 
 ## Fuzzing
 

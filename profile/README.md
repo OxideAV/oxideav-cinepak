@@ -283,6 +283,92 @@ rgb24/640x480/q70/baseline
   the small fixture's per-call fixed cost dominates, so the phase
   *ratios* are clearer on the 320×240 / 640×480 rows.
 
+## Round 430 — encoder hot-path optimization round (output-invariant)
+
+Round 430 is the encoder's first dedicated *optimization* round: the
+r160/r209/r289 baselines above measured; r430 spends them. Ground
+rules: every change is **output-invariant** — the 15-scenario golden
+wire-hash matrix in `tests/golden_wire_hashes.rs` (landed first, in the
+same round) must stay byte-identical, and the 42-rule conformance
+linter must stay zero-findings on every pinned stream. No wire-format
+change, no option-default change, no quality change of any kind — the
+round buys wall-time only.
+
+Five optimizations landed, one measured commit each:
+
+1. **`nearest` scan restructure** — i32 accumulation, mode-split
+   loops, partial-distance early exit gated to `n >= 64` colour scans
+   (the exit's data-dependent branch measured +20% on K~45 and gray8
+   scans, −3% at K~91 — so it is compiled only where it wins).
+   −8.3%..−13.4% whole-call.
+2. **LBG pass restructure** — 2 full O(vectors×K) scans per pass
+   instead of 3 (the per-slot SSE recompute duplicated what `nearest`
+   already returned; the verify scan now carries assignment state into
+   the next pass), flat accumulators instead of per-pass
+   `Vec<Vec<CodebookEntry>>`. LBG marginal 15.09→9.83 ms (320×240),
+   63.39→42.53 ms (640×480).
+3. **Lloyd-loop de-churn** — flat per-slot sums/counts + in-place
+   centroid update in the seeded (inter/warm-start) and k-means++
+   Lloyd loops. Stateful GOP −3.6%.
+4. **Median-cut split-selection cache** — per-cluster best
+   `(weighted score, dim)` cached and recomputed only for the two
+   clusters a split produces; single all-dims extent sweep. The
+   biggest single win: −8.2%..−18.8% whole-call on top of the above.
+5. **k-means++ D²-seeding pass** — i32 distances with hoisted centroid
+   components, Σd² fused into the update pass. Seeding marginal −14%
+   (320×240) / −8.8% (640×480).
+
+### Round-430 cumulative effect (Apple M4 Max, release, samples=5 medians)
+
+```
+                                   r430 start      r430 end
+encode  rgb24/64x64/q50/round7      30.132 ms      20.907 ms   (-30.6%)
+encode  rgb24/320x240/q50/baseline  24.183 ms      18.031 ms   (-25.4%,  9.09 -> 12.19 MiB/s)
+encode  rgb24/640x480/q70/baseline 166.243 ms     117.714 ms   (-29.2%,  5.29 ->  7.47 MiB/s)
+encode  gray8/320x240/q50/baseline  12.720 ms       9.726 ms   (-23.5%,  5.76 ->  7.53 MiB/s)
+stateful 5-frame GOP 320x240 q50    66.354 ms      47.978 ms   (-27.7%, 16.56 -> 22.90 MiB/s)
+```
+
+The criterion mirror (`benches/encode.rs`, groups
+`encode_training_phases_320x240` + `encode_rgb24_640x480_strips3`,
+baseline `r430pre` captured before the first optimization) agrees:
+−26.8%..−41.2% per row, the largest on `plus_lbg8` (−41.2%) where
+optimizations 1+2 compose.
+
+Picker rows for continuity with the r209 table: round-7 320×240
+564.7→430.5 ms, round-8 640×480 15,709.6→9,771.3 ms (−37.8%) — the
+picker tiers inherit the single-pass gains multiplicatively, as
+expected.
+
+### Decode re-verification (r430)
+
+Decode was untouched this round; re-measured on the same tree to
+confirm the r160 anchor still holds:
+
+```
+decode  rgb24/64x64/q50/round7      median= 0.003 ms/iter  3447.96 MiB/s  (jitter 3.3%)
+decode  rgb24/320x240/q50/baseline  median= 0.060 ms/iter  3633.84 MiB/s  (jitter 1.6%)
+decode  rgb24/640x480/q70/baseline  median= 0.200 ms/iter  4390.24 MiB/s  (jitter 1.6%)
+decode  gray8/320x240/q50/baseline  median= 0.023 ms/iter  3187.74 MiB/s  (jitter 0.9%)
+```
+
+3.2–4.4 GiB/s of raw output — within the ≤3% decode jitter band of
+the r160/r209 numbers, i.e. no regression and no accidental
+improvement claim.
+
+### Post-round hotspot ranking (samply 1997 Hz, encode mode, self time)
+
+After the five optimizations the encode profile self-time splits
+roughly evenly across the three remaining pillars:
+`median_cut_seeded` 33.5% (dominated by the inlined k-means++
+selection + Lloyd polish on cold strips), `lbg_refine_codebook` 31.9%,
+`nearest` 27.4% (as called from MB classification + PCL), with the
+median-cut sort at ~3.5% and everything else ≤0.5%. Further gains
+now require either SIMD on the `nearest` inner loop or
+algorithmic/quality trade-offs (early-stop heuristics, pass caps) that
+are *not* output-invariant and therefore out of scope for a round of
+this shape.
+
 ## Reproducing
 
 ```bash

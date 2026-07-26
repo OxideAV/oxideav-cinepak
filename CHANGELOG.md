@@ -84,6 +84,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   minority share of the k-means++ row, which bundles its Lloyd
   polish). Wire bytes identical on all 15 golden-pin scenarios.
 
+- Round 430 (step 4 — documentation): `profile/README.md` gains a
+  round-430 section with the per-optimization ledger, the cumulative
+  before/after table (encode −23.5%..−30.6% across the fixture set;
+  stateful GOP 66.35→47.98 ms/seq), the criterion `r430pre` baseline
+  comparison (−26.8%..−41.2% on the training-phase rows), a decode
+  re-verification (3.2–4.4 GiB/s, within the r160/r209 jitter band —
+  decode untouched), and the post-round samply hotspot ranking. The
+  crate README benchmark blurb is updated to match.
+
 ### Added
 
 - Round 430 (encoder-performance depth round, step 1 — golden pins):

@@ -21,12 +21,12 @@
 //! example writes mismatched bytes to disk.
 
 use oxideav_cinepak::codebook::{
-    apply_codebook_chunk, apply_codebook_chunk_with, encode_full_chunk, encode_header_only_chunk,
-    encode_selective_chunk, Codebook, CodebookChunkKind, CodebookEntry, UpdateStyle,
+    Codebook, CodebookChunkKind, CodebookEntry, UpdateStyle, apply_codebook_chunk,
+    apply_codebook_chunk_with, encode_full_chunk, encode_header_only_chunk, encode_selective_chunk,
 };
 use oxideav_cinepak::vector::{
-    decode_vector_chunk, encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload,
-    Mb, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY,
+    Mb, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY, decode_vector_chunk,
+    encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload,
 };
 use oxideav_cinepak::{CinepakDecoder, DeviantConfig};
 

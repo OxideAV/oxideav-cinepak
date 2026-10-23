@@ -46,7 +46,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_cinepak::codebook::{
-    apply_codebook_chunk, apply_codebook_chunk_with, Codebook, CodebookChunkKind,
+    Codebook, CodebookChunkKind, apply_codebook_chunk, apply_codebook_chunk_with,
 };
 
 /// Defence-in-depth raw-input cap; mirrors the sibling targets.

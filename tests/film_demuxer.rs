@@ -5,7 +5,7 @@
 //! with [`FilmDemuxer`], extract the codec sample bytes, and decode
 //! them with [`CinepakDecoder`].
 
-use oxideav_cinepak::{encode_rgb24, probe_film, CinepakDecoder, EncoderOptions, FilmDemuxer};
+use oxideav_cinepak::{CinepakDecoder, EncoderOptions, FilmDemuxer, encode_rgb24, probe_film};
 
 /// Build a minimal 1-sample FILM container that wraps the supplied
 /// Cinepak frame bytes. Layout matches `docs/video/cinepak/spec/05`
@@ -37,7 +37,7 @@ fn wrap_in_film(frame_bytes: &[u8], width: u32, height: u32) -> Vec<u8> {
     out.extend_from_slice(&32u32.to_be_bytes()); // chunk_length (16 + 1 record)
     out.extend_from_slice(&10u32.to_be_bytes()); // base_frequency
     out.extend_from_slice(&1u32.to_be_bytes()); // num_entries
-                                                // Record: keyframe at offset 0.
+    // Record: keyframe at offset 0.
     out.extend_from_slice(&0u32.to_be_bytes());
     out.extend_from_slice(&sample_length.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // key, ts=0

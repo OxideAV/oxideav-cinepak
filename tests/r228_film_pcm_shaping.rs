@@ -8,9 +8,8 @@
 //! wiki/Sega_FILM.wiki` lines 147–169.
 
 use oxideav_cinepak::{
-    pcm_decode_16be_to_i16, pcm_decode_8bit, pcm_deinterleave_stereo_16be,
-    pcm_deinterleave_stereo_8bit, pcm_sign_magnitude_to_i8, FilmAudioFormat, PcmEndianness,
-    PcmSignConvention,
+    FilmAudioFormat, PcmEndianness, PcmSignConvention, pcm_decode_8bit, pcm_decode_16be_to_i16,
+    pcm_deinterleave_stereo_8bit, pcm_deinterleave_stereo_16be, pcm_sign_magnitude_to_i8,
 };
 
 // ---- pcm_sign_magnitude_to_i8 --------------------------------------

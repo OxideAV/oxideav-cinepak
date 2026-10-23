@@ -485,7 +485,7 @@ pub fn pcm_decode_8bit(src: &[u8], convention: PcmSignConvention, dst: &mut [i8]
 /// conversion. A `convention` argument is intentionally absent — the
 /// wiki does not document a 16-bit sign/magnitude FILM variant.
 pub fn pcm_decode_16be_to_i16(src: &[u8], dst: &mut [i16]) -> Result<()> {
-    if src.len() % 2 != 0 {
+    if !src.len().is_multiple_of(2) {
         return Err(CinepakError::invalid(format!(
             "FILM PCM: 16-bit BE source length must be even, got {}",
             src.len(),
@@ -500,7 +500,7 @@ pub fn pcm_decode_16be_to_i16(src: &[u8], dst: &mut [i16]) -> Result<()> {
             dst.len(),
         )));
     }
-    for (i, pair) in src.chunks_exact(2).enumerate() {
+    for (i, pair) in src.as_chunks::<2>().0.iter().enumerate() {
         dst[i] = i16::from_be_bytes([pair[0], pair[1]]);
     }
     Ok(())
@@ -528,7 +528,7 @@ pub fn pcm_decode_16be_to_i16(src: &[u8], dst: &mut [i16]) -> Result<()> {
 /// [`pcm_decode_8bit`] first if a sign-magnitude→twos-complement step
 /// is also needed, then re-interleave the decoded `i8` slice.
 pub fn pcm_deinterleave_stereo_8bit(src: &[u8], dst: &mut [u8]) -> Result<()> {
-    if src.len() % 2 != 0 {
+    if !src.len().is_multiple_of(2) {
         return Err(CinepakError::invalid(format!(
             "FILM PCM: stereo 8-bit chunk length must be even, got {}",
             src.len(),
@@ -564,7 +564,7 @@ pub fn pcm_deinterleave_stereo_8bit(src: &[u8], dst: &mut [u8]) -> Result<()> {
 /// big-endian decode without re-interleave should use
 /// `pcm_decode_16be_to_i16` directly on the L and R halves.
 pub fn pcm_deinterleave_stereo_16be(src: &[u8], dst: &mut [i16]) -> Result<()> {
-    if src.len() % 4 != 0 {
+    if !src.len().is_multiple_of(4) {
         return Err(CinepakError::invalid(format!(
             "FILM PCM: stereo 16-bit BE chunk length must be a multiple of 4, got {}",
             src.len(),
@@ -637,7 +637,7 @@ impl FilmAudioFormat {
                 Some(tmp.into_iter().map(|s| s as i16).collect())
             }
             (8, 2) => {
-                if src.len() % 2 != 0 {
+                if !src.len().is_multiple_of(2) {
                     return None;
                 }
                 let mut decoded = vec![0i8; src.len()];
@@ -651,7 +651,7 @@ impl FilmAudioFormat {
                 Some(out)
             }
             (16, 1) => {
-                if src.len() % 2 != 0 {
+                if !src.len().is_multiple_of(2) {
                     return None;
                 }
                 let mut out = vec![0i16; src.len() / 2];
@@ -659,7 +659,7 @@ impl FilmAudioFormat {
                 Some(out)
             }
             (16, 2) => {
-                if src.len() % 4 != 0 {
+                if !src.len().is_multiple_of(4) {
                     return None;
                 }
                 let mut out = vec![0i16; src.len() / 2];
@@ -1031,7 +1031,7 @@ impl<'a> Samples<'a> {
     /// Returns `Err` iff `records.len() % SAMPLE_RECORD_SIZE != 0`
     /// (a STAB record table cannot have a partial row).
     pub fn new(records: &'a [u8]) -> Result<Self> {
-        if records.len() % SAMPLE_RECORD_SIZE != 0 {
+        if !records.len().is_multiple_of(SAMPLE_RECORD_SIZE) {
             return Err(CinepakError::invalid(format!(
                 "STAB sample-records slice length {} not a multiple of {SAMPLE_RECORD_SIZE}",
                 records.len()
@@ -1427,7 +1427,7 @@ mod tests {
         out.extend_from_slice(&80u32.to_be_bytes());
         out.extend_from_slice(b"1.09");
         out.extend_from_slice(&0u32.to_be_bytes()); // reserved
-                                                    // FDSC chunk (32 B).
+        // FDSC chunk (32 B).
         out.extend_from_slice(b"FDSC");
         out.extend_from_slice(&0x20u32.to_be_bytes()); // chunk_length
         out.extend_from_slice(b"cvid");
@@ -1439,12 +1439,12 @@ mod tests {
         out.push(0); // audio_compression
         out.extend_from_slice(&0u16.to_be_bytes()); // audio_sample_rate
         out.extend_from_slice(&[0u8; 6]); // reserved
-                                          // STAB chunk: signature + length + base_frequency + num_entries + 1 record.
+        // STAB chunk: signature + length + base_frequency + num_entries + 1 record.
         out.extend_from_slice(b"STAB");
         out.extend_from_slice(&32u32.to_be_bytes()); // chunk_length (16 + 16)
         out.extend_from_slice(&10u32.to_be_bytes()); // base_frequency
         out.extend_from_slice(&1u32.to_be_bytes()); // num_entries
-                                                    // Sample record: video keyframe, ts=0
+        // Sample record: video keyframe, ts=0
         out.extend_from_slice(&0u32.to_be_bytes()); // sample_offset
         out.extend_from_slice(&500u32.to_be_bytes()); // sample_length
         out.extend_from_slice(&0u32.to_be_bytes()); // sample_info_1 (key, ts=0)
@@ -1581,7 +1581,7 @@ mod tests {
         out.extend_from_slice(&100u32.to_be_bytes()); // length
         out.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // audio sentinel
         out.extend_from_slice(&1u32.to_be_bytes()); // sample_info_2
-                                                    // Patch header_length to include the extra record (was 80).
+        // Patch header_length to include the extra record (was 80).
         out[4..8].copy_from_slice(&96u32.to_be_bytes());
         // Patch STAB chunk_length too (not used for offsets but kept consistent).
         let stab_len_off = 16 + 32 + 4;

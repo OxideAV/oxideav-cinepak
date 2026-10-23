@@ -37,8 +37,8 @@
 //! ```
 
 use oxideav_cinepak::{
-    encode_gray8, encode_rgb24, encode_rgb24_round6, encode_rgb24_round7, encode_rgb24_round8,
-    lint_sequence, CinepakEncoder, EncoderOptions, LintOptions,
+    CinepakEncoder, EncoderOptions, LintOptions, encode_gray8, encode_rgb24, encode_rgb24_round6,
+    encode_rgb24_round7, encode_rgb24_round8, lint_sequence,
 };
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use oxideav_cinepak::{encode_rgb24, encode_rgb24_best_strips, CinepakDecoder, EncoderOptions};
+use oxideav_cinepak::{CinepakDecoder, EncoderOptions, encode_rgb24, encode_rgb24_best_strips};
 
 /// Synthesise a 320×240 smooth RGB24 gradient (the standard PSNR
 /// fixture from `tests/ffmpeg_psnr.rs`).
@@ -72,7 +72,7 @@ fn synth_64x64() -> Vec<u8> {
 /// `f64::INFINITY` on bit-identical Y.
 fn psnr_y(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
-    assert!(a.len() % 3 == 0);
+    assert!(a.len().is_multiple_of(3));
     let n = a.len() / 3;
     let mut sum_sq = 0.0f64;
     for i in 0..n {

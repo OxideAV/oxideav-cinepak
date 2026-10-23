@@ -25,7 +25,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_cinepak::{
-    encode_rgb24, encode_rgb24_inter, CinepakDecoder, CinepakEncoder, EncoderOptions,
+    CinepakDecoder, CinepakEncoder, EncoderOptions, encode_rgb24, encode_rgb24_inter,
 };
 
 const W: usize = 32;

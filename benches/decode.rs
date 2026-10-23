@@ -33,10 +33,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-cinepak --bench decode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_cinepak::{
-    encode_gray8, encode_rgb24, encode_rgb24_inter, CinepakDecoder, EncoderOptions,
+    CinepakDecoder, EncoderOptions, encode_gray8, encode_rgb24, encode_rgb24_inter,
 };
 
 /// Cheap deterministic xorshift32 — synthesises "natural-ish" per-pixel

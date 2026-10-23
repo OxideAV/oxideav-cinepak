@@ -40,7 +40,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use oxideav_cinepak::{encode_rgb24, encode_rgb24_best_strips, CinepakDecoder, EncoderOptions};
+use oxideav_cinepak::{CinepakDecoder, EncoderOptions, encode_rgb24, encode_rgb24_best_strips};
 
 fn synth_320x240() -> Vec<u8> {
     let w: usize = 320;
@@ -93,7 +93,7 @@ fn synth_noisy_64x64() -> Vec<u8> {
 /// BT.601 Y-channel mean PSNR between two RGB24 buffers.
 fn psnr_y(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
-    assert!(a.len() % 3 == 0);
+    assert!(a.len().is_multiple_of(3));
     let n = a.len() / 3;
     let mut sum_sq = 0.0f64;
     for i in 0..n {

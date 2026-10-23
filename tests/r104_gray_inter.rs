@@ -31,8 +31,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_cinepak::{
-    encode_gray8, encode_gray8_inter, CinepakDecoder, CinepakEncoder, CinepakPixelFormat,
-    EncoderOptions,
+    CinepakDecoder, CinepakEncoder, CinepakPixelFormat, EncoderOptions, encode_gray8,
+    encode_gray8_inter,
 };
 
 const W: usize = 32;

@@ -25,7 +25,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_cinepak::{
-    encode_rgb24, CinepakDecoder, CinepakEncoder, CinepakPixelFormat, EncoderOptions,
+    CinepakDecoder, CinepakEncoder, CinepakPixelFormat, EncoderOptions, encode_rgb24,
 };
 
 /// 32×32 RGB fixture: solid mid-gray. Used as both the intra and the

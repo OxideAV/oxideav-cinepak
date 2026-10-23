@@ -36,7 +36,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_cinepak::{
-    encode_gray8, encode_rgb24, encode_rgb24_inter, CinepakDecoder, EncoderOptions,
+    CinepakDecoder, EncoderOptions, encode_gray8, encode_rgb24, encode_rgb24_inter,
 };
 
 const MAX_INPUT_BYTES: usize = 16 * 1024;

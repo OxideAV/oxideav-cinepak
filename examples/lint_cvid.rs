@@ -25,7 +25,7 @@
 //! allowed), `1` when any frame carries an error-severity finding,
 //! `2` on usage/IO problems.
 
-use oxideav_cinepak::{lint_frame_with, LintOptions, LintReport};
+use oxideav_cinepak::{LintOptions, LintReport, lint_frame_with};
 
 fn usage() -> ! {
     eprintln!("usage: lint_cvid [--vintage] [--mid-stream] <file.cvid>");

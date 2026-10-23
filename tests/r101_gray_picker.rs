@@ -24,8 +24,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_cinepak::{
-    encode_gray8, encode_gray8_best_rd_grid, encode_gray8_round7, CinepakDecoder,
-    CinepakPixelFormat, EncoderOptions,
+    CinepakDecoder, CinepakPixelFormat, EncoderOptions, encode_gray8, encode_gray8_best_rd_grid,
+    encode_gray8_round7,
 };
 
 /// Smooth two-axis grayscale gradient (favours more strips so each

@@ -287,7 +287,7 @@ fn decodes_deviant_multi_strip_frame() {
         bytes.extend_from_slice(&0u16.to_be_bytes()); // x_top
         bytes.extend_from_slice(&y_bottom_raw.to_be_bytes()); // y_bottom or height
         bytes.extend_from_slice(&4u16.to_be_bytes()); // x_bottom
-                                                      // Empty V4.
+        // Empty V4.
         bytes.extend_from_slice(&[0x20, 0x00, 0x00, 0x04]);
         // V1 deviant (255 entries + 2 pad).
         bytes.extend_from_slice(&0x2200u16.to_be_bytes());
@@ -308,7 +308,7 @@ fn decodes_deviant_multi_strip_frame() {
         bytes[strip_hdr_pos + 2..strip_hdr_pos + 4].copy_from_slice(&strip_size.to_be_bytes());
     };
     emit_strip(0, 4, 60); // strip 0: y=0..4, y0=60
-                          // strip 1: y_top=0 sentinel → resolves to prev_y_bottom=4; y_bottom_raw=4 = height
+    // strip 1: y_top=0 sentinel → resolves to prev_y_bottom=4; y_bottom_raw=4 = height
     emit_strip(0, 4, 200);
 
     // Patch frame_length to (real_len - 8) per deviant convention.

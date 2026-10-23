@@ -77,18 +77,18 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::codebook::{
-    encode_full_chunk, encode_header_only_chunk, encode_selective_chunk, Codebook,
-    CodebookChunkKind, CodebookEntry, PixelMode, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
+    CHUNK_HEADER_SIZE, Codebook, CodebookChunkKind, CodebookEntry, PixelMode, UpdateStyle,
+    WhichCodebook, encode_full_chunk, encode_header_only_chunk, encode_selective_chunk,
 };
 use crate::error::{CinepakError, Result};
 use crate::header::{
-    FrameHeader, RawStripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER,
+    FRAME_HEADER_SIZE, FrameHeader, RawStripHeader, STRIP_HEADER_SIZE, STRIP_ID_INTER,
     STRIP_ID_INTRA,
 };
 use crate::image::{CinepakFrame, CinepakPixelFormat};
 use crate::vector::{
-    encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload, Mb,
-    VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY,
+    Mb, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY, encode_inter_payload,
+    encode_mixed_intra_payload, encode_v1_only_payload,
 };
 
 /// Encoder configuration.
@@ -1872,11 +1872,7 @@ impl CinepakEncoder {
     /// Otherwise the number of inter frames that have been emitted since
     /// the most recent keyframe.
     pub fn gop_position(&self) -> u32 {
-        if self.force_keyframe {
-            0
-        } else {
-            self.gop_pos
-        }
+        if self.force_keyframe { 0 } else { self.gop_pos }
     }
 
     /// Round 143: request a one-shot keyframe on the next
@@ -1993,7 +1989,7 @@ impl CinepakEncoder {
         };
         let intra = self.force_keyframe
             || self.gop_pos == 0
-            || (interval > 0 && self.gop_pos % interval == 0)
+            || (interval > 0 && self.gop_pos.is_multiple_of(interval))
             || self.prev_frame.is_none()
             || mode_mismatch;
 
@@ -4642,7 +4638,7 @@ fn assemble_frame(width: u32, height: u32, strips: &[Vec<u8>], flags: u8) -> Res
 // ---------------------------------------------------------------------------
 
 fn validate_dims(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err(CinepakError::other(format!(
             "encoder: dims must be > 0 and multiples of 4; got {width}x{height}"
         )));
@@ -4919,11 +4915,7 @@ fn mb_mse_against_prev(
             }
         }
     }
-    if n > 0.0 {
-        sum_sq / n
-    } else {
-        0.0
-    }
+    if n > 0.0 { sum_sq / n } else { 0.0 }
 }
 
 // ---------------------------------------------------------------------------

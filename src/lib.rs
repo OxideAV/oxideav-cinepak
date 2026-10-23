@@ -58,28 +58,29 @@ pub const CODEC_ID_STR: &str = "cinepak";
 
 // Standalone, framework-free re-exports.
 pub use codebook::{
-    expand_v4_chroma, expand_v4_luma, CodebookEntries, CodebookEntryRecord, StripChunkEntry,
-    StripChunkKind, StripChunks, VectorChunkKind,
+    CodebookEntries, CodebookEntryRecord, StripChunkEntry, StripChunkKind, StripChunks,
+    VectorChunkKind, expand_v4_chroma, expand_v4_luma,
 };
 pub use decoder::{CinepakDecoder, DeviantConfig};
 pub use encoder::{
-    encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter, encode_gray8_round7, encode_rgb24,
-    encode_rgb24_best_rd_grid, encode_rgb24_best_rd_grid_3axis, encode_rgb24_best_strips,
-    encode_rgb24_inter, encode_rgb24_per_strip_rd, encode_rgb24_round6, encode_rgb24_round7,
-    encode_rgb24_round8, CinepakEncoder, EncodedFrame, EncoderOptions, FrameStats,
-    RateControlledFrame, RateStats, TwoPassRateControl,
+    CinepakEncoder, EncodedFrame, EncoderOptions, FrameStats, RateControlledFrame, RateStats,
+    TwoPassRateControl, encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter,
+    encode_gray8_round7, encode_rgb24, encode_rgb24_best_rd_grid, encode_rgb24_best_rd_grid_3axis,
+    encode_rgb24_best_strips, encode_rgb24_inter, encode_rgb24_per_strip_rd, encode_rgb24_round6,
+    encode_rgb24_round7, encode_rgb24_round8,
 };
 pub use error::{CinepakError, Result};
 pub use film::{
-    pcm_decode_16be_to_i16, pcm_decode_8bit, pcm_deinterleave_stereo_16be,
-    pcm_deinterleave_stereo_8bit, pcm_sign_magnitude_to_i8, probe_film, CinepakVariant, Fdsc,
-    FilmAudioFormat, FilmDemuxer, FilmHeader, PcmEndianness, PcmSignConvention, SampleKind,
-    SampleRecord, SampleRecordEntry, Samples, StabHeader, SAMPLE_RECORD_SIZE, STAB_HEADER_SIZE,
+    CinepakVariant, Fdsc, FilmAudioFormat, FilmDemuxer, FilmHeader, PcmEndianness,
+    PcmSignConvention, SAMPLE_RECORD_SIZE, STAB_HEADER_SIZE, SampleKind, SampleRecord,
+    SampleRecordEntry, Samples, StabHeader, pcm_decode_8bit, pcm_decode_16be_to_i16,
+    pcm_deinterleave_stereo_8bit, pcm_deinterleave_stereo_16be, pcm_sign_magnitude_to_i8,
+    probe_film,
 };
 pub use image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
 pub use lint::{
-    lint_frame, lint_frame_with, lint_sequence, LintIssue, LintOptions, LintReport, LintRule,
-    LintSeverity,
+    LintIssue, LintOptions, LintReport, LintRule, LintSeverity, lint_frame, lint_frame_with,
+    lint_sequence,
 };
 pub use vector::{
     InterEntry, InterMacroblocks, InterMb, MixedIntraCoding, MixedIntraEntry,

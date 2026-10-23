@@ -8,6 +8,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95.
+
+### Changed
+
 - Round 430 (encoder-performance depth round, step 3 — nearest-neighbour
   scan restructure, output-invariant): the `nearest` inner loop shared
   by every codebook-training phase and per-MB classification now

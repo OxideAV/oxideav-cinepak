@@ -17,16 +17,16 @@
 //! 6. Grayscale (8-bit) single-strip intra.
 
 use oxideav_cinepak::codebook::{
-    encode_full_chunk, encode_header_only_chunk, Codebook, CodebookChunkKind, CodebookEntry,
-    PixelMode, UpdateStyle, WhichCodebook, CHUNK_HEADER_SIZE,
+    CHUNK_HEADER_SIZE, Codebook, CodebookChunkKind, CodebookEntry, PixelMode, UpdateStyle,
+    WhichCodebook, encode_full_chunk, encode_header_only_chunk,
 };
 use oxideav_cinepak::header::{
-    FrameHeader, RawStripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER,
+    FRAME_HEADER_SIZE, FrameHeader, RawStripHeader, STRIP_HEADER_SIZE, STRIP_ID_INTER,
     STRIP_ID_INTRA,
 };
 use oxideav_cinepak::vector::{
-    encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload, Mb,
-    VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY,
+    Mb, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY, encode_inter_payload,
+    encode_mixed_intra_payload, encode_v1_only_payload,
 };
 use oxideav_cinepak::{CinepakDecoder, CinepakPixelFormat};
 

@@ -347,7 +347,7 @@ fn apply_full(
     cb: &mut Codebook,
     tolerate_trailing: bool,
 ) -> Result<()> {
-    if payload.len() % entry_size != 0 && !tolerate_trailing {
+    if !payload.len().is_multiple_of(entry_size) && !tolerate_trailing {
         return Err(CinepakError::invalid(format!(
             "full-replace codebook payload size {} not a multiple of entry size {entry_size}",
             payload.len()
@@ -863,7 +863,7 @@ impl<'a> CodebookEntries<'a> {
     pub fn new(kind: CodebookChunkKind, payload: &'a [u8]) -> Result<Self> {
         if kind.style == UpdateStyle::Full {
             let entry_size = kind.mode.entry_size();
-            if payload.len() % entry_size != 0 {
+            if !payload.len().is_multiple_of(entry_size) {
                 return Err(CinepakError::invalid(format!(
                     "full-replace codebook payload size {} not a multiple of entry size {entry_size}",
                     payload.len()

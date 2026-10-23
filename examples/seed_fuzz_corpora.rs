@@ -37,11 +37,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_cinepak::codebook::{
-    encode_full_chunk, encode_header_only_chunk, encode_selective_chunk, Codebook,
-    CodebookChunkKind, CodebookEntry, UpdateStyle,
+    Codebook, CodebookChunkKind, CodebookEntry, UpdateStyle, encode_full_chunk,
+    encode_header_only_chunk, encode_selective_chunk,
 };
 use oxideav_cinepak::vector::{
-    encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload, Mb,
+    Mb, encode_inter_payload, encode_mixed_intra_payload, encode_v1_only_payload,
 };
 
 fn main() {

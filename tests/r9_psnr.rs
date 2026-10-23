@@ -53,7 +53,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use oxideav_cinepak::{encode_rgb24_round8, CinepakDecoder, EncoderOptions};
+use oxideav_cinepak::{CinepakDecoder, EncoderOptions, encode_rgb24_round8};
 
 fn psnr_y(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());

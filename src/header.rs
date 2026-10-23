@@ -58,7 +58,7 @@ impl FrameHeader {
                 "width/height must be > 0 (got {width}x{height})"
             )));
         }
-        if width % 4 != 0 || height % 4 != 0 {
+        if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             return Err(CinepakError::invalid(format!(
                 "width and height must be multiples of 4 (got {width}x{height})"
             )));

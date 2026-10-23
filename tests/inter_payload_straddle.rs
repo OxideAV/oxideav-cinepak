@@ -6,7 +6,7 @@
 //! tests; they caught a decoder bug where the deferred
 //! placeholder-mb's index bytes were being read in the wrong group.
 
-use oxideav_cinepak::vector::{decode_vector_chunk, encode_inter_payload, Mb, VECTOR_CHUNK_INTER};
+use oxideav_cinepak::vector::{Mb, VECTOR_CHUNK_INTER, decode_vector_chunk, encode_inter_payload};
 
 #[test]
 fn inter_payload_roundtrip_dense_v4_64mb() {

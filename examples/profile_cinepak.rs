@@ -80,8 +80,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use oxideav_cinepak::{
-    encode_gray8, encode_rgb24, encode_rgb24_round6, encode_rgb24_round7, encode_rgb24_round8,
-    CinepakDecoder, CinepakEncoder, EncoderOptions,
+    CinepakDecoder, CinepakEncoder, EncoderOptions, encode_gray8, encode_rgb24,
+    encode_rgb24_round6, encode_rgb24_round7, encode_rgb24_round8,
 };
 
 /// xorshift32 — same constant the bench harnesses use so the profile
@@ -412,13 +412,13 @@ fn profile_stateful(iters_override: Option<u32>) {
 const PICKER_TRIAL_COUNT_BASELINE: u32 = 1;
 const PICKER_TRIAL_COUNT_ROUND6: u32 = 9; // 3 strip × 3 lambda
 const PICKER_TRIAL_COUNT_ROUND7: u32 = 27; // 3 strip × 3 lambda × 3 luma_weight
-                                           // Round 8 runs the round-7 grid PLUS a per-strip greedy that, for
-                                           // each candidate strip count, sweeps the lambda × luma_weight grid
-                                           // independently per strip. On a 2-strip pick the per-strip greedy
-                                           // dominates: 9 (round-7 grid) + 2-strip × 2 strips × 9 (lambda×luma) =
-                                           // ≈ 45 trials. We surface the ceiling here; the per-scenario picker
-                                           // run prints the observed wall time which captures the actual
-                                           // dynamic trial count.
+// Round 8 runs the round-7 grid PLUS a per-strip greedy that, for
+// each candidate strip count, sweeps the lambda × luma_weight grid
+// independently per strip. On a 2-strip pick the per-strip greedy
+// dominates: 9 (round-7 grid) + 2-strip × 2 strips × 9 (lambda×luma) =
+// ≈ 45 trials. We surface the ceiling here; the per-scenario picker
+// run prints the observed wall time which captures the actual
+// dynamic trial count.
 const PICKER_TRIAL_COUNT_ROUND8_CEILING: u32 = 81;
 
 /// Round 209 picker-axis sweep: run each of the four public RGB

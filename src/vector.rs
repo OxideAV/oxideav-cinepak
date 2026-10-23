@@ -592,11 +592,11 @@ impl<'a> Iterator for MixedIntraMacroblocks<'a> {
         }
         // Refill the per-group classification buffer at every group
         // boundary.
-        if self.group_cursor >= self.group_kinds_len {
-            if let Err(e) = self.load_next_group() {
-                self.fused = true;
-                return Some(Err(e));
-            }
+        if self.group_cursor >= self.group_kinds_len
+            && let Err(e) = self.load_next_group()
+        {
+            self.fused = true;
+            return Some(Err(e));
         }
         let is_v4 = self.group_kinds[self.group_cursor as usize];
         self.group_cursor += 1;
@@ -1255,7 +1255,7 @@ pub fn encode_v1_only_payload(mbs: &[Mb], out: &mut Vec<u8>) -> Result<()> {
             _ => {
                 return Err(CinepakError::other(
                     "0x3200 encoder only accepts V1 macroblocks",
-                ))
+                ));
             }
         }
     }

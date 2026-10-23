@@ -33,12 +33,12 @@
 //! on arbitrary input.
 
 use crate::codebook::{
-    CodebookEntries, PixelMode, StripChunkKind, UpdateStyle, VectorChunkKind, WhichCodebook,
-    CHUNK_HEADER_SIZE,
+    CHUNK_HEADER_SIZE, CodebookEntries, PixelMode, StripChunkKind, UpdateStyle, VectorChunkKind,
+    WhichCodebook,
 };
 use crate::header::{
-    RawStripHeader, StripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER,
-    STRIP_ID_INTRA,
+    FRAME_HEADER_SIZE, RawStripHeader, STRIP_HEADER_SIZE, STRIP_ID_INTER, STRIP_ID_INTRA,
+    StripHeader,
 };
 
 /// How severe a lint finding is.
@@ -653,7 +653,7 @@ fn lint_strip_chunks(
                             occupancy_known = false;
                         } else {
                             let entry = kind.mode.entry_size();
-                            if body.len() % entry != 0 {
+                            if !body.len().is_multiple_of(entry) {
                                 occupancy_known = false;
                                 rep.push_chunk(
                                     LintRule::CodebookPayloadMisaligned,
@@ -835,12 +835,10 @@ fn lint_strip_chunks(
     // strip end so codebook chunks appearing after the vector chunk
     // (itself already flagged) still contribute their entries and
     // don't produce false index-range findings.
-    if occupancy_known {
-        if let (Some((v_idx, v_off, vk, body)), Some(mb)) = (vector_occ, mb_count) {
-            lint_vector_occupancy(
-                rep, strip, v_idx, vk, mb, body, v_off, v1_defined, v4_defined,
-            );
-        }
+    if occupancy_known && let (Some((v_idx, v_off, vk, body)), Some(mb)) = (vector_occ, mb_count) {
+        lint_vector_occupancy(
+            rep, strip, v_idx, vk, mb, body, v_off, v1_defined, v4_defined,
+        );
     }
 }
 
@@ -978,10 +976,11 @@ fn lint_vector_payload(
             let mut failed = false;
             let mut first_skip: Option<usize> = None;
             for entry in walker.by_ref() {
-                if let Ok(e) = &entry {
-                    if first_skip.is_none() && matches!(e.kind, crate::vector::InterMb::Skip) {
-                        first_skip = Some(e.index.into());
-                    }
+                if let Ok(e) = &entry
+                    && first_skip.is_none()
+                    && matches!(e.kind, crate::vector::InterMb::Skip)
+                {
+                    first_skip = Some(e.index.into());
                 }
                 if let Err(e) = entry {
                     rep.push_chunk(
@@ -1007,9 +1006,10 @@ fn lint_vector_payload(
                     ),
                 );
             }
-            if opts.sequence_start {
-                if let Some(mb) = first_skip {
-                    rep.push_chunk(
+            if opts.sequence_start
+                && let Some(mb) = first_skip
+            {
+                rep.push_chunk(
                         LintRule::PrevFrameDependencyAtSequenceStart,
                         strip,
                         chunk_idx,
@@ -1018,7 +1018,6 @@ fn lint_vector_payload(
                             "macroblock {mb} is skip-coded at sequence start; there is no previous reconstruction to reuse"
                         ),
                     );
-                }
             }
         }
     }
@@ -1071,7 +1070,7 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
             format!("coded dimensions {width}x{height}"),
         );
     }
-    if width % 4 != 0 {
+    if !width.is_multiple_of(4) {
         rep.push(
             LintRule::FrameWidthNotMultipleOf4,
             None,
@@ -1079,7 +1078,7 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
             format!("width {width} is not a multiple of 4"),
         );
     }
-    if height % 4 != 0 {
+    if !height.is_multiple_of(4) {
         rep.push(
             LintRule::FrameHeightNotMultipleOf4,
             None,
@@ -1344,7 +1343,7 @@ pub fn lint_frame_with(bytes: &[u8], opts: &LintOptions) -> LintReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::{encode_rgb24, EncoderOptions};
+    use crate::encoder::{EncoderOptions, encode_rgb24};
 
     /// Build the spec 01 §1.1 `O1`-shaped 16×8 single-strip frame body
     /// around the given strip chunk stream. Pass
@@ -1713,7 +1712,7 @@ mod tests {
         let rep = lint_frame(&f);
         assert!(has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));
         assert!(rep.is_conformant()); // warning only
-                                      // Header-only on an inter strip is the documented reuse signal.
+        // Header-only on an inter strip is the documented reuse signal.
         let f = wrap_frame(16, 8, &[(0x1100, 0, 8, p)]);
         let rep = lint_frame(&f);
         assert!(!has_rule(&rep, LintRule::HeaderOnlyCodebookOnIntraStrip));

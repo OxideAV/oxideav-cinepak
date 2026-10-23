@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use oxideav_cinepak::{encode_rgb24, EncoderOptions};
+use oxideav_cinepak::{EncoderOptions, encode_rgb24};
 
 /// Synthesise a 320×240 RGB24 frame with smoothly-varying colours.
 /// Diagonal gradient in luma + horizontal red ramp + vertical blue
@@ -90,7 +90,7 @@ fn wrap_in_avi(cinepak_frame: &[u8], width: u32, height: u32) -> Vec<u8> {
     strh.extend_from_slice(&((frame_len + frame_pad) as u32).to_le_bytes()); // dwSuggestedBufferSize
     strh.extend_from_slice(&0u32.to_le_bytes()); // dwQuality
     strh.extend_from_slice(&(width * height * 3).to_le_bytes()); // dwSampleSize
-                                                                 // rcFrame
+    // rcFrame
     strh.extend_from_slice(&0u16.to_le_bytes());
     strh.extend_from_slice(&0u16.to_le_bytes());
     strh.extend_from_slice(&(width as u16).to_le_bytes());
@@ -147,8 +147,8 @@ fn wrap_in_avi(cinepak_frame: &[u8], width: u32, height: u32) -> Vec<u8> {
     idx1.extend_from_slice(b"00dc");
     idx1.extend_from_slice(&0x10u32.to_le_bytes()); // AVIIF_KEYFRAME
     idx1.extend_from_slice(&4u32.to_le_bytes()); // offset of 00dc data
-                                                 // start of movi data
-                                                 // (relative to start of movi LIST data)
+    // start of movi data
+    // (relative to start of movi LIST data)
     idx1.extend_from_slice(&(frame_len as u32).to_le_bytes()); // size
 
     // Top-level RIFF.

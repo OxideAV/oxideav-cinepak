@@ -51,7 +51,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_cinepak::vector::{
-    decode_vector_chunk, VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY,
+    VECTOR_CHUNK_INTER, VECTOR_CHUNK_INTRA, VECTOR_CHUNK_V1_ONLY, decode_vector_chunk,
 };
 
 /// Defence-in-depth raw-input cap; mirrors the sibling targets.

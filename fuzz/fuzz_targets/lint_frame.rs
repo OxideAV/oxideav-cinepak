@@ -27,7 +27,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_cinepak::{lint_frame, lint_frame_with, LintOptions};
+use oxideav_cinepak::{LintOptions, lint_frame, lint_frame_with};
 
 /// Defence-in-depth raw-input cap, matching the sibling targets.
 const MAX_INPUT_LEN: usize = 64 * 1024;

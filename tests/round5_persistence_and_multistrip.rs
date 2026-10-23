@@ -23,7 +23,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use oxideav_cinepak::{
-    encode_rgb24_inter, CinepakDecoder, CinepakEncoder, EncoderOptions, TwoPassRateControl,
+    CinepakDecoder, CinepakEncoder, EncoderOptions, TwoPassRateControl, encode_rgb24_inter,
 };
 
 /// Build a 32×32 RGB fixture with a horizontal colour gradient that

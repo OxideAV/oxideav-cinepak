@@ -14,11 +14,11 @@ use oxideav_core::{
     Error, Frame, Packet, PixelFormat, ProbeContext, Result, RuntimeContext, VideoFrame,
 };
 
+use crate::CODEC_ID_STR;
 use crate::decoder::CinepakDecoder;
 use crate::error::CinepakError;
 use crate::header::{FRAME_HEADER_SIZE, STRIP_HEADER_SIZE, STRIP_ID_INTER, STRIP_ID_INTRA};
 use crate::image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
-use crate::CODEC_ID_STR;
 
 // ---- Error / pixel-format / frame conversions --------------------------
 

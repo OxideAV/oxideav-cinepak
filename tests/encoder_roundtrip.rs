@@ -9,7 +9,7 @@
 //! decode the resulting bitstream and verify pixel-correctness within
 //! a small per-channel tolerance accounting for codebook quantisation.
 
-use oxideav_cinepak::{encode_gray8, encode_rgb24, CinepakDecoder, EncoderOptions};
+use oxideav_cinepak::{CinepakDecoder, EncoderOptions, encode_gray8, encode_rgb24};
 
 /// Generate a 32×32 RGB frame with four 16×16 quadrants of distinct
 /// colours, encode it with default (64-entry) codebooks, decode the

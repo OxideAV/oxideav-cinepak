@@ -11,12 +11,12 @@
 //! for a downstream decoder to notice.
 
 use oxideav_cinepak::encoder::{
-    encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter, encode_gray8_round7, encode_rgb24,
-    encode_rgb24_best_rd_grid, encode_rgb24_best_rd_grid_3axis, encode_rgb24_best_strips,
-    encode_rgb24_inter, encode_rgb24_per_strip_rd, encode_rgb24_round6, encode_rgb24_round7,
-    encode_rgb24_round8, CinepakEncoder, EncoderOptions,
+    CinepakEncoder, EncoderOptions, encode_gray8, encode_gray8_best_rd_grid, encode_gray8_inter,
+    encode_gray8_round7, encode_rgb24, encode_rgb24_best_rd_grid, encode_rgb24_best_rd_grid_3axis,
+    encode_rgb24_best_strips, encode_rgb24_inter, encode_rgb24_per_strip_rd, encode_rgb24_round6,
+    encode_rgb24_round7, encode_rgb24_round8,
 };
-use oxideav_cinepak::{lint_frame, lint_frame_with, lint_sequence, CinepakDecoder, LintOptions};
+use oxideav_cinepak::{CinepakDecoder, LintOptions, lint_frame, lint_frame_with, lint_sequence};
 
 const W: u32 = 32;
 const H: u32 = 16;

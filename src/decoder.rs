@@ -9,15 +9,15 @@
 //! identity).
 
 use crate::codebook::{
-    apply_codebook_chunk_with, Codebook, CodebookChunkKind, PixelMode, UpdateStyle, WhichCodebook,
-    CHUNK_HEADER_SIZE,
+    CHUNK_HEADER_SIZE, Codebook, CodebookChunkKind, PixelMode, UpdateStyle, WhichCodebook,
+    apply_codebook_chunk_with,
 };
 use crate::error::{CinepakError, Result};
 use crate::header::{
-    FrameHeader, RawStripHeader, StripHeader, FRAME_HEADER_SIZE, STRIP_HEADER_SIZE,
+    FRAME_HEADER_SIZE, FrameHeader, RawStripHeader, STRIP_HEADER_SIZE, StripHeader,
 };
 use crate::image::{CinepakFrame, CinepakPixelFormat, CinepakPlane};
-use crate::vector::{decode_vector_chunk, Mb};
+use crate::vector::{Mb, decode_vector_chunk};
 use crate::yuv::yuv_to_rgb;
 
 /// Wire-level deviation profile for a Cinepak frame.
@@ -197,10 +197,10 @@ impl CinepakDecoder {
 
         // If the previous frame is the wrong size for this frame, drop
         // it — skip macroblocks must reference the *same* frame layout.
-        if let Some(p) = &self.prev_frame {
-            if p.width != width || p.height != height {
-                self.prev_frame = None;
-            }
+        if let Some(p) = &self.prev_frame
+            && (p.width != width || p.height != height)
+        {
+            self.prev_frame = None;
         }
 
         // Take the carry-over codebooks out of `self` to avoid the
@@ -257,7 +257,7 @@ impl CinepakDecoder {
                     strip_hdr.actual_y_top, strip_hdr.actual_y_bottom
                 )));
             }
-            if (sx1 - sx0) % 4 != 0 || strip_hdr.height() % 4 != 0 {
+            if (sx1 - sx0) % 4 != 0 || !strip_hdr.height().is_multiple_of(4) {
                 return Err(CinepakError::invalid(format!(
                     "strip {strip_index} dims ({}x{}) not multiples of 4",
                     sx1 - sx0,

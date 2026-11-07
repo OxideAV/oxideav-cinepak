@@ -308,8 +308,6 @@ pub struct LintIssue {
     pub message: String,
 }
 
-impl LintIssue {}
-
 impl core::fmt::Display for LintIssue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let sev = match self.severity {

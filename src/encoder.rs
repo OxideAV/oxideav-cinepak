@@ -1543,8 +1543,6 @@ pub struct EncodedFrame {
     pub frame_number_in_gop: u32,
 }
 
-impl EncodedFrame {}
-
 /// Round-7 per-frame telemetry, queried via
 /// [`CinepakEncoder::last_frame_stats`] after each
 /// [`CinepakEncoder::encode_intra`] / [`CinepakEncoder::encode_inter`]
@@ -1566,8 +1564,6 @@ pub struct FrameStats {
     /// Maxes at `2 × strip_count` (one per V4/V1 codebook per strip).
     pub forced_full_chunks: usize,
 }
-
-impl FrameStats {}
 
 /// Round-96 per-frame rate-control telemetry, queried via
 /// [`CinepakEncoder::last_rate_stats`] after a budget-driven
@@ -1624,8 +1620,6 @@ pub struct RateStats {
     /// frames since the carry-over was last reset, **after** this frame.
     pub cumulative_actual_bytes: u64,
 }
-
-impl RateStats {}
 
 impl Default for CinepakEncoder {
     fn default() -> Self {
@@ -2910,8 +2904,6 @@ pub struct RateControlledFrame {
     /// positive ⇒ over (q=0 still couldn't fit).
     pub byte_delta: i64,
 }
-
-impl RateControlledFrame {}
 
 impl Default for TwoPassRateControl {
     fn default() -> Self {

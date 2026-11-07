@@ -6,6 +6,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-cinepak/compare/v0.0.4...v0.0.5) - 2026-11-07
+
+### Other
+
+- rustfmt the builder chains from the non_exhaustive pass
+- Drop the empty impl blocks left by the non_exhaustive pass
+- API hygiene: non_exhaustive options/records/enums, hide syntax modules
+
 ### Changed
 
 - `#[non_exhaustive]`: the enums `CinepakError`, `CinepakVariant`, `FilmAudioFormat`, `CinepakPixelFormat` and `LintSeverity`; the records `EncoderOptions`, `DeviantConfig`, `EncodedFrame`, `FrameStats`, `RateStats`, `RateControlledFrame` and `LintIssue`. Code outside the crate builds `EncoderOptions` / `DeviantConfig` through their constructors and `with_*` setters and needs a `_ =>` arm when matching the enums. `SampleKind`, `PcmSignConvention` and `PcmEndianness` (closed by the FILM format) stay exhaustive.

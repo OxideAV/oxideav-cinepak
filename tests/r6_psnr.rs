@@ -208,19 +208,10 @@ fn lever_h_pcl_64x64_single_strip_lifts_by_1db() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
-    let base = EncoderOptions {
-        strip_count: 1,
-        ..EncoderOptions::from_quality(50)
-    };
+    let base = EncoderOptions::from_quality(50).with_strip_count(1);
 
-    let opts_off = EncoderOptions {
-        pcl_max_iter: 0,
-        ..base
-    };
-    let opts_on = EncoderOptions {
-        pcl_max_iter: 2,
-        ..base
-    };
+    let opts_off = base.with_pcl_max_iter(0);
+    let opts_on = base.with_pcl_max_iter(2);
     let bytes_off = encode_rgb24(&rgb, w, h, opts_off).unwrap();
     let psnr_off = psnr_y(&rgb, &decode_packed(&bytes_off, w, h));
     let bytes_on = encode_rgb24(&rgb, w, h, opts_on).unwrap();
@@ -303,11 +294,9 @@ fn pcl_0_restores_round5_picker_baseline() {
     // `pcl_max_iter = 0` so this regression guard exactly characterises
     // the **round-5** baseline: every later cold-start-init lever is
     // disabled too.
-    let opts = EncoderOptions {
-        pcl_max_iter: 0,
-        kmeans_pp_init: false,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50)
+        .with_pcl_max_iter(0)
+        .with_kmeans_pp_init(false);
     let bytes = encode_rgb24_best_strips(&rgb, w, h, opts, &[1, 2, 4]).unwrap();
     let psnr = psnr_y(&rgb, &decode_packed(&bytes, w, h));
     eprintln!(
@@ -373,16 +362,10 @@ fn round6_pcl_iter_count_monotonic_lift() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
-    let base = EncoderOptions {
-        strip_count: 1,
-        ..EncoderOptions::from_quality(50)
-    };
+    let base = EncoderOptions::from_quality(50).with_strip_count(1);
     let mut prior_psnr: f64 = -f64::INFINITY;
     for &iter in &[0u8, 1, 2, 3, 4] {
-        let opts = EncoderOptions {
-            pcl_max_iter: iter,
-            ..base
-        };
+        let opts = base.with_pcl_max_iter(iter);
         let bytes = encode_rgb24(&rgb, w, h, opts).unwrap();
         let psnr = psnr_y(&rgb, &decode_packed(&bytes, w, h));
         eprintln!(

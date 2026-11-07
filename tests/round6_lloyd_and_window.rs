@@ -83,11 +83,7 @@ fn lloyd_max_iter_progression_does_not_worsen_pixel_fidelity() {
         h: usize,
         n_inter: usize,
     ) -> f64 {
-        let opts = EncoderOptions {
-            lloyd_max_iter: max_iter,
-            lloyd_eps: eps,
-            ..base
-        };
+        let opts = base.with_lloyd_max_iter(max_iter).with_lloyd_eps(eps);
         let mut enc = CinepakEncoder::new();
         let intra = enc
             .encode_intra(&slow_pan_fixture(w, h, 0), w as u32, h as u32, opts)
@@ -146,11 +142,9 @@ fn lloyd_max_iter_0_loses_persistence_wire_savings() {
     // clusters; the cold-vs-warm wire-size delta on this fixture
     // (~15 B / 0.7%) is then dominated by chunk-omission-format
     // boundary effects unrelated to the Lloyd knob being characterised.
-    let base = EncoderOptions {
-        rdo_lambda: None,
-        luma_weight: 1,
-        ..EncoderOptions::from_quality(50)
-    };
+    let base = EncoderOptions::from_quality(50)
+        .with_rdo_lambda(None)
+        .with_luma_weight(1);
 
     fn total_inter_bytes(opts: EncoderOptions, w: usize, h: usize, n_inter: usize) -> usize {
         let mut enc = CinepakEncoder::new();
@@ -167,24 +161,8 @@ fn lloyd_max_iter_0_loses_persistence_wire_savings() {
         total
     }
 
-    let cold = total_inter_bytes(
-        EncoderOptions {
-            lloyd_max_iter: 0,
-            ..base
-        },
-        w,
-        h,
-        n_inter,
-    );
-    let warm = total_inter_bytes(
-        EncoderOptions {
-            lloyd_max_iter: 2,
-            ..base
-        },
-        w,
-        h,
-        n_inter,
-    );
+    let cold = total_inter_bytes(base.with_lloyd_max_iter(0), w, h, n_inter);
+    let warm = total_inter_bytes(base.with_lloyd_max_iter(2), w, h, n_inter);
     eprintln!("lloyd_max_iter wire size: cold={cold} warm={warm}");
     // Disabling Lloyd should not yield smaller wire (no slot-identity
     // means full-replace chunks every frame).

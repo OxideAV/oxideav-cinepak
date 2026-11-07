@@ -108,6 +108,7 @@ pub struct Fdsc {
 /// use. Determined from the FILM header version + FDSC chunk layout
 /// per `Sega_FILM.wiki` lines 125–224.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CinepakVariant {
     /// Standard Cinepak (`'cvid'` FOURCC, ASCII version field
     /// `'1.0X'` or `'1.0Y'`). Decode with
@@ -313,6 +314,7 @@ pub enum PcmEndianness {
 /// `Sega_FILM.wiki` line 149 plus the linear-PCM encoding rules per
 /// wiki lines 151–162.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FilmAudioFormat {
     /// No audio stream. The FDSC's audio fields are all zero (wiki
     /// line 82) or the FDSC is in the abbreviated 20-byte layout (wiki

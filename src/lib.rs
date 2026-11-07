@@ -39,15 +39,21 @@
 
 #![forbid(unsafe_code)]
 
+// Internal: bitstream syntax walkers and colour kernels, reachable for
+// tests / fuzz / examples; not part of the documented API.
+#[doc(hidden)]
 pub mod codebook;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod film;
+#[doc(hidden)]
 pub mod header;
 pub mod image;
 pub mod lint;
+#[doc(hidden)]
 pub mod vector;
+#[doc(hidden)]
 pub mod yuv;
 
 #[cfg(feature = "registry")]
@@ -57,6 +63,7 @@ pub mod registry;
 pub const CODEC_ID_STR: &str = "cinepak";
 
 // Standalone, framework-free re-exports.
+#[doc(hidden)]
 pub use codebook::{
     CodebookEntries, CodebookEntryRecord, StripChunkEntry, StripChunkKind, StripChunks,
     VectorChunkKind, expand_v4_chroma, expand_v4_luma,
@@ -82,11 +89,13 @@ pub use lint::{
     LintIssue, LintOptions, LintReport, LintRule, LintSeverity, lint_frame, lint_frame_with,
     lint_sequence,
 };
+#[doc(hidden)]
 pub use vector::{
     InterEntry, InterMacroblocks, InterMb, MixedIntraCoding, MixedIntraEntry,
     MixedIntraMacroblocks, MixedIntraMb, MixedIntraRgbBlock, MixedIntraRgbBlocks,
     V1MacroblockEntry, V1OnlyMacroblocks,
 };
+#[doc(hidden)]
 pub use yuv::{expand_v1_mb_rgb, expand_v4_mb_rgb, yuv_to_rgb};
 
 // Framework-integrated re-exports.

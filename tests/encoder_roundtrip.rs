@@ -113,11 +113,9 @@ fn rgb24_tiny_codebook_4_entries() {
             rgb[off + 2] = colors[q].2;
         }
     }
-    let opts = EncoderOptions {
-        v4_entries: 4,
-        v1_entries: 4,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_v4_entries(4)
+        .with_v1_entries(4);
     let bytes = encode_rgb24(&rgb, w as u32, h as u32, opts).unwrap();
     let mut dec = CinepakDecoder::new();
     let f = dec.decode_frame(&bytes, None).unwrap();

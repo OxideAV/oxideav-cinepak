@@ -186,58 +186,41 @@ fn bench_encode_gray8_320x240_q50_round7(c: &mut Criterion) {
 /// wire-hash pins) so the benched paths are the pinned paths.
 fn bench_encode_training_phases_320x240(c: &mut Criterion) {
     let rgb = build_rgb_gradient(320, 240);
-    let base = EncoderOptions {
-        v4_entries: 64,
-        v1_entries: 64,
-        strip_count: 1,
-        skip_threshold: 64.0,
-        lloyd_max_iter: 0,
-        lloyd_eps: 1,
-        stale_slot_threshold: Some(8),
-        rdo_lambda: Some(5.0),
-        lbg_max_passes: 0,
-        luma_weight: 2,
-        pcl_max_iter: 0,
-        kmeans_pp_init: false,
-        kmeans_pp_lloyd_iter: 0,
-        vintage_compat: false,
-    };
+    let base = EncoderOptions::default()
+        .with_v4_entries(64)
+        .with_v1_entries(64)
+        .with_strip_count(1)
+        .with_skip_threshold(64.0)
+        .with_lloyd_max_iter(0)
+        .with_lloyd_eps(1)
+        .with_stale_slot_threshold(Some(8))
+        .with_rdo_lambda(Some(5.0))
+        .with_lbg_max_passes(0)
+        .with_luma_weight(2)
+        .with_pcl_max_iter(0)
+        .with_kmeans_pp_init(false)
+        .with_kmeans_pp_lloyd_iter(0)
+        .with_vintage_compat(false);
     let rows: [(&str, EncoderOptions); 5] = [
         ("mediancut_only", base),
-        (
-            "plus_lloyd2",
-            EncoderOptions {
-                lloyd_max_iter: 2,
-                ..base
-            },
-        ),
+        ("plus_lloyd2", base.with_lloyd_max_iter(2)),
         (
             "plus_lbg8",
-            EncoderOptions {
-                lloyd_max_iter: 2,
-                lbg_max_passes: 8,
-                ..base
-            },
+            base.with_lloyd_max_iter(2).with_lbg_max_passes(8),
         ),
         (
             "plus_pcl2",
-            EncoderOptions {
-                lloyd_max_iter: 2,
-                lbg_max_passes: 8,
-                pcl_max_iter: 2,
-                ..base
-            },
+            base.with_lloyd_max_iter(2)
+                .with_lbg_max_passes(8)
+                .with_pcl_max_iter(2),
         ),
         (
             "plus_kmeanspp4",
-            EncoderOptions {
-                lloyd_max_iter: 2,
-                lbg_max_passes: 8,
-                pcl_max_iter: 2,
-                kmeans_pp_init: true,
-                kmeans_pp_lloyd_iter: 4,
-                ..base
-            },
+            base.with_lloyd_max_iter(2)
+                .with_lbg_max_passes(8)
+                .with_pcl_max_iter(2)
+                .with_kmeans_pp_init(true)
+                .with_kmeans_pp_lloyd_iter(4),
         ),
     ];
     let mut g = c.benchmark_group("encode_training_phases_320x240");
@@ -259,22 +242,21 @@ fn bench_encode_training_phases_320x240(c: &mut Criterion) {
 /// guard the 320x240 single-strip rows can't see.
 fn bench_encode_rgb24_640x480_strips3(c: &mut Criterion) {
     let rgb = build_rgb_gradient(640, 480);
-    let opts = EncoderOptions {
-        v4_entries: 128,
-        v1_entries: 128,
-        strip_count: 3,
-        skip_threshold: 32.0,
-        lloyd_max_iter: 2,
-        lloyd_eps: 1,
-        stale_slot_threshold: Some(8),
-        rdo_lambda: Some(5.0),
-        lbg_max_passes: 8,
-        luma_weight: 2,
-        pcl_max_iter: 2,
-        kmeans_pp_init: true,
-        kmeans_pp_lloyd_iter: 4,
-        vintage_compat: false,
-    };
+    let opts = EncoderOptions::default()
+        .with_v4_entries(128)
+        .with_v1_entries(128)
+        .with_strip_count(3)
+        .with_skip_threshold(32.0)
+        .with_lloyd_max_iter(2)
+        .with_lloyd_eps(1)
+        .with_stale_slot_threshold(Some(8))
+        .with_rdo_lambda(Some(5.0))
+        .with_lbg_max_passes(8)
+        .with_luma_weight(2)
+        .with_pcl_max_iter(2)
+        .with_kmeans_pp_init(true)
+        .with_kmeans_pp_lloyd_iter(4)
+        .with_vintage_compat(false);
     let mut g = c.benchmark_group("encode_rgb24_640x480_strips3");
     g.throughput(Throughput::Bytes((640 * 480 * 3) as u64));
     g.sample_size(10);

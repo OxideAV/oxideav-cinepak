@@ -305,10 +305,7 @@ fn round8_saves_wire_on_split_256x256() {
 #[test]
 fn round8_matches_round7_on_homogeneous_pure_distortion() {
     let rgb = synth_64x64();
-    let opts_none = EncoderOptions {
-        rdo_lambda: None,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts_none = EncoderOptions::from_quality(50).with_rdo_lambda(None);
     let r7 = encode_rgb24_round7(&rgb, 64, 64, opts_none).expect("r7");
     let r8 = encode_rgb24_round8(&rgb, 64, 64, opts_none).expect("r8");
     let psnr7 = psnr_y(&rgb, &decode_to_packed(&r7, 64, 64));

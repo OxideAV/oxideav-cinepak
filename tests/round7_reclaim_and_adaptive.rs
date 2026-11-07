@@ -83,10 +83,7 @@ fn vivid_gradient(width: usize, height: usize) -> Vec<u8> {
 fn reclamation_fires_after_threshold_on_content_cut() {
     let w = 32usize;
     let h = 32usize;
-    let opts = EncoderOptions {
-        stale_slot_threshold: Some(2),
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50).with_stale_slot_threshold(Some(2));
 
     let mut enc = CinepakEncoder::new();
     // Intra: small hot corner that uses few slots.
@@ -144,10 +141,7 @@ fn reclamation_fires_after_threshold_on_content_cut() {
 fn reclamation_disabled_via_none_threshold() {
     let w = 32usize;
     let h = 32usize;
-    let opts = EncoderOptions {
-        stale_slot_threshold: None,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50).with_stale_slot_threshold(None);
 
     let mut enc = CinepakEncoder::new();
     let _intra = enc
@@ -177,10 +171,7 @@ fn reclamation_disabled_via_none_threshold() {
 fn reclamation_chain_decodes_coherently() {
     let w = 32usize;
     let h = 32usize;
-    let opts = EncoderOptions {
-        stale_slot_threshold: Some(2),
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50).with_stale_slot_threshold(Some(2));
     let mut enc = CinepakEncoder::new();
     let intra = enc
         .encode_intra(&static_with_hot_corner(w, h), w as u32, h as u32, opts)
@@ -242,10 +233,7 @@ fn reclamation_chain_decodes_coherently() {
 fn last_frame_stats_resets_per_frame() {
     let w = 32usize;
     let h = 32usize;
-    let opts = EncoderOptions {
-        stale_slot_threshold: Some(1),
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50).with_stale_slot_threshold(Some(1));
     let mut enc = CinepakEncoder::new();
     let _ = enc
         .encode_intra(&static_with_hot_corner(w, h), w as u32, h as u32, opts)

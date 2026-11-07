@@ -71,11 +71,9 @@ fn cross_frame_persistence_shrinks_slow_pan_wire_size() {
     // omission heuristics see a slightly different prev-codebook view,
     // which flips the persistence-vs-no-persistence delta on this
     // fixture by ~50 bytes — unrelated to the persistence mechanism.
-    let opts = EncoderOptions {
-        rdo_lambda: None,
-        luma_weight: 1,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50)
+        .with_rdo_lambda(None)
+        .with_luma_weight(1);
     let n_inter = 8usize;
 
     // --- With persistence (default-on round-5 path) ---
@@ -179,13 +177,11 @@ fn cross_frame_persistence_shrinks_slow_pan_wire_size() {
 fn multi_strip_inter_selective_update_beats_full_replace() {
     let w = 64usize;
     let h = 64usize;
-    let opts = EncoderOptions {
-        v4_entries: 32,
-        v1_entries: 32,
-        strip_count: 4,
-        skip_threshold: 32.0,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_v4_entries(32)
+        .with_v1_entries(32)
+        .with_strip_count(4)
+        .with_skip_threshold(32.0);
 
     // Slow-pan: 6 inter frames each shifting by 1 column.
     let n_inter = 6usize;
@@ -261,13 +257,11 @@ fn multi_strip_inter_selective_update_beats_full_replace() {
 fn multi_strip_inter_static_fixture_chunk_omission_across_strips() {
     let w = 32usize;
     let h = 32usize;
-    let opts = EncoderOptions {
-        v4_entries: 16,
-        v1_entries: 16,
-        strip_count: 4,
-        skip_threshold: 32.0,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_v4_entries(16)
+        .with_v1_entries(16)
+        .with_strip_count(4)
+        .with_skip_threshold(32.0);
     // Solid colour — every strip's codebook will train to the same
     // single-cluster value, so the rolling state across strips will
     // already be correct from strip 1 onward.

@@ -12,6 +12,7 @@
 /// the YUV→RGB matrix (per `docs/video/cinepak/spec/04-yuv-rgb-matrix.md`)
 /// and emits one of:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CinepakPixelFormat {
     /// Packed 8-bit RGB, three bytes per pixel, in `R, G, B` order.
     /// Matches `pix_fmt rgb24`.

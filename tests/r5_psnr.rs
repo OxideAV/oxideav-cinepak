@@ -237,29 +237,10 @@ fn lever_f_luma_weight_64x64_gradient_lifts_by_1db() {
     let w = 64u32;
     let h = 64u32;
     // Pin PCL off to isolate the round-5 lever-F effect.
-    let base = EncoderOptions {
-        pcl_max_iter: 0,
-        ..EncoderOptions::from_quality(50)
-    };
+    let base = EncoderOptions::from_quality(50).with_pcl_max_iter(0);
 
-    let (bytes_r4, psnr_r4) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            luma_weight: 1,
-            ..base
-        },
-    );
-    let (bytes_r5, psnr_r5) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            luma_weight: 2,
-            ..base
-        },
-    );
+    let (bytes_r4, psnr_r4) = encode_decode_measure(&rgb, w, h, base.with_luma_weight(1));
+    let (bytes_r5, psnr_r5) = encode_decode_measure(&rgb, w, h, base.with_luma_weight(2));
     let delta = psnr_r5 - psnr_r4;
     eprintln!(
         "Lever F (luma_weight) on 64x64 gradient at q=50, pcl=0: \
@@ -288,11 +269,9 @@ fn luma_weight_1_restores_round4_baseline() {
     let rgb = synth_64x64();
     let w = 64u32;
     let h = 64u32;
-    let opts = EncoderOptions {
-        luma_weight: 1,
-        pcl_max_iter: 0,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts = EncoderOptions::from_quality(50)
+        .with_luma_weight(1)
+        .with_pcl_max_iter(0);
     let (bytes, psnr) = encode_decode_measure(&rgb, w, h, opts);
     eprintln!(
         "luma_weight=1 (round-4 baseline, pcl=0) on 64x64 gradient at q=50: \
@@ -306,10 +285,7 @@ fn luma_weight_1_restores_round4_baseline() {
     );
     // And luma_weight=2 (round-5 default) must strictly improve at the
     // same PCL setting.
-    let opts_r5 = EncoderOptions {
-        pcl_max_iter: 0,
-        ..EncoderOptions::from_quality(50)
-    };
+    let opts_r5 = EncoderOptions::from_quality(50).with_pcl_max_iter(0);
     let (_, psnr_r5) = encode_decode_measure(&rgb, w, h, opts_r5);
     assert!(
         psnr_r5 > psnr,
@@ -329,24 +305,8 @@ fn luma_weight_0_falls_back_to_1() {
     let h = 64u32;
     let base = EncoderOptions::from_quality(50);
 
-    let (bytes_0, psnr_0) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            luma_weight: 0,
-            ..base
-        },
-    );
-    let (bytes_1, psnr_1) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            luma_weight: 1,
-            ..base
-        },
-    );
+    let (bytes_0, psnr_0) = encode_decode_measure(&rgb, w, h, base.with_luma_weight(0));
+    let (bytes_1, psnr_1) = encode_decode_measure(&rgb, w, h, base.with_luma_weight(1));
     eprintln!(
         "luma_weight=0 → fallback: psnr_y={:.3} dB ({} B); \
          luma_weight=1: psnr_y={:.3} dB ({} B)",

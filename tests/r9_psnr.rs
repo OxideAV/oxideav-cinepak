@@ -158,24 +158,8 @@ fn round9_no_regression_on_64x64_gradient() {
     let w = 64u32;
     let h = 64u32;
     let base = EncoderOptions::from_quality(50);
-    let (bytes_r8, psnr_r8) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: false,
-            ..base
-        },
-    );
-    let (bytes_r9, psnr_r9) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            ..base
-        },
-    );
+    let (bytes_r8, psnr_r8) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(false));
+    let (bytes_r9, psnr_r9) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(true));
     eprintln!(
         "Lever M on 64x64 gradient via round8: \
          r8 (kmeans++=off) psnr_y={:.3} dB ({} B), \
@@ -200,24 +184,8 @@ fn round9_no_regression_on_320x240_gradient() {
     let w = 320u32;
     let h = 240u32;
     let base = EncoderOptions::from_quality(50);
-    let (bytes_r8, psnr_r8) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: false,
-            ..base
-        },
-    );
-    let (bytes_r9, psnr_r9) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            ..base
-        },
-    );
+    let (bytes_r8, psnr_r8) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(false));
+    let (bytes_r9, psnr_r9) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(true));
     eprintln!(
         "Lever M on 320x240 gradient via round8: \
          r8 (kmeans++=off) psnr_y={:.3} dB ({} B), \
@@ -249,24 +217,8 @@ fn round9_lcg_noise_64x64_positive_delta() {
     let w = 64u32;
     let h = 64u32;
     let base = EncoderOptions::from_quality(50);
-    let (bytes_r8, psnr_r8) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: false,
-            ..base
-        },
-    );
-    let (bytes_r9, psnr_r9) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            ..base
-        },
-    );
+    let (bytes_r8, psnr_r8) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(false));
+    let (bytes_r9, psnr_r9) = encode_decode_measure(&rgb, w, h, base.with_kmeans_pp_init(true));
     let delta = psnr_r9 - psnr_r8;
     eprintln!(
         "Lever M on 64x64 LCG-noise via round8: \
@@ -313,10 +265,7 @@ fn round9_kmeans_pp_off_matches_round8_floor() {
     let w = 64u32;
     let h = 64u32;
     let base = EncoderOptions::from_quality(50);
-    let opts = EncoderOptions {
-        kmeans_pp_init: false,
-        ..base
-    };
+    let opts = base.with_kmeans_pp_init(false);
     let (bytes, psnr) = encode_decode_measure(&rgb, w, h, opts);
     eprintln!(
         "kmeans_pp_init=false on 64x64 gradient via round8: psnr_y={:.3} dB ({} B)",
@@ -344,26 +293,8 @@ fn round9_picker_cost_improves_on_64x64() {
     let base = EncoderOptions::from_quality(50);
     let lambda = base.rdo_lambda.unwrap_or(0.0) as f64;
     let n_pixels = (w as usize) * (h as usize);
-    let bytes_r8 = encode_rgb24_round8(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: false,
-            ..base
-        },
-    )
-    .unwrap();
-    let bytes_r9 = encode_rgb24_round8(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            ..base
-        },
-    )
-    .unwrap();
+    let bytes_r8 = encode_rgb24_round8(&rgb, w, h, base.with_kmeans_pp_init(false)).unwrap();
+    let bytes_r9 = encode_rgb24_round8(&rgb, w, h, base.with_kmeans_pp_init(true)).unwrap();
     let cost = |bytes: &[u8]| -> f64 {
         let mut dec = CinepakDecoder::new();
         let frame = dec.decode_frame(bytes, None).unwrap();
@@ -415,21 +346,13 @@ fn round9_lloyd_iter_is_monotonic() {
         &rgb,
         w,
         h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            kmeans_pp_lloyd_iter: 0,
-            ..base
-        },
+        base.with_kmeans_pp_init(true).with_kmeans_pp_lloyd_iter(0),
     );
     let (_b4, p4) = encode_decode_measure(
         &rgb,
         w,
         h,
-        EncoderOptions {
-            kmeans_pp_init: true,
-            kmeans_pp_lloyd_iter: 4,
-            ..base
-        },
+        base.with_kmeans_pp_init(true).with_kmeans_pp_lloyd_iter(4),
     );
     eprintln!(
         "Lloyd-iter monotonicity on 64x64 gradient: \

@@ -138,12 +138,10 @@ fn encode_decode_measure(rgb: &[u8], w: u32, h: u32, opts: EncoderOptions) -> (V
 /// tests measure the **round-4** LBG lever's contribution, so we pin
 /// the cold-start to the original median-cut baseline.
 fn r4_isolated_opts(quality: u8) -> EncoderOptions {
-    EncoderOptions {
-        luma_weight: 1,
-        pcl_max_iter: 0,
-        kmeans_pp_init: false,
-        ..EncoderOptions::from_quality(quality)
-    }
+    EncoderOptions::from_quality(quality)
+        .with_luma_weight(1)
+        .with_pcl_max_iter(0)
+        .with_kmeans_pp_init(false)
 }
 
 /// **Lever E target — 64×64 gradient ≥ 38 dB PSNR_Y.**
@@ -219,24 +217,8 @@ fn lever_e_noisy_64x64_improves_by_half_db() {
     // doesn't compound with the r4 LBG delta being measured here.
     let base = r4_isolated_opts(50);
 
-    let (bytes_r3, psnr_r3) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            lbg_max_passes: 0,
-            ..base
-        },
-    );
-    let (bytes_r4, psnr_r4) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            lbg_max_passes: 8,
-            ..base
-        },
-    );
+    let (bytes_r3, psnr_r3) = encode_decode_measure(&rgb, w, h, base.with_lbg_max_passes(0));
+    let (bytes_r4, psnr_r4) = encode_decode_measure(&rgb, w, h, base.with_lbg_max_passes(8));
     let delta = psnr_r4 - psnr_r3;
     eprintln!(
         "Lever E (LBG) on 64x64 LCG-noise at q=50: \
@@ -268,24 +250,8 @@ fn lever_e_64x64_gradient_lbg_delta() {
     // doesn't compound with the r4 LBG delta being measured here.
     let base = r4_isolated_opts(50);
 
-    let (bytes_r3, psnr_r3) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            lbg_max_passes: 0,
-            ..base
-        },
-    );
-    let (bytes_r4, psnr_r4) = encode_decode_measure(
-        &rgb,
-        w,
-        h,
-        EncoderOptions {
-            lbg_max_passes: 8,
-            ..base
-        },
-    );
+    let (bytes_r3, psnr_r3) = encode_decode_measure(&rgb, w, h, base.with_lbg_max_passes(0));
+    let (bytes_r4, psnr_r4) = encode_decode_measure(&rgb, w, h, base.with_lbg_max_passes(8));
     let delta = psnr_r4 - psnr_r3;
     eprintln!(
         "Lever E (LBG) on 64x64 gradient at q=50: \
@@ -315,10 +281,7 @@ fn lbg_disabled_matches_round3_baseline() {
     let h = 64u32;
     // Pin `luma_weight = 1` so the round-5 luma-weighted distance lever
     // doesn't compound with the r4 LBG baseline being characterised here.
-    let opts = EncoderOptions {
-        lbg_max_passes: 0,
-        ..r4_isolated_opts(50)
-    };
+    let opts = r4_isolated_opts(50).with_lbg_max_passes(0);
     let (bytes, psnr) = encode_decode_measure(&rgb, w, h, opts);
     eprintln!(
         "lbg=0 (r3 baseline, luma_weight=1) on 64x64 gradient at q=50: \

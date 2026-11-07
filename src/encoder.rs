@@ -107,6 +107,7 @@ use crate::vector::{
 /// derives all three from a single `quality ∈ 0..=100` PSNR-style
 /// knob (see method docs for the mapping).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EncoderOptions {
     /// Number of V4 codebook entries (1..=256). Default `64`.
     pub v4_entries: u16,
@@ -366,6 +367,92 @@ pub struct EncoderOptions {
     ///
     /// Default `false`. Set to `true` for vintage-player target output.
     pub vintage_compat: bool,
+}
+
+impl EncoderOptions {
+    /// Set `v4_entries`.
+    pub fn with_v4_entries(mut self, v4_entries: u16) -> Self {
+        self.v4_entries = v4_entries;
+        self
+    }
+
+    /// Set `v1_entries`.
+    pub fn with_v1_entries(mut self, v1_entries: u16) -> Self {
+        self.v1_entries = v1_entries;
+        self
+    }
+
+    /// Set `strip_count`.
+    pub fn with_strip_count(mut self, strip_count: u16) -> Self {
+        self.strip_count = strip_count;
+        self
+    }
+
+    /// Set `skip_threshold`.
+    pub fn with_skip_threshold(mut self, skip_threshold: f32) -> Self {
+        self.skip_threshold = skip_threshold;
+        self
+    }
+
+    /// Set `lloyd_max_iter`.
+    pub fn with_lloyd_max_iter(mut self, lloyd_max_iter: u8) -> Self {
+        self.lloyd_max_iter = lloyd_max_iter;
+        self
+    }
+
+    /// Set `lloyd_eps`.
+    pub fn with_lloyd_eps(mut self, lloyd_eps: u32) -> Self {
+        self.lloyd_eps = lloyd_eps;
+        self
+    }
+
+    /// Set `stale_slot_threshold`.
+    pub fn with_stale_slot_threshold(mut self, stale_slot_threshold: Option<u8>) -> Self {
+        self.stale_slot_threshold = stale_slot_threshold;
+        self
+    }
+
+    /// Set `rdo_lambda`.
+    pub fn with_rdo_lambda(mut self, rdo_lambda: Option<f32>) -> Self {
+        self.rdo_lambda = rdo_lambda;
+        self
+    }
+
+    /// Set `lbg_max_passes`.
+    pub fn with_lbg_max_passes(mut self, lbg_max_passes: u8) -> Self {
+        self.lbg_max_passes = lbg_max_passes;
+        self
+    }
+
+    /// Set `luma_weight`.
+    pub fn with_luma_weight(mut self, luma_weight: u8) -> Self {
+        self.luma_weight = luma_weight;
+        self
+    }
+
+    /// Set `pcl_max_iter`.
+    pub fn with_pcl_max_iter(mut self, pcl_max_iter: u8) -> Self {
+        self.pcl_max_iter = pcl_max_iter;
+        self
+    }
+
+    /// Set `kmeans_pp_init`.
+    pub fn with_kmeans_pp_init(mut self, kmeans_pp_init: bool) -> Self {
+        self.kmeans_pp_init = kmeans_pp_init;
+        self
+    }
+
+    /// Set `kmeans_pp_lloyd_iter`.
+    pub fn with_kmeans_pp_lloyd_iter(mut self, kmeans_pp_lloyd_iter: u8) -> Self {
+        self.kmeans_pp_lloyd_iter = kmeans_pp_lloyd_iter;
+        self
+    }
+
+    /// Set `vintage_compat`.
+    pub fn with_vintage_compat(mut self, vintage_compat: bool) -> Self {
+        self.vintage_compat = vintage_compat;
+        self
+    }
 }
 
 impl Default for EncoderOptions {
@@ -1440,6 +1527,7 @@ pub struct CinepakEncoder {
 /// flag (e.g. AVI `AVIF_KEYFRAME` / QuickTime sync sample / Sega FILM
 /// `sample_info_1`) without re-decoding the first byte.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EncodedFrame {
     /// The conformant Cinepak frame bytes (10-byte frame header + strips).
     /// Identical to the return value of [`CinepakEncoder::encode_intra`] /
@@ -1455,6 +1543,8 @@ pub struct EncodedFrame {
     pub frame_number_in_gop: u32,
 }
 
+impl EncodedFrame {}
+
 /// Round-7 per-frame telemetry, queried via
 /// [`CinepakEncoder::last_frame_stats`] after each
 /// [`CinepakEncoder::encode_intra`] / [`CinepakEncoder::encode_inter`]
@@ -1462,6 +1552,7 @@ pub struct EncodedFrame {
 /// across all of the frame's strips (so a 4-strip frame can produce up
 /// to 4 reclamations per codebook flavour).
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct FrameStats {
     /// Number of V4 codebook slots reclaimed via round-7 empty-cluster
     /// recovery during the most recent frame. Zero on intra frames or
@@ -1476,12 +1567,15 @@ pub struct FrameStats {
     pub forced_full_chunks: usize,
 }
 
+impl FrameStats {}
+
 /// Round-96 per-frame rate-control telemetry, queried via
 /// [`CinepakEncoder::last_rate_stats`] after a budget-driven
 /// [`CinepakEncoder::encode_intra`] / [`CinepakEncoder::encode_inter`]
 /// call. `None` (via the accessor) when the encoder is not in
 /// target-bitrate mode.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct RateStats {
     /// The per-frame **base** byte budget in effect for the most recent frame
     /// (`bits_per_second / 8 / fps`, or the directly-set byte budget). This
@@ -1530,6 +1624,8 @@ pub struct RateStats {
     /// frames since the carry-over was last reset, **after** this frame.
     pub cumulative_actual_bytes: u64,
 }
+
+impl RateStats {}
 
 impl Default for CinepakEncoder {
     fn default() -> Self {
@@ -2804,6 +2900,7 @@ pub struct TwoPassRateControl {
 
 /// Per-frame outcome from [`TwoPassRateControl::encode_at_target_bytes`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct RateControlledFrame {
     /// The encoded bitstream.
     pub bytes: Vec<u8>,
@@ -2813,6 +2910,8 @@ pub struct RateControlledFrame {
     /// positive ⇒ over (q=0 still couldn't fit).
     pub byte_delta: i64,
 }
+
+impl RateControlledFrame {}
 
 impl Default for TwoPassRateControl {
     fn default() -> Self {

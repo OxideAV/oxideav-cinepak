@@ -134,38 +134,35 @@ fn gray_frame(width: usize, height: usize, phase: usize) -> Vec<u8> {
 /// does not silently move if a future round changes the defaults; a
 /// default change should *consciously* re-pin).
 fn opts_default() -> EncoderOptions {
-    EncoderOptions {
-        v4_entries: 64,
-        v1_entries: 64,
-        strip_count: 1,
-        skip_threshold: 64.0,
-        lloyd_max_iter: 2,
-        lloyd_eps: 1,
-        stale_slot_threshold: Some(8),
-        rdo_lambda: Some(5.0),
-        lbg_max_passes: 8,
-        luma_weight: 2,
-        pcl_max_iter: 2,
-        kmeans_pp_init: true,
-        kmeans_pp_lloyd_iter: 4,
-        vintage_compat: false,
-    }
+    EncoderOptions::default()
+        .with_v4_entries(64)
+        .with_v1_entries(64)
+        .with_strip_count(1)
+        .with_skip_threshold(64.0)
+        .with_lloyd_max_iter(2)
+        .with_lloyd_eps(1)
+        .with_stale_slot_threshold(Some(8))
+        .with_rdo_lambda(Some(5.0))
+        .with_lbg_max_passes(8)
+        .with_luma_weight(2)
+        .with_pcl_max_iter(2)
+        .with_kmeans_pp_init(true)
+        .with_kmeans_pp_lloyd_iter(4)
+        .with_vintage_compat(false)
 }
 
 /// Training-minimal legacy path: median-cut only, isotropic metric,
 /// legacy distance-sum V1/V4 selection. Exercises the code paths the
 /// default vector skips.
 fn opts_legacy_minimal() -> EncoderOptions {
-    EncoderOptions {
-        rdo_lambda: None,
-        lbg_max_passes: 0,
-        luma_weight: 1,
-        pcl_max_iter: 0,
-        kmeans_pp_init: false,
-        kmeans_pp_lloyd_iter: 0,
-        lloyd_max_iter: 0,
-        ..opts_default()
-    }
+    opts_default()
+        .with_rdo_lambda(None)
+        .with_lbg_max_passes(0)
+        .with_luma_weight(1)
+        .with_pcl_max_iter(0)
+        .with_kmeans_pp_init(false)
+        .with_kmeans_pp_lloyd_iter(0)
+        .with_lloyd_max_iter(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -229,11 +226,7 @@ fn golden_intra_single_frame_matrix() {
 
     // --- 3 strips + vintage_compat on a taller frame -----------------
     let rgb96 = rgb_frame(96, 96, 0);
-    let opts_v3 = EncoderOptions {
-        strip_count: 3,
-        vintage_compat: true,
-        ..opts_default()
-    };
+    let opts_v3 = opts_default().with_strip_count(3).with_vintage_compat(true);
     check(
         "intra/rgb24/96x96/strips3-vintage",
         vec![encode_rgb24(&rgb96, 96, 96, opts_v3).unwrap()],
@@ -242,12 +235,10 @@ fn golden_intra_single_frame_matrix() {
 
     // --- maximum codebooks, 2 strips ----------------------------------
     let rgb80 = rgb_frame(80, 64, 0);
-    let opts_max = EncoderOptions {
-        v4_entries: 256,
-        v1_entries: 256,
-        strip_count: 2,
-        ..opts_default()
-    };
+    let opts_max = opts_default()
+        .with_v4_entries(256)
+        .with_v1_entries(256)
+        .with_strip_count(2);
     check(
         "intra/rgb24/80x64/entries256-strips2",
         vec![encode_rgb24(&rgb80, 80, 64, opts_max).unwrap()],
@@ -255,12 +246,10 @@ fn golden_intra_single_frame_matrix() {
     );
 
     // --- tiny codebooks (deep-quantisation shape) ---------------------
-    let opts_tiny = EncoderOptions {
-        v4_entries: 8,
-        v1_entries: 8,
-        skip_threshold: 256.0,
-        ..opts_default()
-    };
+    let opts_tiny = opts_default()
+        .with_v4_entries(8)
+        .with_v1_entries(8)
+        .with_skip_threshold(256.0);
     check(
         "intra/rgb24/64x64/entries8",
         vec![encode_rgb24(&rgb64, 64, 64, opts_tiny).unwrap()],
@@ -321,11 +310,7 @@ fn golden_stateful_gop_matrix() {
 
     // --- multi-strip vintage GOP (header-only chunk-omission path) ----
     let mut enc = CinepakEncoder::new().with_keyframe_interval(8);
-    let opts_v = EncoderOptions {
-        strip_count: 3,
-        vintage_compat: true,
-        ..opts_default()
-    };
+    let opts_v = opts_default().with_strip_count(3).with_vintage_compat(true);
     let mut frames = Vec::new();
     for phase in 0..4 {
         let rgb = rgb_frame(w as usize, h as usize, phase);
@@ -339,10 +324,7 @@ fn golden_stateful_gop_matrix() {
 
     // --- aggressive stale-slot reclamation ----------------------------
     let mut enc = CinepakEncoder::new().with_keyframe_interval(16);
-    let opts_stale = EncoderOptions {
-        stale_slot_threshold: Some(1),
-        ..opts_default()
-    };
+    let opts_stale = opts_default().with_stale_slot_threshold(Some(1));
     let mut frames = Vec::new();
     for phase in 0..6 {
         // Larger pan step so codebook content actually churns.

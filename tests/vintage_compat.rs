@@ -69,11 +69,9 @@ fn enumerate_codebook_chunks(bytes: &[u8]) -> (u16, Vec<(usize, u16, u16, u16)>)
 #[test]
 fn rejects_strip_count_above_three_when_vintage_compat() {
     let rgb = solid_gray_32(128);
-    let opts = EncoderOptions {
-        strip_count: 4,
-        vintage_compat: true,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_strip_count(4)
+        .with_vintage_compat(true);
     let r = encode_rgb24(&rgb, 32, 32, opts);
     assert!(r.is_err(), "strip_count=4 with vintage_compat must error");
     let msg = format!("{}", r.err().unwrap());
@@ -87,11 +85,9 @@ fn rejects_strip_count_above_three_when_vintage_compat() {
 #[test]
 fn accepts_strip_count_three_when_vintage_compat() {
     let rgb = solid_gray_32(128);
-    let opts = EncoderOptions {
-        strip_count: 3,
-        vintage_compat: true,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_strip_count(3)
+        .with_vintage_compat(true);
     let bytes = encode_rgb24(&rgb, 32, 32, opts).expect("strip_count=3 accepted");
     // Decode roundtrip: bytes are well-formed Cinepak.
     let mut dec = CinepakDecoder::new();
@@ -106,10 +102,7 @@ fn accepts_strip_count_three_when_vintage_compat() {
 #[test]
 fn accepts_strip_count_above_three_when_default() {
     let rgb = solid_gray_32(128);
-    let opts = EncoderOptions {
-        strip_count: 4,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default().with_strip_count(4);
     let bytes = encode_rgb24(&rgb, 32, 32, opts).expect("strip_count=4 default-accepted");
     let mut dec = CinepakDecoder::new();
     let f = dec.decode_frame(&bytes, None).expect("roundtrip decode");
@@ -123,12 +116,10 @@ fn accepts_strip_count_above_three_when_default() {
 #[test]
 fn default_inter_chunk_omission_emits_zero_codebook_chunks() {
     let mut enc = CinepakEncoder::new();
-    let opts = EncoderOptions {
-        strip_count: 1,
-        v4_entries: 16,
-        v1_entries: 16,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_strip_count(1)
+        .with_v4_entries(16)
+        .with_v1_entries(16);
     let rgb = solid_gray_32(128);
     let _intra = enc.encode_intra(&rgb, 32, 32, opts).expect("intra encode");
     // Inter frame: same pixels → the codebook trained for this strip
@@ -155,13 +146,11 @@ fn default_inter_chunk_omission_emits_zero_codebook_chunks() {
 #[test]
 fn vintage_compat_inter_emits_header_only_chunks_in_v4_then_v1_order() {
     let mut enc = CinepakEncoder::new();
-    let opts = EncoderOptions {
-        strip_count: 1,
-        v4_entries: 16,
-        v1_entries: 16,
-        vintage_compat: true,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_strip_count(1)
+        .with_v4_entries(16)
+        .with_v1_entries(16)
+        .with_vintage_compat(true);
     let rgb = solid_gray_32(128);
     let _intra = enc.encode_intra(&rgb, 32, 32, opts).expect("intra encode");
     let inter = enc.encode_inter(&rgb, 32, 32, opts).expect("inter encode");
@@ -196,16 +185,11 @@ fn vintage_compat_inter_emits_header_only_chunks_in_v4_then_v1_order() {
 fn vintage_compat_wire_size_overhead_is_bounded() {
     let mut enc_default = CinepakEncoder::new();
     let mut enc_vintage = CinepakEncoder::new();
-    let opts_default = EncoderOptions {
-        strip_count: 2,
-        v4_entries: 16,
-        v1_entries: 16,
-        ..EncoderOptions::default()
-    };
-    let opts_vintage = EncoderOptions {
-        vintage_compat: true,
-        ..opts_default
-    };
+    let opts_default = EncoderOptions::default()
+        .with_strip_count(2)
+        .with_v4_entries(16)
+        .with_v1_entries(16);
+    let opts_vintage = opts_default.with_vintage_compat(true);
     let rgb = solid_gray_32(128);
     let _ = enc_default
         .encode_intra(&rgb, 32, 32, opts_default)
@@ -238,16 +222,11 @@ fn vintage_compat_wire_size_overhead_is_bounded() {
 fn vintage_compat_decode_matches_default() {
     let mut enc_default = CinepakEncoder::new();
     let mut enc_vintage = CinepakEncoder::new();
-    let opts_default = EncoderOptions {
-        strip_count: 2,
-        v4_entries: 16,
-        v1_entries: 16,
-        ..EncoderOptions::default()
-    };
-    let opts_vintage = EncoderOptions {
-        vintage_compat: true,
-        ..opts_default
-    };
+    let opts_default = EncoderOptions::default()
+        .with_strip_count(2)
+        .with_v4_entries(16)
+        .with_v1_entries(16);
+    let opts_vintage = opts_default.with_vintage_compat(true);
     let rgb = solid_gray_32(140);
 
     let _ = enc_default
@@ -298,16 +277,11 @@ fn vintage_compat_decode_matches_default() {
 #[test]
 fn vintage_compat_is_noop_on_intra() {
     let rgb = solid_gray_32(96);
-    let opts_default = EncoderOptions {
-        strip_count: 3,
-        v4_entries: 32,
-        v1_entries: 32,
-        ..EncoderOptions::default()
-    };
-    let opts_vintage = EncoderOptions {
-        vintage_compat: true,
-        ..opts_default
-    };
+    let opts_default = EncoderOptions::default()
+        .with_strip_count(3)
+        .with_v4_entries(32)
+        .with_v1_entries(32);
+    let opts_vintage = opts_default.with_vintage_compat(true);
     let bytes_default = encode_rgb24(&rgb, 32, 32, opts_default).expect("intra default");
     let bytes_vintage = encode_rgb24(&rgb, 32, 32, opts_vintage).expect("intra vintage");
     assert_eq!(
@@ -322,13 +296,11 @@ fn vintage_compat_is_noop_on_intra() {
 #[test]
 fn vintage_compat_every_inter_strip_has_two_codebook_chunks() {
     let mut enc = CinepakEncoder::new();
-    let opts = EncoderOptions {
-        strip_count: 2,
-        v4_entries: 16,
-        v1_entries: 16,
-        vintage_compat: true,
-        ..EncoderOptions::default()
-    };
+    let opts = EncoderOptions::default()
+        .with_strip_count(2)
+        .with_v4_entries(16)
+        .with_v1_entries(16)
+        .with_vintage_compat(true);
     let rgb = solid_gray_32(160);
     let _ = enc.encode_intra(&rgb, 32, 32, opts).expect("intra");
     let inter = enc.encode_inter(&rgb, 32, 32, opts).expect("inter");

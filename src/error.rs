@@ -6,6 +6,7 @@
 
 /// Errors emitted by the Cinepak decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CinepakError {
     /// The bitstream did not parse — header field out of range, chunk
     /// size accounting mismatch, vector chunk truncated, etc.

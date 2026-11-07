@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the enums `CinepakError`, `CinepakVariant`, `FilmAudioFormat`, `CinepakPixelFormat` and `LintSeverity`; the records `EncoderOptions`, `DeviantConfig`, `EncodedFrame`, `FrameStats`, `RateStats`, `RateControlledFrame` and `LintIssue`. Code outside the crate builds `EncoderOptions` / `DeviantConfig` through their constructors and `with_*` setters and needs a `_ =>` arm when matching the enums. `SampleKind`, `PcmSignConvention` and `PcmEndianness` (closed by the FILM format) stay exhaustive.
+- `#[doc(hidden)]`: the bitstream-syntax modules `codebook`, `header`, `vector` and `yuv` and their crate-root re-exports (still `pub` for tests / fuzz / examples).
+
+### Added
+
+- `EncoderOptions::with_*` and `DeviantConfig::with_*` setters for every field (start from `Default` / `from_quality`, or `DeviantConfig::saturn` / `lemmings_3do`).
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-cinepak/compare/v0.0.3...v0.0.4) - 2026-10-23
 
 ### Other

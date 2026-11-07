@@ -43,6 +43,7 @@ use crate::header::{
 
 /// How severe a lint finding is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum LintSeverity {
     /// Deviates from a documented SHOULD / encoder convention /
     /// corpus observation. Streams decode fine.
@@ -290,6 +291,7 @@ impl LintRule {
 /// One lint finding: a violated rule plus its location and a
 /// human-readable message.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LintIssue {
     /// The violated rule.
     pub rule: LintRule,
@@ -305,6 +307,8 @@ pub struct LintIssue {
     /// Human-readable description with the concrete offending values.
     pub message: String,
 }
+
+impl LintIssue {}
 
 impl core::fmt::Display for LintIssue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
